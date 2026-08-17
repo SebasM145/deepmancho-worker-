@@ -11,6 +11,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY worker.py .
+COPY grid_detect.py .
 
 # Worker en segundo plano (poller). No expone puertos.
 CMD ["python", "-u", "worker.py"]
