@@ -52,7 +52,7 @@ MAX_DURATION = 600  # analiza como máximo 10 min (tope de tiempo/memoria)
 # QUÉ código está corriendo, sin tener que deducirlo de los resultados.
 # v5.1.1 = rejilla v5 (ancla dentro del primer beat) + los 4 arreglos de cues:
 #   MIX-OUT (cola real + runway mínimo), banda de graves, snap 4 compases, perfil edma.
-WORKER_VERSION = "5.1.1"
+WORKER_VERSION = "5.2.0"
 # Resolución de la waveform. 800 se veía en bloques al hacer zoom en el mezclador;
 # 3000 da ~4x de detalle para el zoom por compás sin inflar demasiado el payload.
 BUCKETS = 3000
@@ -327,45 +327,71 @@ def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
                 break
         add(0, bar_to_ms(a_bar))
 
-        # ── CAMBIO 1 (v5.1) — CAUSA RAÍZ del MIX-OUT al ~95% ────────────────
-        # EL BUG: la búsqueda arrancaba en `b = n_bars - 4` y medía la cola como
-        # `win(b + 4, n_bars)` = `win(n_bars, n_bars)` = 0.0 — una ventana VACÍA.
-        # Con tail=0.0, la condición `tail < here - 0.12` se cumple siempre que
-        # el compás tenga algo de energía, así que la PRIMERA iteración acertaba
-        # y H quedaba a 4 compases del final, en todos los tracks. Ese es el 95%
-        # sistemático que hubo que pisar a mano con el 78.4%.
+        # ── CAMBIO 5 (v5.2) — MIX-OUT por ESCANEO INVERSO (metodología validada) ──
+        # El piloto de 25 tracks mostró dos fallos del enfoque "último pico antes
+        # de una caída": (A) H caía al 90-94% (el outro de un extended mix es
+        # corto, así que el "último punto alto" queda pegado al final) y (B) en
+        # 3 tracks confundió un BREAKDOWN largo del medio con el outro (H al 51%).
         #
-        # EL ARREGLO, tres condiciones:
-        #   1. La cola es una ventana REAL (mínimo TAIL_BARS compases).
-        #   2. La caída se SOSTIENE hasta el final (se mira el promedio de toda
-        #      la cola Y los últimos 8 compases, para que no valga una bajada
-        #      momentánea seguida de un repunte).
-        #   3. Queda RUNWAY suficiente después de H para mezclar (>= RUNWAY_BARS).
-        #      Esto ataca de raíz los `h_cue_runway_override` (hubo cues con
-        #      0.13 s de margen; el guardrail los atrapaba, pero el dato nacía mal).
-        TAIL_BARS = 16      # cola mínima a evaluar (~30 s a 128 BPM)
-        RUNWAY_BARS = 8     # audio mínimo después de H (~15 s a 128 BPM)
+        # Modelo nuevo (investigación 17-ago, basada en Zehren ISMIR2020/CMJ2022,
+        # Vande Veire & De Bie 2018, y análisis de 20.765 transiciones reales de
+        # DJ en Kim et al. ISMIR2020):
+        #   1. Escanear DESDE EL FINAL hacia atrás el último segmento de energía
+        #      ALTA SOSTENIDA (total Y graves) de >= MIN_SEG compases.
+        #   2. Colocar H en el downbeat INICIAL de ese segmento — la práctica DJ
+        #      real es salir al inicio de la última sección estable, mezclando
+        #      16-32 compases sobre contenido estable, no sobre el outro.
+        #   3. LOOK-AHEAD anti-breakdown: después del segmento, los GRAVES no
+        #      deben volver a superar el umbral alto por >= 8 compases hasta el
+        #      final. Si vuelven, el valle era un breakdown -> seguir hacia atrás.
+        #   4. Límites de cordura: H entre el 65% y el 90% de la duración.
+        HIGH_BASS = 0.5     # umbral de graves "altos" (normalizados 0-1)
+        MIN_SEG = 16 if n_bars >= 64 else 8   # sección estable mínima
+        RUNWAY_BARS = 8     # audio mínimo tras H (guardia absoluta)
+        floor_bar = max(a_bar + phrase_bars, int(round(n_bars * 0.65)))
+        ceil_bar = min(int(round(n_bars * 0.90)), n_bars - RUNWAY_BARS)
+
+        def high_at(b):     # compás "alto": energía total Y graves sobre umbral
+            return win(b, b + 4) >= HIGH and winb(b, b + 4) >= HIGH_BASS
+
+        def bass_recovers_after(b_end):
+            # ¿los graves vuelven a "alto" por >= 8 compases después de b_end?
+            b = b_end
+            while b + 8 <= n_bars:
+                if winb(b, b + 8) >= HIGH_BASS:
+                    return True
+                b += 4
+            return False
+
+        # Runs de compases altos (paso de 4, la resolución del snap)
+        runs = []           # (inicio, fin) exclusivo
+        b = a_bar
+        while b < n_bars:
+            if high_at(b):
+                s = b
+                while b < n_bars and high_at(b):
+                    b += 4
+                runs.append((s, b))
+            else:
+                b += 4
 
         h_bar = -1
-        b = n_bars - TAIL_BARS
-        while b > a_bar + phrase_bars:
-            here = win(b - 4, b)                  # energía justo ANTES del punto
-            tail = win(b, n_bars)                 # todo lo que queda
-            tail_end = win(n_bars - 8, n_bars)    # el final propiamente dicho
-            if here >= HIGH and tail < here - 0.12 and tail_end < here - 0.12:
-                h_bar = b
-                break
-            b -= 4
+        for s, e in reversed(runs):
+            if e - s < MIN_SEG:
+                continue                      # sección corta: no es estable
+            if bass_recovers_after(e):
+                continue                      # tras esto vuelve el kick: breakdown
+            h_bar = s                         # inicio de la última sección estable
+            break
 
         if h_bar < 0:
-            # Fallback honesto: si la caída no se detecta (p. ej. el track
-            # termina de golpe a plena energía), se usa la mediana medida del
-            # catálogo (78.4% de la duración). Es ubicar por porcentaje, con la
-            # incertidumbre conocida de ±30 s — por eso es SOLO el fallback,
-            # nunca el camino principal.
-            h_bar = int(round(n_bars * 0.784))
+            # Fallback (track sin caída final clara, p.ej. termina a plena
+            # energía): último downbeat de frase que respete el techo del 90%
+            # y deje cuerpo mezclable. Es heurística de cordura, no el camino
+            # principal.
+            h_bar = min(ceil_bar, n_bars - MIN_SEG)
 
-        h_bar = max(a_bar + phrase_bars, min(h_bar, n_bars - RUNWAY_BARS))
+        h_bar = max(floor_bar, min(h_bar, ceil_bar))
         add(7, bar_to_ms(h_bar))
 
         # Cambios significativos entre A y H (resolución de media frase)
@@ -679,7 +705,7 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
 
 def main():
     print(f"DeepMancho worker v{WORKER_VERSION} iniciado "
-          f"(rejilla v5 + MIX-OUT corregido + graves + snap 4 + edma). "
+          f"(rejilla v5 + MIX-OUT por escaneo inverso + look-ahead anti-breakdown). "
           f"Esperando jobs...", flush=True)
     idle = 0
     while True:
