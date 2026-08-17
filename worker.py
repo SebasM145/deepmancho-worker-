@@ -47,6 +47,12 @@ ACOUSTID_API_KEY = os.environ.get("ACOUSTID_API_KEY", "")
 
 SR = 11025          # más liviano que 22050; suficiente para beat/estructura/energía
 MAX_DURATION = 600  # analiza como máximo 10 min (tope de tiempo/memoria)
+
+# Versión del worker. Se imprime al arrancar para poder confirmar desde los logs
+# QUÉ código está corriendo, sin tener que deducirlo de los resultados.
+# v5.1.1 = rejilla v5 (ancla dentro del primer beat) + los 4 arreglos de cues:
+#   MIX-OUT (cola real + runway mínimo), banda de graves, snap 4 compases, perfil edma.
+WORKER_VERSION = "5.1.1"
 # Resolución de la waveform. 800 se veía en bloques al hacer zoom en el mezclador;
 # 3000 da ~4x de detalle para el zoom por compás sin inflar demasiado el payload.
 BUCKETS = 3000
@@ -71,9 +77,25 @@ DJ_CUE_STANDARD = [
 ]
 CUE_DEF = {n: (label, color) for n, label, color in DJ_CUE_STANDARD}
 
-# Perfiles Krumhansl-Schmuckler para detección de tonalidad
+# Perfiles Krumhansl-Schmuckler (calibrados con música CLÁSICA — se dejan como
+# referencia/fallback, ya no se usan por defecto).
 KS_MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
 KS_MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+
+# ── CAMBIO 4 (v5.1) — perfiles de tonalidad para MÚSICA ELECTRÓNICA ──────────
+# Perfiles 'edma' (Faraldo et al., proyecto GiantSteps): extraídos por análisis
+# de corpus de EDM. En el benchmark GiantSteps (604 tracks de Beatport) superan
+# a Krumhansl y a KeyFinder.
+#
+# Fuente de los coeficientes: código fuente de Essentia,
+#   src/algorithms/tonal/key.cpp, arreglo `profileTypesWithOther`, entrada 'edma'.
+# Copiados textualmente del archivo, NO de memoria.
+#
+# Se usan SOLO los doce números de cada perfil: no se importa Essentia (su
+# licencia AGPLv3 exigiría licencia comercial de la UPF). Los coeficientes son
+# datos publicados; la implementación de abajo es propia sobre librosa.
+EDMA_MAJOR = np.array([1.00, 0.29, 0.50, 0.40, 0.60, 0.56, 0.32, 0.80, 0.31, 0.45, 0.42, 0.39])
+EDMA_MINOR = np.array([1.00, 0.31, 0.44, 0.58, 0.33, 0.49, 0.29, 0.78, 0.43, 0.29, 0.53, 0.32])
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 # Nota (0=C) -> Camelot. Menores = letra A, mayores = letra B (rueda estándar).
@@ -137,15 +159,20 @@ def compute_bands(y: np.ndarray, sr: int, buckets: int) -> dict:
 
 
 def detect_key(y: np.ndarray, sr: int):
-    """Krumhansl-Schmuckler sobre chroma. Devuelve (key_musical, camelot)."""
+    """Correlación de perfiles sobre chroma. Devuelve (key_musical, camelot).
+
+    CAMBIO 4 (v5.1): usa los perfiles 'edma' (calibrados con EDM) en vez de
+    Krumhansl-Schmuckler (calibrado con música clásica). Mismo algoritmo, misma
+    velocidad, mismo costo: cambian doce números por perfil.
+    """
     try:
         chroma = librosa.feature.chroma_stft(y=y, sr=sr)  # más rápido que chroma_cqt
         prof = chroma.mean(axis=1)
         prof = prof / (prof.sum() + 1e-9)
         best = (-1e9, 0, True)
         for i in range(12):
-            maj = np.corrcoef(np.roll(KS_MAJOR, i), prof)[0, 1]
-            mino = np.corrcoef(np.roll(KS_MINOR, i), prof)[0, 1]
+            maj = np.corrcoef(np.roll(EDMA_MAJOR, i), prof)[0, 1]
+            mino = np.corrcoef(np.roll(EDMA_MINOR, i), prof)[0, 1]
             if maj > best[0]:
                 best = (maj, i, False)
             if mino > best[0]:
@@ -221,8 +248,21 @@ def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
         phrase_bars = 16 if n_bars >= 32 else 8
         phrase_ms = phrase_bars * bar_ms
 
+        # ── CAMBIO 3 (v5.1) — cuantizar a 4 compases, no a 16 ────────────────
+        # ANTES: snap a frase de 16 compases. Eso puede MOVER un cue hasta 8
+        # compases (~15 s a 128 BPM): se detectaba bien la frontera y después se
+        # la corría quince segundos.
+        # Además contradecía la medición del propio catálogo: 91% de las
+        # distancias entre cues son múltiplos de 8 compases y 96% de 4 — forzar
+        # todo a múltiplos de 16 no reproduce esa distribución.
+        # AHORA: snap a 4 compases (error máximo 2 compases, ~3.75 s a 128 BPM).
+        # Corrige el error de detección sin reubicar el cue. Los múltiplos de
+        # 8/16 aparecen solos, porque así está construida la música.
+        SNAP_BARS = 4
+        snap_ms = SNAP_BARS * bar_ms
+
         def snap(ms):
-            return first_beat_ms + round((ms - first_beat_ms) / phrase_ms) * phrase_ms
+            return first_beat_ms + round((ms - first_beat_ms) / snap_ms) * snap_ms
 
         chosen = {}
 
@@ -252,14 +292,32 @@ def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
         THRESH = 0.15   # cambio de energía mínimo (0-1) para marcar un cue
         HIGH = 0.5      # umbral de "parte alta"
 
-        def win(a, b):
+        def _win(arr, a, b):
             a = max(0, int(a)); b = min(n_bars, int(b))
             if b <= a:
                 return 0.0
-            return float(np.mean(full_b[a:b]))
+            return float(np.mean(arr[a:b]))
 
+        def win(a, b):          # energía total (banda ancha)
+            return _win(full_b, a, b)
+
+        def winb(a, b):         # energía de GRAVES (kick + bajo)
+            return _win(bass_b, a, b)
+
+        # ── CAMBIO 2 (v5.1) — la banda de graves entra en la decisión ────────
+        # ANTES: `bass_b` y `high_b` se calculaban y NO se usaban en ningún cue;
+        # todo se decidía con `full_b` (RMS de banda ancha).
+        # Ese es justo el dato que NO captura el criterio real: en un breakdown
+        # el kick desaparece (el waveform de Rekordbox se pone verde) pero si
+        # los medios siguen fuertes, el RMS de banda ancha casi no se mueve y el
+        # cambio no se marca.
+        # AHORA: el cambio se mide como el promedio del salto en banda ancha y
+        # del salto en graves. Una caída SOLO de graves (kick que sale) ya
+        # alcanza para marcar el cue, que es la regla que se quería.
         def delta(b):  # +sube / -baja (compara 4 compases antes/después)
-            return win(b, b + 4) - win(b - 4, b)
+            d_full = win(b, b + 4) - win(b - 4, b)
+            d_bass = winb(b, b + 4) - winb(b - 4, b)
+            return 0.5 * d_full + 0.5 * d_bass
 
         # A (0) — inicio real: primer compás con energía sostenida
         a_bar = 0
@@ -269,20 +327,45 @@ def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
                 break
         add(0, bar_to_ms(a_bar))
 
-        # H (7) — último compás ALTO seguido de caída sostenida hasta el final
+        # ── CAMBIO 1 (v5.1) — CAUSA RAÍZ del MIX-OUT al ~95% ────────────────
+        # EL BUG: la búsqueda arrancaba en `b = n_bars - 4` y medía la cola como
+        # `win(b + 4, n_bars)` = `win(n_bars, n_bars)` = 0.0 — una ventana VACÍA.
+        # Con tail=0.0, la condición `tail < here - 0.12` se cumple siempre que
+        # el compás tenga algo de energía, así que la PRIMERA iteración acertaba
+        # y H quedaba a 4 compases del final, en todos los tracks. Ese es el 95%
+        # sistemático que hubo que pisar a mano con el 78.4%.
+        #
+        # EL ARREGLO, tres condiciones:
+        #   1. La cola es una ventana REAL (mínimo TAIL_BARS compases).
+        #   2. La caída se SOSTIENE hasta el final (se mira el promedio de toda
+        #      la cola Y los últimos 8 compases, para que no valga una bajada
+        #      momentánea seguida de un repunte).
+        #   3. Queda RUNWAY suficiente después de H para mezclar (>= RUNWAY_BARS).
+        #      Esto ataca de raíz los `h_cue_runway_override` (hubo cues con
+        #      0.13 s de margen; el guardrail los atrapaba, pero el dato nacía mal).
+        TAIL_BARS = 16      # cola mínima a evaluar (~30 s a 128 BPM)
+        RUNWAY_BARS = 8     # audio mínimo después de H (~15 s a 128 BPM)
+
         h_bar = -1
-        b = n_bars - 4
-        while b > a_bar + 4:
-            here = win(b - 2, b + 2)
-            tail = win(b + 4, n_bars)
-            if here >= HIGH and tail < here - 0.12:
+        b = n_bars - TAIL_BARS
+        while b > a_bar + phrase_bars:
+            here = win(b - 4, b)                  # energía justo ANTES del punto
+            tail = win(b, n_bars)                 # todo lo que queda
+            tail_end = win(n_bars - 8, n_bars)    # el final propiamente dicho
+            if here >= HIGH and tail < here - 0.12 and tail_end < here - 0.12:
                 h_bar = b
                 break
             b -= 4
-        if h_bar < 0:  # fallback: última subida fuerte, o ~32 compases antes del final
-            ups = [bb for bb in range(a_bar + 4, n_bars - 4) if delta(bb) >= THRESH]
-            h_bar = ups[-1] if ups else max(a_bar + phrase_bars, n_bars - 32)
-        h_bar = max(a_bar + phrase_bars, min(h_bar, n_bars - 2))
+
+        if h_bar < 0:
+            # Fallback honesto: si la caída no se detecta (p. ej. el track
+            # termina de golpe a plena energía), se usa la mediana medida del
+            # catálogo (78.4% de la duración). Es ubicar por porcentaje, con la
+            # incertidumbre conocida de ±30 s — por eso es SOLO el fallback,
+            # nunca el camino principal.
+            h_bar = int(round(n_bars * 0.784))
+
+        h_bar = max(a_bar + phrase_bars, min(h_bar, n_bars - RUNWAY_BARS))
         add(7, bar_to_ms(h_bar))
 
         # Cambios significativos entre A y H (resolución de media frase)
@@ -595,7 +678,9 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
 
 
 def main():
-    print("DeepMancho worker iniciado. Esperando jobs...", flush=True)
+    print(f"DeepMancho worker v{WORKER_VERSION} iniciado "
+          f"(rejilla v5 + MIX-OUT corregido + graves + snap 4 + edma). "
+          f"Esperando jobs...", flush=True)
     idle = 0
     while True:
         try:
