@@ -651,30 +651,77 @@ def _ajuste_lineal_fase(pts, periodo_s: float):
 
 
 def compute_anchor(path: str, bpm: float):
-    """Ancla de rejilla (primer downbeat audible, en ms) sobre el archivo dado.
-    Usa el BPM de la base como semilla (fuente de verdad protegida: no re-decide
-    el tempo, solo lo afina en ±fracción mínima con el ajuste de fase).
-    Devuelve dict(ancla_ms, bpm_real, residuo_ms) o lanza excepción."""
+    """v6.1 — Ancla de rejilla (primer downbeat audible, en ms).
+    Cambios vs v6 (el examen del golden set refutó la v6 el 19-ago):
+      * La fase se estima con onsets de GRAVES (kick): en 4x4 el kick esta EN el
+        beat; los hats/percusion en contratiempo arrastraban la media de fase de
+        banda completa (errores de ~1/3-1/2 beat observados en el examen).
+      * La fase es el PICO del histograma plegado (el modo), no la media circular:
+        el modo es inmune al arrastre del contratiempo.
+      * El tempo NO se ajusta libre: el BPM de la base es fuente de verdad; solo
+        se busca en una grilla fina nominal ±0.05 BPM la que maximiza la nitidez
+        del pico (esto elimina los errores de desenrollado de fase).
+    Devuelve dict(ancla_ms, bpm_real, residuo_ms) o lanza excepcion."""
     y, sr = librosa.load(path, sr=ANCHOR_SR, mono=True, duration=MAX_DURATION)
     if y.size == 0:
         raise RuntimeError("CM2: audio vacío")
-    periodo_s = 60.0 / float(bpm)
-    # Onsets (transientes) banda completa + banda grave (kick) — NO envolventes RMS:
-    # el bajo en contratiempo del house corre el centro de energía; los onsets no.
     onset_full = librosa.onset.onset_strength(y=y, sr=sr, hop_length=ANCHOR_HOP)
     onset_bass = librosa.onset.onset_strength(y=y, sr=sr, hop_length=ANCHOR_HOP, fmax=160)
     times = librosa.times_like(onset_full, sr=sr, hop_length=ANCHOR_HOP)
+    w = onset_bass.astype(np.float64)
+    if w.sum() < 1e-9:
+        w = onset_full.astype(np.float64)  # fallback si no hay energia grave
 
-    f_real, b, resid_ms = _ajuste_lineal_fase(
-        _fase_por_segmento(onset_full, times, periodo_s), periodo_s)
-    periodo_real = 1.0 / f_real
-    t_beat0 = (b / (2 * np.pi)) * periodo_real % periodo_real
+    NBINS = 192  # ~2.5 ms por bin a 123 BPM
 
-    # Downbeat: plegar el onset GRAVE módulo compás (4 beats) sobre la rejilla hallada
+    def hist_plegado(periodo_s):
+        b = np.floor(((times % periodo_s) / periodo_s) * NBINS).astype(int) % NBINS
+        H = np.bincount(b, weights=w, minlength=NBINS)
+        # suavizado circular leve (3 bins) para un pico estable
+        return (np.roll(H, 1) + H + np.roll(H, -1)) / 3.0
+
+    def pico_interp(H, periodo_s):
+        k = int(np.argmax(H))
+        a, c = H[(k - 1) % NBINS], H[(k + 1) % NBINS]
+        den = (a - 2 * H[k] + c)
+        delta = 0.5 * (a - c) / den if abs(den) > 1e-12 else 0.0
+        return ((k + delta) / NBINS) * periodo_s % periodo_s
+
+    # Grilla fina de tempo alrededor del nominal (fuente de verdad protegida)
+    mejor = None
+    for dbpm in np.linspace(-0.05, 0.05, 21):
+        p = 60.0 / (float(bpm) + dbpm)
+        H = hist_plegado(p)
+        nitidez = float(H.max() / (H.mean() + 1e-12))
+        if mejor is None or nitidez > mejor[0]:
+            mejor = (nitidez, p, H)
+    _, periodo_real, H = mejor
+    t_beat0 = pico_interp(H, periodo_real)
+
+    # "Residuo" v6.1 = dispersion (mediana de desvio circular) del pico por segmento
+    SEGS = 12
+    borde = np.linspace(0, len(w), SEGS + 1).astype(int)
+    desvios = []
+    for s in range(SEGS):
+        i0, i1 = borde[s], borde[s + 1]
+        ws = w[i0:i1]
+        if ws.sum() < 0.02 * w.sum() / SEGS:
+            continue  # segmento sin graves (intro/breakdown) — no vota
+        b = np.floor(((times[i0:i1] % periodo_real) / periodo_real) * NBINS).astype(int) % NBINS
+        Hs = np.bincount(b, weights=ws, minlength=NBINS)
+        Hs = (np.roll(Hs, 1) + Hs + np.roll(Hs, -1)) / 3.0
+        ts = pico_interp(Hs, periodo_real)
+        d = (ts - t_beat0) % periodo_real
+        if d > periodo_real / 2:
+            d -= periodo_real
+        desvios.append(abs(d))
+    resid_ms = float(np.median(desvios) * 1000.0) if desvios else 999.0
+
+    # Downbeat: plegar graves modulo compas (4 beats) anclado al beat hallado
     compas = 4.0 * periodo_real
     pos = (times - t_beat0) % compas
     slot = np.floor(pos / periodo_real).astype(int) % 4
-    energia_slot = np.array([onset_bass[slot == k].sum() for k in range(4)])
+    energia_slot = np.array([w[slot == k].sum() for k in range(4)])
     t_down0 = (t_beat0 + int(np.argmax(energia_slot)) * periodo_real) % compas
 
     # Ancla = primer downbeat despues del arranque audible
@@ -891,7 +938,7 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
 
 
 def main():
-    print("DeepMancho worker iniciado (v6: CM1-bis loudness + CM2 ancla/examen golden set). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v6.1: CM1-bis loudness + CM2.1 ancla robusta (kick/modo) + examen golden set). Esperando jobs...", flush=True)
     if GOLDEN_EXAM:
         try:
             golden_exam()
