@@ -47,12 +47,6 @@ ACOUSTID_API_KEY = os.environ.get("ACOUSTID_API_KEY", "")
 
 SR = 11025          # más liviano que 22050; suficiente para beat/estructura/energía
 MAX_DURATION = 600  # analiza como máximo 10 min (tope de tiempo/memoria)
-
-# Versión del worker. Se imprime al arrancar para poder confirmar desde los logs
-# QUÉ código está corriendo, sin tener que deducirlo de los resultados.
-# v5.1.1 = rejilla v5 (ancla dentro del primer beat) + los 4 arreglos de cues:
-#   MIX-OUT (cola real + runway mínimo), banda de graves, snap 4 compases, perfil edma.
-WORKER_VERSION = "5.2.0"
 # Resolución de la waveform. 800 se veía en bloques al hacer zoom en el mezclador;
 # 3000 da ~4x de detalle para el zoom por compás sin inflar demasiado el payload.
 BUCKETS = 3000
@@ -61,6 +55,45 @@ HEADERS = {"x-worker-secret": WORKER_SECRET, "Content-Type": "application/json"}
 if not WORKER_API_URL or not WORKER_SECRET:
     print("ERROR: faltan WORKER_API_URL o WORKER_SECRET", flush=True)
     sys.exit(1)
+
+# ----------------------------------------------------------------------------
+# CM2 (v6) — Ancla de rejilla de precisión sobre la RENDITION + examen golden set
+# CM1-bis (v6) — Restauración del cálculo de loudness (LUFS), perdido en la
+#                reescritura v5 (regresión detectada el 18-ago: jobs 'done'
+#                sin llenar loudness_lufs).
+#
+# Diagnóstico que motiva CM2 (18-ago-2026, sesión de mixer con telemetría):
+#   - El motor del mixer alinea bien (test mismo-track = perfecto).
+#   - El ancla de rejilla por track tiene errores de 40-120 ms porque:
+#     (a) el análisis corre a SR=11025 (~46 ms por frame), y
+#     (b) la rejilla se calcula sobre el máster, pero el navegador
+#         reproduce la rendition (timeline distinto por encoder delay).
+#   - Se validó de punta a punta que corregir SOLO el dato arregla la mezcla
+#     (par Right Thing × Till There Was You: phaseMs 118.5 -> ~0).
+#
+# Por eso CM2: (1) calcula el ancla a 22050 Hz / hop 128 (~5.8 ms de frame,
+# con ajuste de fase sobre todo el track -> precisión de pocos ms), (2) la
+# calcula sobre el MISMO audio que sirve stream-track (lo que oye el DJ), y
+# (3) antes de tocar el catálogo, rinde un EXAMEN contra 6 tracks calibrados
+# por el oído del DJ ("golden set"). Sin examen aprobado no hay backfill.
+# ----------------------------------------------------------------------------
+GOLDEN_EXAM = os.environ.get("GOLDEN_EXAM", "true").lower() != "false"
+ENABLE_ANCHOR_BACKFILL = os.environ.get("ENABLE_ANCHOR_BACKFILL", "").lower() == "true"
+ANCHOR_SR = 22050    # SR del análisis de ancla (independiente del SR=11025 general)
+ANCHOR_HOP = 128     # ~5.8 ms por frame de onset a 22050 Hz
+ANCHOR_TOL_MS = 10.0 # criterio del examen (error relativo por par)
+
+# Golden set — anclas validadas por oído + telemetría (18-ago-2026).
+# gold_ms = first_beat_detected_ms vigente en la base tras la calibración manual.
+GOLDEN_TRACKS = [
+    ("b411743d-de03-4190-b6fe-f44aa6685ba8", "Make It Hot (Mustafa Ismaeel Rmx)", 122.0, 81),
+    ("a16963a1-0d15-4354-80e5-ba27500dd7b1", "Blame (Claptone Extended Mix)",     122.0, 128),
+    ("4cc427fb-03a6-4165-8ca3-2025b6ebe779", "No Time for Tears (Original Mix)",  122.0, 238),
+    ("7d377de8-6562-416d-8b0b-97317f9b6c7f", "Slip Away (Original Mix)",          122.0, 181),
+    ("cfaaaa0e-26d1-4e96-ab3c-8a5a49f34f07", "Right Thing (Instrumental)",        123.0, 398),
+    ("b3f57c3c-7b58-49de-9dd8-c5555aab6909", "Till There Was You (Vanilla Ace)",  123.0, 372),
+]
+GOLDEN_PAIRS = [(0, 1), (2, 3), (4, 5)]  # índices (deck A, deck B) — el orden fija el signo
 
 # ----------------------------------------------------------------------------
 # Estándar de 8 cues (debe coincidir con src/lib/djCueStandard.ts)
@@ -327,71 +360,45 @@ def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
                 break
         add(0, bar_to_ms(a_bar))
 
-        # ── CAMBIO 5 (v5.2) — MIX-OUT por ESCANEO INVERSO (metodología validada) ──
-        # El piloto de 25 tracks mostró dos fallos del enfoque "último pico antes
-        # de una caída": (A) H caía al 90-94% (el outro de un extended mix es
-        # corto, así que el "último punto alto" queda pegado al final) y (B) en
-        # 3 tracks confundió un BREAKDOWN largo del medio con el outro (H al 51%).
+        # ── CAMBIO 1 (v5.1) — CAUSA RAÍZ del MIX-OUT al ~95% ────────────────
+        # EL BUG: la búsqueda arrancaba en `b = n_bars - 4` y medía la cola como
+        # `win(b + 4, n_bars)` = `win(n_bars, n_bars)` = 0.0 — una ventana VACÍA.
+        # Con tail=0.0, la condición `tail < here - 0.12` se cumple siempre que
+        # el compás tenga algo de energía, así que la PRIMERA iteración acertaba
+        # y H quedaba a 4 compases del final, en todos los tracks. Ese es el 95%
+        # sistemático que hubo que pisar a mano con el 78.4%.
         #
-        # Modelo nuevo (investigación 17-ago, basada en Zehren ISMIR2020/CMJ2022,
-        # Vande Veire & De Bie 2018, y análisis de 20.765 transiciones reales de
-        # DJ en Kim et al. ISMIR2020):
-        #   1. Escanear DESDE EL FINAL hacia atrás el último segmento de energía
-        #      ALTA SOSTENIDA (total Y graves) de >= MIN_SEG compases.
-        #   2. Colocar H en el downbeat INICIAL de ese segmento — la práctica DJ
-        #      real es salir al inicio de la última sección estable, mezclando
-        #      16-32 compases sobre contenido estable, no sobre el outro.
-        #   3. LOOK-AHEAD anti-breakdown: después del segmento, los GRAVES no
-        #      deben volver a superar el umbral alto por >= 8 compases hasta el
-        #      final. Si vuelven, el valle era un breakdown -> seguir hacia atrás.
-        #   4. Límites de cordura: H entre el 65% y el 90% de la duración.
-        HIGH_BASS = 0.5     # umbral de graves "altos" (normalizados 0-1)
-        MIN_SEG = 16 if n_bars >= 64 else 8   # sección estable mínima
-        RUNWAY_BARS = 8     # audio mínimo tras H (guardia absoluta)
-        floor_bar = max(a_bar + phrase_bars, int(round(n_bars * 0.65)))
-        ceil_bar = min(int(round(n_bars * 0.90)), n_bars - RUNWAY_BARS)
-
-        def high_at(b):     # compás "alto": energía total Y graves sobre umbral
-            return win(b, b + 4) >= HIGH and winb(b, b + 4) >= HIGH_BASS
-
-        def bass_recovers_after(b_end):
-            # ¿los graves vuelven a "alto" por >= 8 compases después de b_end?
-            b = b_end
-            while b + 8 <= n_bars:
-                if winb(b, b + 8) >= HIGH_BASS:
-                    return True
-                b += 4
-            return False
-
-        # Runs de compases altos (paso de 4, la resolución del snap)
-        runs = []           # (inicio, fin) exclusivo
-        b = a_bar
-        while b < n_bars:
-            if high_at(b):
-                s = b
-                while b < n_bars and high_at(b):
-                    b += 4
-                runs.append((s, b))
-            else:
-                b += 4
+        # EL ARREGLO, tres condiciones:
+        #   1. La cola es una ventana REAL (mínimo TAIL_BARS compases).
+        #   2. La caída se SOSTIENE hasta el final (se mira el promedio de toda
+        #      la cola Y los últimos 8 compases, para que no valga una bajada
+        #      momentánea seguida de un repunte).
+        #   3. Queda RUNWAY suficiente después de H para mezclar (>= RUNWAY_BARS).
+        #      Esto ataca de raíz los `h_cue_runway_override` (hubo cues con
+        #      0.13 s de margen; el guardrail los atrapaba, pero el dato nacía mal).
+        TAIL_BARS = 16      # cola mínima a evaluar (~30 s a 128 BPM)
+        RUNWAY_BARS = 8     # audio mínimo después de H (~15 s a 128 BPM)
 
         h_bar = -1
-        for s, e in reversed(runs):
-            if e - s < MIN_SEG:
-                continue                      # sección corta: no es estable
-            if bass_recovers_after(e):
-                continue                      # tras esto vuelve el kick: breakdown
-            h_bar = s                         # inicio de la última sección estable
-            break
+        b = n_bars - TAIL_BARS
+        while b > a_bar + phrase_bars:
+            here = win(b - 4, b)                  # energía justo ANTES del punto
+            tail = win(b, n_bars)                 # todo lo que queda
+            tail_end = win(n_bars - 8, n_bars)    # el final propiamente dicho
+            if here >= HIGH and tail < here - 0.12 and tail_end < here - 0.12:
+                h_bar = b
+                break
+            b -= 4
 
         if h_bar < 0:
-            # Fallback (track sin caída final clara, p.ej. termina a plena
-            # energía): último downbeat de frase que respete el techo del 90%
-            # y deje cuerpo mezclable. Es heurística de cordura, no el camino
-            # principal.
-            h_bar = min(ceil_bar, n_bars - MIN_SEG)
+            # Fallback honesto: si la caída no se detecta (p. ej. el track
+            # termina de golpe a plena energía), se usa la mediana medida del
+            # catálogo (78.4% de la duración). Es ubicar por porcentaje, con la
+            # incertidumbre conocida de ±30 s — por eso es SOLO el fallback,
+            # nunca el camino principal.
+            h_bar = int(round(n_bars * 0.784))
 
-        h_bar = max(floor_bar, min(h_bar, ceil_bar))
+        h_bar = max(a_bar + phrase_bars, min(h_bar, n_bars - RUNWAY_BARS))
         add(7, bar_to_ms(h_bar))
 
         # Cambios significativos entre A y H (resolución de media frase)
@@ -579,6 +586,162 @@ def fingerprint_identify(path: str):
 
 
 # ----------------------------------------------------------------------------
+# CM1-bis — Loudness (LUFS integrado, BS.1770 vía pyloudnorm)
+# ----------------------------------------------------------------------------
+def compute_loudness_lufs(path: str):
+    """LUFS integrado del archivo. None si pyloudnorm no está o el audio falla.
+    Nunca rompe el job: la ausencia de loudness no debe frenar el análisis."""
+    try:
+        import pyloudnorm  # dependencia: pyloudnorm>=0.1 (requirements)
+    except ImportError:
+        print("WARN CM1: pyloudnorm no instalado; loudness_lufs no se calcula", flush=True)
+        return None
+    try:
+        y44, sr44 = librosa.load(path, sr=44100, mono=True, duration=MAX_DURATION)
+        if y44.size == 0:
+            return None
+        meter = pyloudnorm.Meter(sr44)
+        lufs = float(meter.integrated_loudness(y44))
+        if not np.isfinite(lufs):
+            return None
+        return round(lufs, 2)
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
+# ----------------------------------------------------------------------------
+# CM2 — Ancla de rejilla de precisión (fase de beat + downbeat) — ver nota arriba
+# ----------------------------------------------------------------------------
+def _fase_por_segmento(onset: np.ndarray, times: np.ndarray, periodo_s: float, segs: int = 12):
+    """Fase circular (media ponderada por energía) del peine de beats, por segmento."""
+    n = len(onset)
+    borde = np.linspace(0, n, segs + 1).astype(int)
+    pts = []
+    for s in range(segs):
+        i0, i1 = borde[s], borde[s + 1]
+        w = onset[i0:i1]
+        if w.sum() < 1e-9:
+            continue
+        ang = 2.0 * np.pi * (times[i0:i1] % periodo_s) / periodo_s
+        z = np.sum(w * np.exp(1j * ang))
+        if abs(z) < 1e-9:
+            continue
+        pts.append((float(times[i0:i1].mean()), float(np.angle(z)), float(abs(z))))
+    return pts
+
+
+def _ajuste_lineal_fase(pts, periodo_s: float):
+    """Desenrolla la fase entre segmentos y ajusta fase(t)=a·t+b (ponderado).
+    a corrige la micro-desviación de tempo; b es la fase absoluta en t=0.
+    Devuelve (frecuencia_real_hz, fase_b, residuo_max_ms)."""
+    if len(pts) < 3:
+        raise RuntimeError("CM2: muy pocos segmentos con energía para ajustar fase")
+    T = np.array([p[0] for p in pts]); PH = np.array([p[1] for p in pts]); W = np.array([p[2] for p in pts])
+    des = PH.copy()
+    for k in range(1, len(des)):
+        while des[k] - des[k - 1] > np.pi:  des[k] -= 2 * np.pi
+        while des[k] - des[k - 1] < -np.pi: des[k] += 2 * np.pi
+    sw, st = W.sum(), (W * T).sum()
+    stt, sp, stp = (W * T * T).sum(), (W * des).sum(), (W * T * des).sum()
+    a = (sw * stp - st * sp) / (sw * stt - st * st)
+    b = (sp - a * st) / sw
+    resid_ms = float(np.max(np.abs(des - (a * T + b))) / (2 * np.pi) * periodo_s * 1000)
+    return (1.0 / periodo_s) + a / (2 * np.pi), b, resid_ms
+
+
+def compute_anchor(path: str, bpm: float):
+    """Ancla de rejilla (primer downbeat audible, en ms) sobre el archivo dado.
+    Usa el BPM de la base como semilla (fuente de verdad protegida: no re-decide
+    el tempo, solo lo afina en ±fracción mínima con el ajuste de fase).
+    Devuelve dict(ancla_ms, bpm_real, residuo_ms) o lanza excepción."""
+    y, sr = librosa.load(path, sr=ANCHOR_SR, mono=True, duration=MAX_DURATION)
+    if y.size == 0:
+        raise RuntimeError("CM2: audio vacío")
+    periodo_s = 60.0 / float(bpm)
+    # Onsets (transientes) banda completa + banda grave (kick) — NO envolventes RMS:
+    # el bajo en contratiempo del house corre el centro de energía; los onsets no.
+    onset_full = librosa.onset.onset_strength(y=y, sr=sr, hop_length=ANCHOR_HOP)
+    onset_bass = librosa.onset.onset_strength(y=y, sr=sr, hop_length=ANCHOR_HOP, fmax=160)
+    times = librosa.times_like(onset_full, sr=sr, hop_length=ANCHOR_HOP)
+
+    f_real, b, resid_ms = _ajuste_lineal_fase(
+        _fase_por_segmento(onset_full, times, periodo_s), periodo_s)
+    periodo_real = 1.0 / f_real
+    t_beat0 = (b / (2 * np.pi)) * periodo_real % periodo_real
+
+    # Downbeat: plegar el onset GRAVE módulo compás (4 beats) sobre la rejilla hallada
+    compas = 4.0 * periodo_real
+    pos = (times - t_beat0) % compas
+    slot = np.floor(pos / periodo_real).astype(int) % 4
+    energia_slot = np.array([onset_bass[slot == k].sum() for k in range(4)])
+    t_down0 = (t_beat0 + int(np.argmax(energia_slot)) * periodo_real) % compas
+
+    # Ancla = primer downbeat despues del arranque audible
+    umbral = 0.1 * np.percentile(onset_full, 95)
+    activos = np.nonzero(onset_full > umbral)[0]
+    t_inicio = float(times[activos[0]]) if len(activos) else 0.0
+    k = math.ceil(max(0.0, (t_inicio - 1e-3) - t_down0) / compas)
+    ancla_s = t_down0 + k * compas
+    return dict(ancla_ms=round(ancla_s * 1000.0, 1),
+                bpm_real=round(60.0 / periodo_real, 3),
+                residuo_ms=round(resid_ms, 1))
+
+
+def rendition_url(track_id: str) -> str:
+    """URL del MISMO audio que reproduce el navegador (stream-track)."""
+    return f"{WORKER_API_URL}/stream-track?track_id={track_id}&format=aac"
+
+
+def _wrap(x: float, T: float) -> float:
+    x = x % T
+    return x - T if x > T / 2 else x
+
+
+def golden_exam():
+    """Examen del golden set. Solo LEE audio e imprime; NUNCA escribe en la base.
+    Gate: |error relativo| <= ANCHOR_TOL_MS en los 3 pares -> APROBADO."""
+    print("[CM2 EXAMEN] arrancando examen del golden set (6 tracks, solo lectura)...", flush=True)
+    resultados = {}
+    for i, (tid, title, bpm, gold) in enumerate(GOLDEN_TRACKS):
+        try:
+            url = rendition_url(tid)
+            r = requests.get(url, timeout=180)
+            r.raise_for_status()
+            tmp = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
+            tmp.write(r.content); tmp.close()
+            res = compute_anchor(tmp.name, bpm)
+            os.remove(tmp.name)
+            res["gold"] = gold; res["bpm"] = bpm
+            resultados[i] = res
+            flag = " ⚠ residuo alto" if res["residuo_ms"] > 8 else ""
+            print(f"[CM2 EXAMEN] {title}: ancla={res['ancla_ms']}ms "
+                  f"bpm_real={res['bpm_real']} residuo={res['residuo_ms']}ms{flag}", flush=True)
+        except Exception as e:
+            print(f"[CM2 EXAMEN] {title}: FALLO al analizar ({e})", flush=True)
+    aprobado = True
+    for a, b in GOLDEN_PAIRS:
+        if a not in resultados or b in (None,) or b not in resultados:
+            print(f"[CM2 EXAMEN] Par {GOLDEN_TRACKS[a][1]} × {GOLDEN_TRACKS[b][1]}: SIN DATOS", flush=True)
+            aprobado = False
+            continue
+        A, B = resultados[a], resultados[b]
+        T = 60000.0 / ((A["bpm"] + B["bpm"]) / 2.0)
+        err = _wrap((B["ancla_ms"] - A["ancla_ms"]) - (B["gold"] - A["gold"]), T)
+        ok = abs(err) <= ANCHOR_TOL_MS
+        aprobado = aprobado and ok
+        print(f"[CM2 EXAMEN] Par {GOLDEN_TRACKS[a][1]} × {GOLDEN_TRACKS[b][1]}: "
+              f"error {err:+.1f} ms {'✅' if ok else '❌'}", flush=True)
+    print(f"[CM2 EXAMEN] RESULTADO: {'APROBADO ✅' if aprobado else 'NO APROBADO ❌'}"
+          f" (criterio ±{ANCHOR_TOL_MS} ms por par)", flush=True)
+    if aprobado and not ENABLE_ANCHOR_BACKFILL:
+        print("[CM2 EXAMEN] Para habilitar el backfill de anclas: variable "
+              "ENABLE_ANCHOR_BACKFILL=true (requiere worker-result con soporte "
+              "de first_beat_detected_ms).", flush=True)
+    return aprobado
+
+
+# ----------------------------------------------------------------------------
 # API (Edge Functions) helpers
 # ----------------------------------------------------------------------------
 def next_job():
@@ -660,6 +823,30 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
             return
         tmp = download_audio(audio_url)
         result = analyze(tmp)
+        # CM1-bis: loudness restaurado (la v5 lo habia perdido — regresion detectada 18-ago)
+        lufs = compute_loudness_lufs(tmp)
+        if lufs is not None:
+            result["loudness_lufs"] = lufs
+        # CM2 (solo con ENABLE_ANCHOR_BACKFILL=true y examen aprobado): ancla de
+        # precision sobre la RENDITION (lo que oye el DJ), nunca sobre el master.
+        # Escribe SOLO first_beat_detected_ms; jamas first_beat_offset_ms ni _source.
+        if ENABLE_ANCHOR_BACKFILL:
+            try:
+                bpm_ref = track.get("bpm") or result.get("bpm")
+                if bpm_ref and 40 < float(bpm_ref) < 240:
+                    rr = requests.get(rendition_url(track_id), timeout=180)
+                    rr.raise_for_status()
+                    rtmp = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
+                    rtmp.write(rr.content); rtmp.close()
+                    anc = compute_anchor(rtmp.name, float(bpm_ref))
+                    os.remove(rtmp.name)
+                    if anc["residuo_ms"] <= 8:
+                        result["first_beat_detected_ms"] = int(round(anc["ancla_ms"]))
+                        print(f"[job {job_id}] CM2 ancla={anc['ancla_ms']}ms residuo={anc['residuo_ms']}ms", flush=True)
+                    else:
+                        print(f"[job {job_id}] CM2 residuo alto ({anc['residuo_ms']}ms) — ancla NO escrita", flush=True)
+            except Exception as e:
+                print(f"[job {job_id}] CM2 fallo (no bloquea el job): {e}", flush=True)
         # Rendition: si la canción no tiene versión reproducible (ej. AIFF), conviértela a
         # m4a/AAC y súbela vía la URL firmada; el backend fija stream_asset_path.
         if rendition_upload and rendition_upload.get("url") and rendition_upload.get("path"):
@@ -704,9 +891,13 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
 
 
 def main():
-    print(f"DeepMancho worker v{WORKER_VERSION} iniciado "
-          f"(rejilla v5 + MIX-OUT por escaneo inverso + look-ahead anti-breakdown). "
-          f"Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v6: CM1-bis loudness + CM2 ancla/examen golden set). Esperando jobs...", flush=True)
+    if GOLDEN_EXAM:
+        try:
+            golden_exam()
+        except Exception:
+            traceback.print_exc()
+            print("[CM2 EXAMEN] el examen fallo pero el worker sigue normal", flush=True)
     idle = 0
     while True:
         try:
