@@ -89,11 +89,19 @@ GOLDEN_TRACKS = [
     ("b411743d-de03-4190-b6fe-f44aa6685ba8", "Make It Hot (Mustafa Ismaeel Rmx)", 122.0, 81),
     ("a16963a1-0d15-4354-80e5-ba27500dd7b1", "Blame (Claptone Extended Mix)",     122.0, 128),
     ("4cc427fb-03a6-4165-8ca3-2025b6ebe779", "No Time for Tears (Original Mix)",  122.0, 238),
-    ("7d377de8-6562-416d-8b0b-97317f9b6c7f", "Slip Away (Original Mix)",          122.0, 181),
+    ("7d377de8-6562-416d-8b0b-97317f9b6c7f", "Slip Away (Original Mix)",          122.0, 158),  # gold corregido 19-ago: arbitraje worker vs oido, gano el worker
     ("cfaaaa0e-26d1-4e96-ab3c-8a5a49f34f07", "Right Thing (Instrumental)",        123.0, 398),
     ("b3f57c3c-7b58-49de-9dd8-c5555aab6909", "Till There Was You (Vanilla Ace)",  123.0, 372),
 ]
 GOLDEN_PAIRS = [(0, 1), (2, 3), (4, 5)]  # índices (deck A, deck B) — el orden fija el signo
+
+# Prueba CIEGA (v6.2): tracks jamas calibrados por oido. El examen imprime sus
+# anclas calculadas (no hay gold contra el cual comparar); se escriben a mano
+# via SQL y el DJ las valida alineando por rejilla en el mixer.
+BLIND_TRACKS = [
+    ("a83916eb-2333-43e8-b131-77071032db59", "This Sound (Extended Mix)",  124.0),
+    ("cf7f1585-f6cf-451a-bf12-e4ebe01c8d89", "Day 'N' Nite (Extended Mix)", 124.0),
+]
 
 # ----------------------------------------------------------------------------
 # Estándar de 8 cues (debe coincidir con src/lib/djCueStandard.ts)
@@ -779,6 +787,18 @@ def golden_exam():
         aprobado = aprobado and ok
         print(f"[CM2 EXAMEN] Par {GOLDEN_TRACKS[a][1]} × {GOLDEN_TRACKS[b][1]}: "
               f"error {err:+.1f} ms {'✅' if ok else '❌'}", flush=True)
+    for tid, title, bpm in BLIND_TRACKS:
+        try:
+            r = requests.get(rendition_url(tid), timeout=180)
+            r.raise_for_status()
+            tmp = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
+            tmp.write(r.content); tmp.close()
+            res = compute_anchor(tmp.name, bpm)
+            os.remove(tmp.name)
+            print(f"[CM2 CIEGA] {title}: ancla={res['ancla_ms']}ms "
+                  f"bpm_real={res['bpm_real']} residuo={res['residuo_ms']}ms", flush=True)
+        except Exception as e:
+            print(f"[CM2 CIEGA] {title}: FALLO ({e})", flush=True)
     print(f"[CM2 EXAMEN] RESULTADO: {'APROBADO ✅' if aprobado else 'NO APROBADO ❌'}"
           f" (criterio ±{ANCHOR_TOL_MS} ms por par)", flush=True)
     if aprobado and not ENABLE_ANCHOR_BACKFILL:
@@ -938,7 +958,7 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
 
 
 def main():
-    print("DeepMancho worker iniciado (v6.1: CM1-bis loudness + CM2.1 ancla robusta (kick/modo) + examen golden set). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v6.2: CM2.1 ancla robusta + examen golden set + prueba ciega). Esperando jobs...", flush=True)
     if GOLDEN_EXAM:
         try:
             golden_exam()
