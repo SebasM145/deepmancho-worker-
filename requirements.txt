@@ -4,3 +4,4 @@ scipy==1.13.1
 soundfile==0.12.1
 audioread==3.0.1
 requests==2.32.3
+pyloudnorm>=0.1.1
