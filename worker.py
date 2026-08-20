@@ -77,6 +77,14 @@ if not WORKER_API_URL or not WORKER_SECRET:
 # (3) antes de tocar el catálogo, rinde un EXAMEN contra 6 tracks calibrados
 # por el oído del DJ ("golden set"). Sin examen aprobado no hay backfill.
 # ----------------------------------------------------------------------------
+ENABLE_SET_RENDER = os.environ.get("ENABLE_SET_RENDER", "").lower() == "true"
+SET_SR = 44100           # SR de render del set (calidad final, no analisis)
+XFADE_BARS = 16          # duracion objetivo de transicion, en compases
+MIN_XFADE_BARS = 8
+MAX_STRETCH_PCT = 6.0    # tope de time-stretch: mas alla los artefactos se oyen
+BASS_HZ = 70.0           # low-shelf del bass-swap (referencia DJM-800)
+SET_TARGET_LUFS = -14.0
+
 GOLDEN_EXAM = os.environ.get("GOLDEN_EXAM", "true").lower() != "false"
 ENABLE_ANCHOR_BACKFILL = os.environ.get("ENABLE_ANCHOR_BACKFILL", "").lower() == "true"
 ANCHOR_SR = 22050    # SR del análisis de ancla (independiente del SR=11025 general)
@@ -496,7 +504,231 @@ def detect_vocal_segments(y: np.ndarray, sr: int, bpm, first_beat_ms):
         return None
 
 
-def analyze(path: str) -> dict:
+# ============================================================================
+# v7 — PIPELINE "LISTO PARA MEZCLAR"
+# ============================================================================
+# Contexto (medido, no supuesto): 996/1005 tracks tenían bpm_fine=0, es decir
+# BPM entero exacto. Un error de 0.24 BPM (el máximo observado) acumula UN BEAT
+# de desfase en ~4 minutos:  t_a_un_beat = 60 / ΔBPM.  Por eso hay pares que
+# arrancan alineados y "se van" a mitad de tema, aun con el ancla perfecta.
+#
+# Nota de licencia: NO se usa madmom. Sus modelos preentrenados son CC BY-NC-SA
+# (no comercial). Todo esto es librosa (ISC) + numpy, apto para uso comercial.
+# ----------------------------------------------------------------------------
+
+SR_GRID = 22050          # SR del refinamiento de tempo (más resolución que SR=11025)
+HOP_GRID = 128           # ~5.8 ms por frame
+MIXOUT_MIN_PCT = 0.70    # el MIX-OUT nunca antes del 70% del track
+RUNWAY_BARS_MIN = 16     # audio mínimo tras MIX-OUT para completar la mezcla
+TEMPO_RESID_MS = 25.0    # residuo máx. para considerar el tempo constante
+
+
+def refine_bpm(y22: np.ndarray, sr22: int, bpm_nominal: float):
+    """Refina un BPM nominal (entero) a su valor real con decimales.
+
+    Método: ajuste por mínimos cuadrados sobre los tiempos de beat detectados a
+    lo largo de TODO el track. Si los beats son t_i ≈ t0 + i*periodo, la
+    pendiente de la recta da el periodo real; el error del BPM escala con
+    1/duración, así que sobre 5-7 min la resolución baja de 0.01 BPM.
+
+    Devuelve (bpm_refinado, residuo_max_ms, n_beats) o (None, None, 0).
+    """
+    try:
+        onset_env = librosa.onset.onset_strength(y=y22, sr=sr22, hop_length=HOP_GRID)
+        # Anclar la búsqueda al nominal protegido: evita saltos de octava y de tresillo
+        _, beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr22,
+                                           hop_length=HOP_GRID, trim=False,
+                                           start_bpm=float(bpm_nominal), tightness=200)
+        t = librosa.frames_to_time(beats, sr=sr22, hop_length=HOP_GRID)
+        if len(t) < 32:
+            return None, None, len(t)
+        # Índice de beat esperado de cada detección, según el periodo nominal.
+        periodo_nom = 60.0 / float(bpm_nominal)
+        idx = np.round((t - t[0]) / periodo_nom)
+        # Descartar detecciones que no caen cerca de una línea de beat (outliers)
+        pred = t[0] + idx * periodo_nom
+        ok = np.abs(t - pred) < periodo_nom * 0.25
+        t, idx = t[ok], idx[ok]
+        if len(t) < 32:
+            return None, None, len(t)
+        # Mínimos cuadrados: t = a*idx + b  →  a = periodo real
+        A = np.vstack([idx, np.ones(len(idx))]).T
+        a, b = np.linalg.lstsq(A, t, rcond=None)[0]
+        if a <= 0:
+            return None, None, len(t)
+        bpm_real = 60.0 / a
+        # Si se fue muy lejos del nominal, no es refinamiento: es otra detección.
+        if abs(bpm_real - float(bpm_nominal)) > 1.5:
+            return None, None, len(t)
+        resid_ms = float(np.max(np.abs(t - (a * idx + b)))) * 1000.0
+        return round(bpm_real, 3), round(resid_ms, 1), int(len(t))
+    except Exception:
+        traceback.print_exc()
+        return None, None, 0
+
+
+def clasificar_tempo(resid_ms):
+    """Tempo constante vs variable, por el residuo del ajuste lineal."""
+    if resid_ms is None:
+        return "desconocido"
+    return "constante" if resid_ms <= TEMPO_RESID_MS else "variable"
+
+
+def detect_mix_in(y22, sr22, bpm, first_beat_ms):
+    """MIX-IN musical: primer downbeat de la primera frase con kick sostenido.
+
+    ANTES (bug medido): 983/1005 tracks tenían el MIX-IN a <2 s — o sea marcaba
+    el INICIO DEL AUDIO, no un punto de entrada de mezcla. Un DJ no lanza el
+    track en el primer sample: lo lanza en la primera frase con groove estable.
+    """
+    try:
+        beat_ms = 60000.0 / float(bpm)
+        bar_ms = beat_ms * 4
+        phrase_ms = bar_ms * 4          # frase de 4 compases como unidad de entrada
+        # Energía de graves por compás (el kick)
+        S = np.abs(librosa.stft(y22, n_fft=2048, hop_length=512))
+        freqs = librosa.fft_frequencies(sr=sr22, n_fft=2048)
+        bass = S[freqs < 200, :].sum(axis=0)
+        times = librosa.frames_to_time(np.arange(len(bass)), sr=sr22, hop_length=512) * 1000.0
+        dur_ms = (len(y22) / sr22) * 1000.0
+        n_bars = int(max(0, (dur_ms - first_beat_ms) // bar_ms))
+        if n_bars < 8:
+            return None, False
+        def bar_energy(b):
+            t0 = first_beat_ms + b * bar_ms
+            m = (times >= t0) & (times < t0 + bar_ms)
+            return float(np.mean(bass[m])) if m.any() else 0.0
+        e = _norm_max(np.array([bar_energy(b) for b in range(n_bars)]))
+        umbral = 0.35 * float(np.max(e)) if np.max(e) > 0 else 0.0
+        # Primera frase donde el kick cruza el umbral y SE SOSTIENE 4 compases
+        for b in range(0, n_bars - 4):
+            if all(e[b + k] >= umbral for k in range(4)):
+                # snapear al inicio de frase
+                bar_frase = int(round(b / 4.0) * 4)
+                pos = first_beat_ms + bar_frase * bar_ms
+                djfriendly = pos > (first_beat_ms + 2 * bar_ms)  # hubo intro real
+                return int(round(pos)), bool(djfriendly)
+        return int(round(first_beat_ms)), False
+    except Exception:
+        traceback.print_exc()
+        return None, False
+
+
+def detect_mix_out(y22, sr22, bpm, first_beat_ms):
+    """MIX-OUT por SCORING GLOBAL (no voraz).
+
+    ANTES (bug encontrado en el código v5): el bucle recorría de atrás hacia
+    adelante y cortaba con `break` en la PRIMERA coincidencia. En un track con
+    un breakdown profundo temprano, ese breakdown se confundía con el final:
+    155 tracks quedaron con el MIX-OUT antes del 80% (casos extremos al 13%,
+    saliendo del track a los 46 s de 354).
+
+    AHORA: (1) se generan TODOS los candidatos, (2) se descarta lo anterior al
+    70% de la duración, (3) se exige que la caída SE SOSTENGA hasta el final
+    (que no reentre energía plena), (4) se elige por score global, no el primero.
+    """
+    try:
+        beat_ms = 60000.0 / float(bpm)
+        bar_ms = beat_ms * 4
+        S = np.abs(librosa.stft(y22, n_fft=2048, hop_length=512))
+        rms = librosa.feature.rms(S=S)[0]
+        times = librosa.frames_to_time(np.arange(len(rms)), sr=sr22, hop_length=512) * 1000.0
+        dur_ms = (len(y22) / sr22) * 1000.0
+        n_bars = int(max(0, (dur_ms - first_beat_ms) // bar_ms))
+        if n_bars < 16:
+            return None, False
+        def win(b0, b1):
+            t0 = first_beat_ms + b0 * bar_ms
+            t1 = first_beat_ms + b1 * bar_ms
+            m = (times >= t0) & (times < t1)
+            return float(np.mean(rms[m])) if m.any() else 0.0
+        e = _norm_max(np.array([win(b, b + 1) for b in range(n_bars)]))
+        bar_min = int(n_bars * MIXOUT_MIN_PCT)          # (2) piso de posición
+        bar_max = n_bars - RUNWAY_BARS_MIN              # (garantía de runway)
+        candidatos = []
+        for b in range(bar_min, max(bar_min + 1, bar_max), 4):
+            antes = float(np.mean(e[max(0, b - 4):b])) if b >= 4 else 0.0
+            despues = float(np.mean(e[b:n_bars]))       # (3) toda la cola
+            final = float(np.mean(e[max(b, n_bars - 8):n_bars]))
+            caida = antes - despues
+            sostiene = (final <= despues + 0.10)        # no reentra energía plena
+            if antes >= 0.45 and caida > 0.10 and sostiene:
+                runway_bars = n_bars - b
+                score = caida * 1.0 + min(runway_bars / 32.0, 1.0) * 0.3
+                candidatos.append((score, b))
+        if candidatos:
+            candidatos.sort(reverse=True)               # (4) el mejor, no el primero
+            b = candidatos[0][1]
+            return int(round(first_beat_ms + b * bar_ms)), True
+        # Fallback honesto: mediana medida del catálogo, respetando runway
+        b = min(int(round(n_bars * 0.87)), bar_max)
+        b = max(b, bar_min)
+        return int(round(first_beat_ms + b * bar_ms)), False
+    except Exception:
+        traceback.print_exc()
+        return None, False
+
+
+def compute_section_energy(y22, sr22, cues, dur_ms):
+    """energy_entry / energy_peak / energy_exit (1-9) a partir de los cues.
+
+    El campo `energy` global del catálogo sólo toma valores 7/8/9 (no
+    discrimina). La energía POR SECCIÓN sí (rango medido 2-8), y es la que
+    permite encadenar: la salida de un track debe casar con la entrada del
+    siguiente.
+    """
+    try:
+        rms = librosa.feature.rms(y=y22, hop_length=512)[0]
+        times = librosa.frames_to_time(np.arange(len(rms)), sr=sr22, hop_length=512) * 1000.0
+        def seg(t0, t1):
+            m = (times >= t0) & (times < t1)
+            return float(np.mean(rms[m])) if m.any() else 0.0
+        pos = {c["label"]: c["positionMs"] for c in (cues or [])}
+        mix_in = pos.get("MIX-IN", 0)
+        mix_out = pos.get("MIX-OUT", dur_ms * 0.87)
+        drop = pos.get("DROP 1", (mix_in + mix_out) / 2)
+        vals = {
+            "entry": seg(mix_in, mix_in + 30000),
+            "peak": seg(drop, drop + 30000),
+            "exit": seg(max(0, mix_out - 30000), mix_out),
+        }
+        pico = max(vals.values()) or 1.0
+        # Escala 1-9 relativa al propio track (el ranking global lo hace la app)
+        return {k: int(max(1, min(9, round(1 + 8 * (v / pico))))) for k, v in vals.items()}
+    except Exception:
+        traceback.print_exc()
+        return {}
+
+
+def sanity_check(result, dur_ms):
+    """Validación automática. Devuelve (lista_de_problemas, confianza 0-1)."""
+    problemas = []
+    cues = result.get("cue_points") or []
+    pos = {c["label"]: c["positionMs"] for c in cues}
+    bpm = result.get("bpm")
+    if bpm and not (100 <= float(bpm) <= 150):
+        problemas.append(f"bpm_fuera_de_rango:{bpm}")
+    mi, mo = pos.get("MIX-IN"), pos.get("MIX-OUT")
+    if mi is not None and dur_ms:
+        pct = mi / dur_ms
+        if pct > 0.15:
+            problemas.append(f"mixin_tarde:{pct:.2f}")
+    if mo is not None and dur_ms:
+        pct = mo / dur_ms
+        if pct < 0.80:
+            problemas.append(f"mixout_temprano:{pct:.2f}")
+        runway_s = (dur_ms - mo) / 1000.0
+        if runway_s < 20:
+            problemas.append(f"runway_corto:{runway_s:.0f}s")
+    if mi is not None and mo is not None and mo <= mi:
+        problemas.append("orden_invertido")
+    if result.get("tempo_stability") == "variable":
+        problemas.append("tempo_variable")
+    confianza = max(0.0, 1.0 - 0.2 * len(problemas))
+    return problemas, round(confianza, 2)
+
+
+def analyze(path: str, bpm_seed=None) -> dict:
     y, sr = librosa.load(path, sr=SR, mono=True, duration=MAX_DURATION)
     if y.size == 0:
         raise RuntimeError("audio vacío")
@@ -529,7 +761,7 @@ def analyze(path: str) -> dict:
     cues = detect_cues(y, sr, bpm, first_beat_ms)
     vocal_segments = detect_vocal_segments(y, sr, bpm, first_beat_ms)
 
-    return {
+    out = {
         "bpm": bpm,
         "key": camelot,          # guardamos Camelot (como el resto de la app)
         "first_beat_offset_ms": first_beat_ms,
@@ -540,6 +772,81 @@ def analyze(path: str) -> dict:
         "vocal_segments": vocal_segments,
         "energy": energy,
     }
+
+    # ── v7: pipeline "listo para mezclar" ────────────────────────────────────
+    # Se corre a 22050 Hz (el análisis general va a 11025, que da ~46 ms de
+    # frame — insuficiente para tempo decimal y para ubicar MIX-IN/MIX-OUT).
+    try:
+        bpm_ref = float(bpm_seed) if bpm_seed else (float(bpm) if bpm else None)
+        if bpm_ref and 40 < bpm_ref < 240:
+            y22, sr22 = librosa.load(path, sr=SR_GRID, mono=True, duration=MAX_DURATION)
+            dur_ms = (len(y22) / sr22) * 1000.0
+
+            # 1) BPM decimal (causa raíz de la deriva)
+            bpm_fino, resid_ms, n_beats = refine_bpm(y22, sr22, bpm_ref)
+            if bpm_fino:
+                out["bpm_precise"] = bpm_fino
+                out["bpm_fine"] = round(bpm_fino - round(bpm_ref), 3)
+                out["tempo_residual_ms"] = resid_ms
+                out["tempo_stability"] = clasificar_tempo(resid_ms)
+                print(f"    v7 bpm {bpm_ref} → {bpm_fino} (resid {resid_ms} ms, {n_beats} beats, {out['tempo_stability']})", flush=True)
+                bpm_grid = bpm_fino
+            else:
+                out["tempo_stability"] = "desconocido"
+                bpm_grid = bpm_ref
+
+            fb = out.get("first_beat_detected_ms") or first_beat_ms or 0
+
+            # 2) MIX-IN musical + 3) MIX-OUT por scoring global
+            mi, djfriendly = detect_mix_in(y22, sr22, bpm_grid, fb)
+            mo, mo_detectado = detect_mix_out(y22, sr22, bpm_grid, fb)
+            out["intro_djfriendly"] = djfriendly
+            out["mixout_detected"] = mo_detectado
+
+            if cues and mi is not None and mo is not None and mo > mi:
+                bar_ms = (60000.0 / bpm_grid) * 4
+                nuevos = []
+                for c in cues:
+                    c2 = dict(c)
+                    if c2.get("label") == "MIX-IN":
+                        c2["positionMs"] = int(mi)
+                    elif c2.get("label") == "MIX-OUT":
+                        c2["positionMs"] = int(mo)
+                    nuevos.append(c2)
+                # 4) Cuantizar TODOS los cues al downbeat de la rejilla
+                for c2 in nuevos:
+                    p = c2["positionMs"]
+                    q = fb + round((p - fb) / bar_ms) * bar_ms
+                    q = max(0, min(q, dur_ms - 1000))
+                    c2["positionMs"] = int(round(q))
+                # 5) Descartar cues fuera de orden o duplicados tras cuantizar
+                vistos, limpios = set(), []
+                for c2 in sorted(nuevos, key=lambda x: x["positionMs"]):
+                    if c2["positionMs"] in vistos:
+                        continue
+                    vistos.add(c2["positionMs"])
+                    limpios.append(c2)
+                out["cue_points"] = limpios
+                cues = limpios
+
+            # 6) Energía por sección (base del arco de los sets)
+            se = compute_section_energy(y22, sr22, cues, dur_ms)
+            if se:
+                out["energy_entry"] = se["entry"]
+                out["energy_peak"] = se["peak"]
+                out["energy_exit"] = se["exit"]
+
+            # 7) Validación automática + score de confianza
+            problemas, confianza = sanity_check(out, dur_ms)
+            out["analysis_confidence"] = confianza
+            if problemas:
+                out["analysis_flags"] = problemas
+                print(f"    v7 ⚠ {', '.join(problemas)} (confianza {confianza})", flush=True)
+    except Exception:
+        traceback.print_exc()
+        print("    v7 falló (no bloquea el job)", flush=True)
+
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -889,7 +1196,7 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
             send_result(job_id, track_id, "error", error="track sin audio")
             return
         tmp = download_audio(audio_url)
-        result = analyze(tmp)
+        result = analyze(tmp, bpm_seed=track.get("bpm"))
         # CM1-bis: loudness restaurado (la v5 lo habia perdido — regresion detectada 18-ago)
         lufs = compute_loudness_lufs(tmp)
         if lufs is not None:
@@ -957,8 +1264,232 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
                 pass
 
 
+# ============================================================================
+# v7 — RENDERIZADOR DE SETS PRE-MEZCLADOS (offline)
+# ============================================================================
+# Un set tiene FINAL, a diferencia de la radio 24/7. Por eso NO necesita
+# Icecast ni VPS de streaming: se mezcla UNA vez offline y queda como archivo.
+# Ventaja: calidad de mezcla sin apuro, y reproduce perfecto en segundo plano
+# y con el telefono bloqueado (que es justo el techo del modelo client-side).
+#
+# Metodologia aplicada (skills del proyecto + investigacion):
+#   * Transiciones sobre los CUE POINTS reales (MIX-OUT saliente / MIX-IN entrante)
+#   * Crossfade EQUAL-POWER: 0.707 en el medio, NO 0.5 -> sin hueco de volumen
+#   * BASS-SWAP: el entrante entra sin graves, el saliente los cede -> sin dos
+#     kicks peleando (cancelacion de fase = "barro")
+#   * Solape alineado a limite de compas
+#   * Time-stretch solo si dBPM <= 6%; mas alla NO se fuerza
+#   * Normalizacion a -14 LUFS con techo de true peak
+# ----------------------------------------------------------------------------
+
+def _set_api(action, payload=None):
+    url = f"{WORKER_API_URL}/set-render?action={action}"
+    r = requests.post(url, headers={"x-worker-secret": WORKER_SECRET,
+                                    "Content-Type": "application/json"},
+                      json=payload or {}, timeout=120)
+    r.raise_for_status()
+    return r.json()
+
+
+def _decode_pcm(path, sr=SET_SR):
+    """Decodifica a float32 estereo -> array (n, 2)."""
+    out = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", path, "-f", "f32le", "-acodec", "pcm_f32le",
+         "-ar", str(sr), "-ac", "2", "-"], capture_output=True, check=True).stdout
+    return np.frombuffer(out, dtype=np.float32).reshape(-1, 2).copy()
+
+
+def _stretch(path, ratio, tmpdir):
+    """Time-stretch preservando el tono. Cae a atempo si no hay rubberband."""
+    if abs(ratio - 1.0) < 1e-4:
+        return path
+    dst = os.path.join(tmpdir, f"st_{abs(hash((path, ratio)))}.wav")
+    for filtro in (f"rubberband=tempo={ratio:.6f}", f"atempo={ratio:.6f}"):
+        try:
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", path, "-af", filtro,
+                            "-ar", str(SET_SR), "-ac", "2", dst],
+                           capture_output=True, check=True)
+            return dst
+        except subprocess.CalledProcessError:
+            continue
+    return path
+
+
+def _low_shelf(x, fc, gain_db):
+    """Low-shelf biquad (RBJ). gain_db<0 recorta graves."""
+    from scipy.signal import lfilter
+    A = 10 ** (gain_db / 40.0)
+    w0 = 2 * np.pi * fc / SET_SR
+    alpha = np.sin(w0) / 2 * np.sqrt((A + 1 / A) * (1 / 0.707 - 1) + 2)
+    cw, sq = np.cos(w0), 2 * np.sqrt(A) * alpha
+    b = np.array([A * ((A + 1) - (A - 1) * cw + sq),
+                  2 * A * ((A - 1) - (A + 1) * cw),
+                  A * ((A + 1) - (A - 1) * cw - sq)])
+    a0 = (A + 1) + (A - 1) * cw + sq
+    a = np.array([1.0, (-2 * ((A - 1) + (A + 1) * cw)) / a0,
+                  ((A + 1) + (A - 1) * cw - sq) / a0])
+    b = b / a0
+    y = np.empty_like(x)
+    for ch in range(x.shape[1]):
+        y[:, ch] = lfilter(b, a, x[:, ch])
+    return y
+
+
+def _bass_ramp(x, entrando: bool):
+    """Bass-swap progresivo entre version filtrada y plena."""
+    filt = _low_shelf(x, BASS_HZ, -24.0)
+    t = np.linspace(0.0 if entrando else 1.0, 1.0 if entrando else 0.0, len(x))[:, None]
+    return (filt * (1 - t) + x * t).astype(np.float32)
+
+
+def _cue(cues, label, default=None):
+    for c in cues or []:
+        if (c.get("label") or "").upper() == label:
+            return float(c["positionMs"])
+    return default
+
+
+def render_set(job, tracks, upload_url, result_path):
+    """Mezcla el set completo y lo sube. Devuelve (duracion_s, tracklist)."""
+    tmpdir = tempfile.mkdtemp(prefix="dm_set_")
+    salida = np.zeros((0, 2), dtype=np.float32)
+    tracklist, bpm_set, fin_ant, fase_ant = [], None, 0, 0.0
+
+    for i, tr in enumerate(tracks):
+        titulo = tr.get("title") or "?"
+        print(f"  [{i+1}/{len(tracks)}] {titulo}", flush=True)
+        r = requests.get(tr["audio_url"], timeout=300)
+        r.raise_for_status()
+        p = os.path.join(tmpdir, f"{i}.audio")
+        with open(p, "wb") as f:
+            f.write(r.content)
+
+        bpm_tr = float(tr.get("bpm") or 0) + float(tr.get("bpm_fine") or 0)
+        if not bpm_tr:
+            print("    sin BPM, se omite", flush=True)
+            continue
+
+        if bpm_set is None:
+            bpm_set, ratio = bpm_tr, 1.0
+        else:
+            ratio = bpm_set / bpm_tr
+            desvio = abs(ratio - 1.0) * 100
+            if desvio > MAX_STRETCH_PCT:
+                print(f"    dBPM {desvio:.1f}% > {MAX_STRETCH_PCT}% — sin estirar", flush=True)
+                ratio = 1.0
+            elif desvio > 0.05:
+                p = _stretch(p, 1.0 / ratio, tmpdir)
+
+        audio = _decode_pcm(p)
+        factor = ratio if ratio != 1.0 else 1.0
+        cues = tr.get("cue_points") or []
+        dur_ms = len(audio) / SET_SR * 1000.0
+        anchor_ms = float(tr.get("first_beat_offset_ms") or 0) * factor
+        mix_in = (_cue(cues, "MIX-IN", 0.0) or 0.0) * factor
+        mix_out = _cue(cues, "MIX-OUT")
+        mix_out = dur_ms * 0.90 if mix_out is None else mix_out * factor
+
+        beat_ms = 60000.0 / bpm_set
+        compas_ms = beat_ms * 4
+        audio = audio[int(mix_in / 1000.0 * SET_SR):]
+        fase = (mix_in - anchor_ms) % compas_ms
+
+        if len(salida) == 0:
+            salida = audio
+            tracklist.append({"position": 1, "start_seconds": 0, **_tl(tr)})
+            fin_ant = int((mix_out - mix_in) / 1000.0 * SET_SR)
+            fase_ant = fase
+            continue
+
+        disp_ms = min(mix_out - mix_in, fin_ant / SET_SR * 1000.0)
+        bars = XFADE_BARS
+        while bars > MIN_XFADE_BARS and bars * compas_ms > disp_ms * 0.5:
+            bars -= 4
+        n = int(min(bars * compas_ms, max(disp_ms, 0) * 0.5) / 1000.0 * SET_SR)
+        n = max(1, min(n, len(audio), len(salida)))
+
+        offset = int((((fase - fase_ant) % compas_ms) / 1000.0) * SET_SR)
+        ini = max(0, min(fin_ant - n + offset, len(salida) - n))
+
+        t = np.linspace(0, np.pi / 2, n)[:, None]
+        fo, fi = np.cos(t).astype(np.float32), np.sin(t).astype(np.float32)
+        cola = _bass_ramp(salida[ini:ini + n], entrando=False)
+        cabeza = _bass_ramp(audio[:n], entrando=True)
+        mezcla = cola * fo + cabeza * fi
+        salida = np.vstack([salida[:ini], mezcla, audio[n:]])
+
+        tracklist.append({"position": i + 1, "start_seconds": int(ini / SET_SR), **_tl(tr)})
+        print(f"    transicion {bars} compases en {ini/SET_SR/60:.1f} min", flush=True)
+        fin_ant = len(salida) - max(0, len(audio) - int((mix_out - mix_in) / 1000.0 * SET_SR))
+        fase_ant = fase
+
+    # Masterizado: loudness parejo + techo de true peak
+    try:
+        import pyloudnorm as pyln
+        lufs = pyln.Meter(SET_SR).integrated_loudness(salida.mean(axis=1))
+        if np.isfinite(lufs):
+            salida = salida * (10 ** ((SET_TARGET_LUFS - lufs) / 20.0))
+            print(f"  loudness {lufs:.1f} -> {SET_TARGET_LUFS} LUFS", flush=True)
+    except Exception:
+        pass
+    pico = float(np.max(np.abs(salida))) or 1.0
+    techo = 10 ** (-1.0 / 20.0)
+    if pico > techo:
+        salida = salida * (techo / pico)
+
+    wav = os.path.join(tmpdir, "set.wav")
+    import wave
+    with wave.open(wav, "wb") as w:
+        w.setnchannels(2); w.setsampwidth(2); w.setframerate(SET_SR)
+        w.writeframes((np.clip(salida, -1, 1) * 32767).astype(np.int16).tobytes())
+    mp3 = os.path.join(tmpdir, "set.mp3")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", wav,
+                    "-c:a", "libmp3lame", "-b:a", "256k", mp3], check=True)
+
+    with open(mp3, "rb") as f:
+        up = requests.put(upload_url, data=f, headers={"Content-Type": "audio/mpeg"}, timeout=900)
+    up.raise_for_status()
+    dur = len(salida) / SET_SR
+    print(f"  subido: {result_path} — {dur/60:.1f} min", flush=True)
+    return dur, tracklist
+
+
+def _tl(tr):
+    return {"track_id": tr.get("id") or tr.get("track_id"),
+            "title": tr.get("title"), "artist": tr.get("artist"),
+            "label": tr.get("label")}
+
+
+def poll_set_render():
+    """Busca un job de render de set y lo procesa. Devuelve True si hizo algo."""
+    try:
+        data = _set_api("next")
+    except Exception as e:
+        print(f"[set-render] no disponible: {e}", flush=True)
+        return False
+    job = data.get("job")
+    if not job:
+        return False
+    print(f"[set-render] job {job['id']} — {job.get('title')}", flush=True)
+    try:
+        dur, tracklist = render_set(job, data.get("tracks") or [],
+                                    data.get("upload_url"), data.get("result_path"))
+        _set_api("result", {"job_id": job["id"], "result_path": data.get("result_path"),
+                            "duration_sec": int(dur), "tracklist": tracklist})
+        print(f"[set-render] OK — set creado SIN publicar (revisar antes de publicar)", flush=True)
+    except Exception as e:
+        traceback.print_exc()
+        try:
+            _set_api("fail", {"job_id": job["id"], "error": str(e)[:2000]})
+        except Exception:
+            pass
+    return True
+
+
 def main():
-    print("DeepMancho worker iniciado (v6.2: CM2.1 ancla robusta + examen golden set + prueba ciega). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7: BPM decimal + hot cues + energia por seccion + validacion + render de sets). Esperando jobs...", flush=True)
+    if ENABLE_SET_RENDER:
+        print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     if GOLDEN_EXAM:
         try:
             golden_exam()
@@ -977,6 +1508,12 @@ def main():
             idle = 0
             process_job(job, track, audio_url, rendition_upload)
         else:
+            # Sin jobs de analisis: aprovechar para renderizar sets si hay cola.
+            # El analisis tiene prioridad (un track sin analizar bloquea mas que
+            # un set sin renderizar).
+            if ENABLE_SET_RENDER and poll_set_render():
+                idle = 0
+                continue
             idle += 1
             if idle % 12 == 1:
                 print("sin jobs pendientes...", flush=True)
