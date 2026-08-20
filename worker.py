@@ -520,7 +520,7 @@ SR_GRID = 22050          # SR del refinamiento de tempo (más resolución que SR
 HOP_GRID = 128           # ~5.8 ms por frame
 MIXOUT_MIN_PCT = 0.70    # el MIX-OUT nunca antes del 70% del track
 RUNWAY_BARS_MIN = 16     # audio mínimo tras MIX-OUT para completar la mezcla
-TEMPO_RESID_MS = 25.0    # residuo máx. para considerar el tempo constante
+TEMPO_RESID_MS = 35.0    # residuo robusto (p90) para considerar el tempo constante
 
 
 def refine_bpm(y22: np.ndarray, sr22: int, bpm_nominal: float):
@@ -560,7 +560,11 @@ def refine_bpm(y22: np.ndarray, sr22: int, bpm_nominal: float):
         # Si se fue muy lejos del nominal, no es refinamiento: es otra detección.
         if abs(bpm_real - float(bpm_nominal)) > 1.5:
             return None, None, len(t)
-        resid_ms = float(np.max(np.abs(t - (a * idx + b)))) * 1000.0
+        # Residuo ROBUSTO: percentil 90, no el máximo. Un solo beat mal
+        # detectado disparaba el máximo y clasificaba como "variable" a
+        # tracks perfectamente constantes (falso positivo medido en la prueba).
+        errs = np.abs(t - (a * idx + b)) * 1000.0
+        resid_ms = float(np.percentile(errs, 90))
         return round(bpm_real, 3), round(resid_ms, 1), int(len(t))
     except Exception:
         traceback.print_exc()
@@ -705,7 +709,10 @@ def sanity_check(result, dur_ms):
     problemas = []
     cues = result.get("cue_points") or []
     pos = {c["label"]: c["positionMs"] for c in cues}
-    bpm = result.get("bpm")
+    # Mirar el BPM que realmente se va a usar (el refinado desde el nominal
+    # protegido), NO el que detect_grid estima por su cuenta: ese puede traer
+    # error de octava (se midió 164 en un track de 123) y se descarta igual.
+    bpm = result.get("bpm_precise") or result.get("bpm")
     if bpm and not (100 <= float(bpm) <= 150):
         problemas.append(f"bpm_fuera_de_rango:{bpm}")
     mi, mo = pos.get("MIX-IN"), pos.get("MIX-OUT")
@@ -795,7 +802,18 @@ def analyze(path: str, bpm_seed=None) -> dict:
                 out["tempo_stability"] = "desconocido"
                 bpm_grid = bpm_ref
 
-            fb = out.get("first_beat_detected_ms") or first_beat_ms or 0
+            # ANCLA: debe ser LA MISMA que usa el mixer (first_beat_detected_ms,
+            # calculada sobre la rendition). Si se usa otra, los cues quedan
+            # cuantizados contra una rejilla distinta a la que suena. Bug real
+            # detectado en la prueba de 1 track: MIX-IN cayó a 44 ms.
+            try:
+                anc = compute_anchor(path, bpm_grid)
+                fb = float(anc["ancla_ms"])
+                out["first_beat_detected_ms"] = int(round(fb))
+                print(f"    v7 ancla={fb:.0f} ms (residuo {anc['residuo_ms']} ms)", flush=True)
+            except Exception:
+                fb = float(first_beat_ms or 0)
+                print("    v7 ancla: fallback a la rejilla interna", flush=True)
 
             # 2) MIX-IN musical + 3) MIX-OUT por scoring global
             mi, djfriendly = detect_mix_in(y22, sr22, bpm_grid, fb)
@@ -1487,7 +1505,7 @@ def poll_set_render():
 
 
 def main():
-    print("DeepMancho worker iniciado (v7: BPM decimal + hot cues + energia por seccion + validacion + render de sets). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.1: BPM decimal + ancla unificada + hot cues + energia por seccion + validacion + render de sets). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     if GOLDEN_EXAM:
