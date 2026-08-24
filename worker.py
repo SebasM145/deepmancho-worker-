@@ -87,6 +87,7 @@ SET_TARGET_LUFS = -14.0
 
 GOLDEN_EXAM = os.environ.get("GOLDEN_EXAM", "true").lower() != "false"
 ENABLE_ANCHOR_BACKFILL = os.environ.get("ENABLE_ANCHOR_BACKFILL", "").lower() == "true"
+ENABLE_MIX_V7 = os.environ.get("ENABLE_MIX_V7", "0") == "1"  # v7.1 MIX-IN/OUT refutados: apagados por default
 ANCHOR_SR = 22050    # SR del análisis de ancla (independiente del SR=11025 general)
 ANCHOR_HOP = 128     # ~5.8 ms por frame de onset a 22050 Hz
 ANCHOR_TOL_MS = 10.0 # criterio del examen (error relativo por par)
@@ -94,14 +95,30 @@ ANCHOR_TOL_MS = 10.0 # criterio del examen (error relativo por par)
 # Golden set — anclas validadas por oído + telemetría (18-ago-2026).
 # gold_ms = first_beat_detected_ms vigente en la base tras la calibración manual.
 GOLDEN_TRACKS = [
-    ("b411743d-de03-4190-b6fe-f44aa6685ba8", "Make It Hot (Mustafa Ismaeel Rmx)", 122.0, 81),
-    ("a16963a1-0d15-4354-80e5-ba27500dd7b1", "Blame (Claptone Extended Mix)",     122.0, 128),
-    ("4cc427fb-03a6-4165-8ca3-2025b6ebe779", "No Time for Tears (Original Mix)",  122.0, 238),
-    ("7d377de8-6562-416d-8b0b-97317f9b6c7f", "Slip Away (Original Mix)",          122.0, 158),  # gold corregido 19-ago: arbitraje worker vs oido, gano el worker
-    ("cfaaaa0e-26d1-4e96-ab3c-8a5a49f34f07", "Right Thing (Instrumental)",        123.0, 398),
-    ("b3f57c3c-7b58-49de-9dd8-c5555aab6909", "Till There Was You (Vanilla Ace)",  123.0, 372),
+    # (track_id, titulo, bpm, gold_ancla_ms_MOD_BEAT)
+    # RECALIBRADO 23-ago-2026 con la metodologia certificada de
+    # docs/golden-set-mixer.md (banda de kick 35-130 Hz Butterworth + envolvente
+    # de Hilbert + ataque al 25% entre piso y pico, 90 s desde el 35% del track),
+    # medido de forma INDEPENDIENTE del worker. Los gold anteriores (81/128/238/
+    # 158/398/372) venian de la metodologia vieja basada en el PICO y resultaron
+    # dispersos (-140 a +170 ms), no un corrimiento constante: eran la regla
+    # equivocada. Validacion cruzada: el detector de la v7.2 coincidio con la
+    # medicion independiente en 5 de 6 tracks dentro de +-5 ms.
+    ("b411743d-de03-4190-b6fe-f44aa6685ba8", "Make It Hot (Mustafa Ismaeel Rmx)", 122.0, 12),
+    ("a16963a1-0d15-4354-80e5-ba27500dd7b1", "Blame (Claptone Extended Mix)",     122.0, 57),
+    ("4cc427fb-03a6-4165-8ca3-2025b6ebe779", "No Time for Tears (Original Mix)",  122.0, 98),
+    ("7d377de8-6562-416d-8b0b-97317f9b6c7f", "Slip Away (Original Mix)",          122.0, 41),
+    ("cfaaaa0e-26d1-4e96-ab3c-8a5a49f34f07", "Right Thing (Instrumental)",        123.0, 43),
+    # RETIRADO del examen: "Till There Was You (Vanilla Ace)" (b3f57c3c) tiene
+    # jitter p90 de 14.6 ms y tempo real ~123.04 (deriva): su propia fase depende
+    # del BPM asumido, asi que RECHAZA los criterios del golden set y no sirve
+    # como referencia. Reponer el tercer par cuando se certifique un reemplazo.
 ]
-GOLDEN_PAIRS = [(0, 1), (2, 3), (4, 5)]  # índices (deck A, deck B) — el orden fija el signo
+
+# El ancla del examen se compara MODULO el periodo de beat: el valor absoluto que
+# reporta el worker (p. ej. 16284.3 ms) es el mismo ancla + n*beat.
+GOLDEN_PAIRS = [(0, 1), (2, 3)]  # indices (deck A, deck B); el orden fija el signo.
+# El tercer par quedo pendiente al retirar "Till There Was You" (dato malo).
 
 # Prueba CIEGA (v6.2): tracks jamas calibrados por oido. El examen imprime sus
 # anclas calculadas (no hay gold contra el cual comparar); se escriben a mano
@@ -810,34 +827,50 @@ def analyze(path: str, bpm_seed=None) -> dict:
                 anc = compute_anchor(path, bpm_grid)
                 fb = float(anc["ancla_ms"])
                 out["first_beat_detected_ms"] = int(round(fb))
-                print(f"    v7 ancla={fb:.0f} ms (residuo {anc['residuo_ms']} ms)", flush=True)
+                out["grid_confidence"] = anc.get("confianza")
+                print(f"    v7.2 ancla={fb:.0f} ms (residuo {anc['residuo_ms']} ms, conf {anc.get('confianza')}, kicks {anc.get('n_kicks')})", flush=True)
             except Exception:
                 fb = float(first_beat_ms or 0)
                 print("    v7 ancla: fallback a la rejilla interna", flush=True)
 
-            # 2) MIX-IN musical + 3) MIX-OUT por scoring global
-            mi, djfriendly = detect_mix_in(y22, sr22, bpm_grid, fb)
-            mo, mo_detectado = detect_mix_out(y22, sr22, bpm_grid, fb)
-            out["intro_djfriendly"] = djfriendly
-            out["mixout_detected"] = mo_detectado
+            # 2-3) MIX-IN/MIX-OUT v7.1: REFUTADOS en el lote de 25 (20-ago) —
+            # MIX-IN roto en tracks dinámicos, MIX-OUT empeoró el conjunto.
+            # Quedan detrás de ENABLE_MIX_V7=1 (default APAGADO). La colocación
+            # heredada de detect_cues se mantiene.
+            mi = mo = None
+            if ENABLE_MIX_V7:
+                mi, djfriendly = detect_mix_in(y22, sr22, bpm_grid, fb)
+                mo, mo_detectado = detect_mix_out(y22, sr22, bpm_grid, fb)
+                out["intro_djfriendly"] = djfriendly
+                out["mixout_detected"] = mo_detectado
 
-            if cues and mi is not None and mo is not None and mo > mi:
+            # 4) v7.2 — TODOS los cues se cuantizan SIEMPRE a la rejilla nueva
+            # (ancla de ataque + BPM fino). Antes esto solo corría si MIX-IN/OUT
+            # validaban, y si no, los cues quedaban pegados a la rejilla vieja:
+            # exactamente el bug de "Oui" (8 hot cues a -47 ms de su propia
+            # rejilla) que hacía saltar los hot cues a otro lado en el mixer.
+            if cues:
                 bar_ms = (60000.0 / bpm_grid) * 4
+                beat_ms = 60000.0 / bpm_grid
                 nuevos = []
                 for c in cues:
                     c2 = dict(c)
-                    if c2.get("label") == "MIX-IN":
-                        c2["positionMs"] = int(mi)
-                    elif c2.get("label") == "MIX-OUT":
-                        c2["positionMs"] = int(mo)
+                    if ENABLE_MIX_V7 and mi is not None and mo is not None and mo > mi:
+                        if c2.get("label") == "MIX-IN":
+                            c2["positionMs"] = int(mi)
+                        elif c2.get("label") == "MIX-OUT":
+                            c2["positionMs"] = int(mo)
                     nuevos.append(c2)
-                # 4) Cuantizar TODOS los cues al downbeat de la rejilla
                 for c2 in nuevos:
                     p = c2["positionMs"]
-                    q = fb + round((p - fb) / bar_ms) * bar_ms
+                    # MIX-IN/OUT al compás; el resto de los cues al BEAT (los
+                    # hot cues intermedios pueden legítimamente caer a mitad
+                    # de compás — cuantizarlos a compás los movería de lugar).
+                    paso = bar_ms if c2.get("label") in ("MIX-IN", "MIX-OUT") else beat_ms
+                    q = fb + round((p - fb) / paso) * paso
                     q = max(0, min(q, dur_ms - 1000))
                     c2["positionMs"] = int(round(q))
-                # 5) Descartar cues fuera de orden o duplicados tras cuantizar
+                # 5) Descartar cues duplicados tras cuantizar
                 vistos, limpios = set(), []
                 for c2 in sorted(nuevos, key=lambda x: x["positionMs"]):
                     if c2["positionMs"] in vistos:
@@ -984,33 +1017,60 @@ def _ajuste_lineal_fase(pts, periodo_s: float):
 
 
 def compute_anchor(path: str, bpm: float):
-    """v6.1 — Ancla de rejilla (primer downbeat audible, en ms).
-    Cambios vs v6 (el examen del golden set refutó la v6 el 19-ago):
-      * La fase se estima con onsets de GRAVES (kick): en 4x4 el kick esta EN el
-        beat; los hats/percusion en contratiempo arrastraban la media de fase de
-        banda completa (errores de ~1/3-1/2 beat observados en el examen).
-      * La fase es el PICO del histograma plegado (el modo), no la media circular:
-        el modo es inmune al arrastre del contratiempo.
-      * El tempo NO se ajusta libre: el BPM de la base es fuente de verdad; solo
-        se busca en una grilla fina nominal ±0.05 BPM la que maximiza la nitidez
-        del pico (esto elimina los errores de desenrollado de fase).
-    Devuelve dict(ancla_ms, bpm_real, residuo_ms) o lanza excepcion."""
+    """v7.2 — Ancla de rejilla anclada al ATAQUE del kick (no al pico de envolvente).
+
+    Por qué (evidencia del golden set, 21-ago): 9/24 tracks del catálogo tenían
+    el ancla corrida -77..-69 ms con rejilla y BPM perfectos. Causa: la onset
+    envelope de librosa reacciona tarde/temprano respecto del ataque perceptual
+    del bombo, que es lo que un DJ (y Rekordbox) usa como beat. Método
+    certificado en la auditoría: banda de kick 35-130 Hz (Butterworth) +
+    envolvente de Hilbert + tiempo de ataque en el cruce del 25% de la altura
+    del pico. Cambios v7.2 vs v6.1:
+      * Eventos discretos de ataque de kick (no la envolvente continua).
+      * Desambiguación del downbeat con la banda de caja/clap (1.5-5 kHz):
+        en 4x4 el snare cae en 2 y 4 — resuelve el corrimiento de 1-3 beats.
+      * grid_confidence (0-1) reportado para que la app sepa cuánto fiarse.
+    El BPM de entrada sigue siendo fuente de verdad (solo ±0.05 de grilla fina).
+    Devuelve dict(ancla_ms, bpm_real, residuo_ms, confianza, n_kicks)."""
+    from scipy.signal import butter, sosfiltfilt, hilbert, find_peaks
+
     y, sr = librosa.load(path, sr=ANCHOR_SR, mono=True, duration=MAX_DURATION)
     if y.size == 0:
         raise RuntimeError("CM2: audio vacío")
-    onset_full = librosa.onset.onset_strength(y=y, sr=sr, hop_length=ANCHOR_HOP)
-    onset_bass = librosa.onset.onset_strength(y=y, sr=sr, hop_length=ANCHOR_HOP, fmax=160)
-    times = librosa.times_like(onset_full, sr=sr, hop_length=ANCHOR_HOP)
-    w = onset_bass.astype(np.float64)
-    if w.sum() < 1e-9:
-        w = onset_full.astype(np.float64)  # fallback si no hay energia grave
+    periodo_nom = 60.0 / float(bpm)
 
-    NBINS = 192  # ~2.5 ms por bin a 123 BPM
+    # --- Envolvente de la banda de kick (35-130 Hz) ---
+    sos = butter(4, [35.0, 130.0], btype="band", fs=sr, output="sos")
+    yb = sosfiltfilt(sos, y.astype(np.float64))
+    env = np.abs(hilbert(yb)).astype(np.float32)
+    w_sm = max(1, int(0.005 * sr))  # suavizado ~5 ms
+    env = np.convolve(env, np.ones(w_sm, dtype=np.float32) / w_sm, mode="same")
 
-    def hist_plegado(periodo_s):
-        b = np.floor(((times % periodo_s) / periodo_s) * NBINS).astype(int) % NBINS
-        H = np.bincount(b, weights=w, minlength=NBINS)
-        # suavizado circular leve (3 bins) para un pico estable
+    # --- Eventos de kick: picos separados al menos ~0.45 del periodo ---
+    p99 = float(np.percentile(env, 99))
+    if p99 <= 0:
+        raise RuntimeError("CM2: sin energía de graves")
+    pk, props = find_peaks(env, distance=max(1, int(0.45 * periodo_nom * sr)),
+                           height=0.30 * p99)
+    if len(pk) < 24:
+        raise RuntimeError(f"CM2: muy pocos kicks detectados ({len(pk)})")
+
+    # --- ATAQUE de cada kick: último cruce del 25% de SU pico, hacia atrás ---
+    lim_atras = int(0.150 * sr)  # un ataque real no dura más de 150 ms
+    ataques = np.empty(len(pk)); pesos = props["peak_heights"].astype(np.float64)
+    for i, p in enumerate(pk):
+        th = 0.25 * env[p]
+        j, lo = p, max(0, p - lim_atras)
+        while j > lo and env[j] > th:
+            j -= 1
+        ataques[i] = j / sr
+
+    # --- Grilla fina de tempo (BPM protegido ±0.05): histograma plegado ---
+    NBINS = 256
+
+    def hist_plegado(ts, ws, periodo_s):
+        b = np.floor(((ts % periodo_s) / periodo_s) * NBINS).astype(int) % NBINS
+        H = np.bincount(b, weights=ws, minlength=NBINS)
         return (np.roll(H, 1) + H + np.roll(H, -1)) / 3.0
 
     def pico_interp(H, periodo_s):
@@ -1020,29 +1080,25 @@ def compute_anchor(path: str, bpm: float):
         delta = 0.5 * (a - c) / den if abs(den) > 1e-12 else 0.0
         return ((k + delta) / NBINS) * periodo_s % periodo_s
 
-    # Grilla fina de tempo alrededor del nominal (fuente de verdad protegida)
     mejor = None
     for dbpm in np.linspace(-0.05, 0.05, 21):
         p = 60.0 / (float(bpm) + dbpm)
-        H = hist_plegado(p)
+        H = hist_plegado(ataques, pesos, p)
         nitidez = float(H.max() / (H.mean() + 1e-12))
         if mejor is None or nitidez > mejor[0]:
             mejor = (nitidez, p, H)
-    _, periodo_real, H = mejor
+    nitidez, periodo_real, H = mejor
     t_beat0 = pico_interp(H, periodo_real)
 
-    # "Residuo" v6.1 = dispersion (mediana de desvio circular) del pico por segmento
-    SEGS = 12
-    borde = np.linspace(0, len(w), SEGS + 1).astype(int)
+    # --- Residuo: dispersión del pico por segmentos (solo segmentos con kicks) ---
+    SEGS = 8
+    borde = np.linspace(ataques.min(), ataques.max() + 1e-6, SEGS + 1)
     desvios = []
     for s in range(SEGS):
-        i0, i1 = borde[s], borde[s + 1]
-        ws = w[i0:i1]
-        if ws.sum() < 0.02 * w.sum() / SEGS:
-            continue  # segmento sin graves (intro/breakdown) — no vota
-        b = np.floor(((times[i0:i1] % periodo_real) / periodo_real) * NBINS).astype(int) % NBINS
-        Hs = np.bincount(b, weights=ws, minlength=NBINS)
-        Hs = (np.roll(Hs, 1) + Hs + np.roll(Hs, -1)) / 3.0
+        m = (ataques >= borde[s]) & (ataques < borde[s + 1])
+        if pesos[m].sum() < 0.02 * pesos.sum():
+            continue
+        Hs = hist_plegado(ataques[m], pesos[m], periodo_real)
         ts = pico_interp(Hs, periodo_real)
         d = (ts - t_beat0) % periodo_real
         if d > periodo_real / 2:
@@ -1050,22 +1106,86 @@ def compute_anchor(path: str, bpm: float):
         desvios.append(abs(d))
     resid_ms = float(np.median(desvios) * 1000.0) if desvios else 999.0
 
-    # Downbeat: plegar graves modulo compas (4 beats) anclado al beat hallado
+    # --- Downbeat: kicks por slot + SNARE (1.5-5 kHz) en 2 y 4 ---
+    # Solo votan COMPASES COMPLETOS: el compás truncado del arranque/final
+    # mete un kick de más en un slot y volcaba el empate 1-vs-3 para el lado
+    # equivocado (refutado con la señal sintética que arranca en el beat 3).
+    # Limitación documentada: si el patrón es simétrico (snare idéntico en 2 y
+    # 4, kicks parejos), beat 1 y beat 3 son indistinguibles desde la señal —
+    # la paridad elegida sigue siendo beat-compatible para la mezcla.
     compas = 4.0 * periodo_real
-    pos = (times - t_beat0) % compas
-    slot = np.floor(pos / periodo_real).astype(int) % 4
-    energia_slot = np.array([w[slot == k].sum() for k in range(4)])
-    t_down0 = (t_beat0 + int(np.argmax(energia_slot)) * periodo_real) % compas
+    t_lo = ataques.min() + compas
+    t_hi = ataques.max() - compas
+    m_full = (ataques >= t_lo) & (ataques <= t_hi)
+    at_v, pe_v = (ataques[m_full], pesos[m_full]) if m_full.sum() >= 16 else (ataques, pesos)
+    slot_k = np.floor(((at_v - t_beat0) % compas) / periodo_real).astype(int) % 4
+    kick_slot = np.array([pe_v[slot_k == k].sum() for k in range(4)])
 
-    # Ancla = primer downbeat despues del arranque audible
-    umbral = 0.1 * np.percentile(onset_full, 95)
-    activos = np.nonzero(onset_full > umbral)[0]
-    t_inicio = float(times[activos[0]]) if len(activos) else 0.0
-    k = math.ceil(max(0.0, (t_inicio - 1e-3) - t_down0) / compas)
+    snare_slot = np.zeros(4)
+    try:
+        sos_s = butter(4, [1500.0, 5000.0], btype="band", fs=sr, output="sos")
+        ys = sosfiltfilt(sos_s, y.astype(np.float64))
+        env_s = np.abs(ys).astype(np.float32)
+        env_s = np.convolve(env_s, np.ones(w_sm, dtype=np.float32) / w_sm, mode="same")
+        pk_s, pr_s = find_peaks(env_s, distance=max(1, int(0.45 * periodo_real * sr)),
+                                height=0.30 * float(np.percentile(env_s, 99)))
+        if len(pk_s) >= 16:
+            t_s = pk_s / sr
+            h_s = pr_s["peak_heights"]
+            m_s = (t_s >= t_lo) & (t_s <= t_hi)
+            if m_s.sum() >= 8:
+                t_s, h_s = t_s[m_s], h_s[m_s]
+            sl = np.floor(((t_s - t_beat0) % compas) / periodo_real).astype(int) % 4
+            snare_slot = np.array([h_s[sl == k].sum() for k in range(4)])
+    except Exception:
+        pass
+
+    kn = kick_slot / (kick_slot.sum() + 1e-12)
+    sn = snare_slot / (snare_slot.sum() + 1e-12)
+    if snare_slot.sum() > 0:
+        # score del candidato a downbeat k: snare fuerte en (k+1) y (k+3), kick en k
+        score = np.array([sn[(k + 1) % 4] + sn[(k + 3) % 4] + 0.5 * kn[k] for k in range(4)])
+    else:
+        score = kn.copy()
+    down = int(np.argmax(score))
+    # Empate 1-vs-3 (snare en 2y4 es simétrico ante un corrimiento de 2 beats):
+    # desempatar por la paridad cuyo downbeat cae MAS TEMPRANO en el audio.
+    # Los intros de DJ arrancan en el beat 1 en la gran mayoría del catálogo;
+    # si el track de verdad arranca en el 3, el error queda a nivel de paridad
+    # de compás (beat-compatible), nunca a nivel de beat.
+    alt = (down + 2) % 4
+    if score[down] - score[alt] < 0.05 * (score[down] + 1e-12):
+        t_ini_ = float(ataques.min())
+        def _primer_ancla(d):
+            td = (t_beat0 + d * periodo_real) % compas
+            kk = math.ceil((t_ini_ - 0.6 * periodo_real - td) / compas)
+            a = td + kk * compas
+            while a < 0:
+                a += compas
+            return a
+        if _primer_ancla(alt) < _primer_ancla(down) - 1e-6:
+            down = alt
+    t_down0 = (t_beat0 + down * periodo_real) % compas
+
+    # --- Ancla = downbeat de la rejilla del primer compás con kick ---
+    # Tolerancia de media negra: el ataque detectado del primer kick puede
+    # caer unos ms antes O después del tiempo exacto de rejilla; con una
+    # tolerancia de 1 ms un jitter de +5 ms saltaba un compás entero
+    # (refutado con la señal sintética de verdad conocida).
+    t_inicio = float(ataques.min())
+    k = math.ceil((t_inicio - 0.6 * periodo_real - t_down0) / compas)
     ancla_s = t_down0 + k * compas
-    return dict(ancla_ms=round(ancla_s * 1000.0, 1),
-                bpm_real=round(60.0 / periodo_real, 3),
-                residuo_ms=round(resid_ms, 1))
+    while ancla_s < 0:
+        ancla_s += compas
+
+    # --- Confianza de rejilla (0-1): nitidez del pico + estabilidad + soporte ---
+    conf = min(1.0, nitidez / 8.0) * max(0.0, 1.0 - min(resid_ms, 40.0) / 40.0)
+    conf *= min(1.0, len(pk) / 120.0)
+    return dict(ancla_ms=round(float(ancla_s) * 1000.0, 1),
+                bpm_real=round(60.0 / float(periodo_real), 3),
+                residuo_ms=round(float(resid_ms), 1),
+                confianza=round(float(conf), 2),
+                n_kicks=int(len(pk)))
 
 
 def rendition_url(track_id: str) -> str:
@@ -1505,7 +1625,7 @@ def poll_set_render():
 
 
 def main():
-    print("DeepMancho worker iniciado (v7.1: BPM decimal + ancla unificada + hot cues + energia por seccion + validacion + render de sets). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.2.1: ancla al ATAQUE del kick + downbeat por snare + cues en la rejilla nueva + grid_confidence + examen recalibrado). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     if GOLDEN_EXAM:
