@@ -291,179 +291,152 @@ def _bar_band_energies(y, sr, anchor_ms, bar_ms, n_bars):
     return out
 
 
+def _energia_1_10(db_val, p10, p90):
+    """Escala la energia medida al 1-10 estilo Mixed In Key.
+    Calibrado contra 7493 cues reales: MIK concentra sus valores en 4-6
+    (Energy 6 n=3178, 5 n=2435, 4 n=1013), con extremos raros. Por eso el
+    mapeo comprime hacia el centro en vez de repartir linealmente 1..10."""
+    if p90 <= p10:
+        return 5
+    x = (db_val - p10) / (p90 - p10)          # 0..1 dentro del propio track
+    x = max(0.0, min(1.0, x))
+    return int(max(1, min(10, round(3.5 + 4.0 * x))))
+
+
 def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
-    """v7.3 — 8 cue points por ESTRUCTURA MUSICAL medida (REGLA-HOT-CUES.md).
+    """v7.4 — 8 hot cues siguiendo la METODOLOGIA INFERIDA DE MIXED IN KEY.
 
-    Reemplaza la plantilla proporcional de `computed_v3`, que fue refutada con
-    medicion sobre 15 tracks: cue[0] era literalmente `first_beat_offset_ms` en
-    15/15 (el MIX-IN caia en el segundo 0.2-1.7), los 105 saltos entre cues eran
-    multiplos exactos de {8,16,24,32}, y solo el 44% de los cues coincidia con un
-    borde de seccion real del audio.
+    No copia posiciones: replica el metodo. Inferido de 951 canciones del
+    catalogo con sus 7493 cues reales de MIK (export de Rekordbox):
 
-    Reglas duras aplicadas (ver REGLA-HOT-CUES.md):
-      R1 el MIX-IN nunca es el compas 0        R2 snap a 4 compases (16 en A y H)
-      R3 el MIX-OUT deja >=16 compases de cola  R4 >=2 cues en la 2a mitad
-      R5 cada cue lleva confianza 0-1
-    Devuelve lista de dicts con positionMs, label, color, number y confidence.
+      1. El cue A esta SIEMPRE en el segundo 0 (mediana 0.07 s; 94% < 1 s).
+         Es el punto de carga, no un punto de mezcla.
+      2. Los 8 cues caen SIEMPRE en la grilla de frases de 8 compases medida
+         desde A. Afinando el BPM, el error de ajuste da 0.00 compases de
+         mediana y el 65% de los tracks encaja perfecto.
+      3. El espaciado NO es regular: 0% de los tracks tiene todos los saltos
+         iguales, el 100% varia. El algoritmo ELIGE segun la musica.
+         Saltos usados: 16 (n=1599), 8 (1202), 32 (851), 24 (596).
+      4. Cobertura: el ultimo cue cae al ~79% de la duracion.
+      5. Cada cue lleva un nivel de ENERGIA 1-10 (MIK concentra en 4-6).
+
+    Perfil mediano de MIK que este detector reproduce (compas desde A):
+      A=0 · B=32 · C=48 · D=64 · E=88 · F=104 · G=128 · H=151
     """
-    if not bpm or bpm < 40 or first_beat_ms is None:
+    if not bpm or bpm < 40:
         return None
     try:
         bar_ms = (60000.0 / bpm) * 4
         dur_ms = (len(y) / sr) * 1000.0
-        anchor = float(first_beat_ms)
-        n_bars = int((dur_ms - anchor) // bar_ms)
-        if n_bars < 24:                       # track muy corto: sin estructura util
+        n_bars = int(dur_ms // bar_ms)
+        if n_bars < 24:
             return None
 
-        F = _bar_band_energies(y, sr, anchor, bar_ms, n_bars)
+        # El cue A es el CERO: toda la grilla se mide desde el arranque del
+        # audio, no desde el ancla de rejilla (regla 1).
+        F = _bar_band_energies(y, sr, 0.0, bar_ms, n_bars)
         tot = 20 * np.log10(np.maximum(
             np.sqrt(sum(10 ** (F[k] / 10) for k in F)), 1e-6))
-        ref, lowref, midref = (float(np.percentile(tot, 90)),
-                               float(np.percentile(F["low"], 90)),
-                               float(np.percentile(F["mid"], 90)))
+        p10, p90 = float(np.percentile(tot, 10)), float(np.percentile(tot, 90))
 
         M = np.vstack([F[k] for k in ("low", "lowmid", "mid", "high")]).T
         M = (M - M.mean(0)) / (M.std(0) + 1e-6)
-        PH = 16
 
-        def med(key, b0, span):
-            seg = F[key][max(0, b0):b0 + span]
-            return float(np.median(seg)) if seg.size else -120.0
+        PASO = 8                      # grilla de frase (regla 2)
+        SALTOS = (8, 16, 24, 32)      # repertorio observado (regla 3)
+        activos = np.where(tot >= p90 - 25)[0]
+        fin_util = int(activos[-1]) if activos.size else n_bars - 1
 
-        # Novedad estructural en cada limite de frase: 8 compases antes vs despues.
+        # Novedad estructural en cada limite de frase: 8 compases antes vs
+        # despues. Es lo que hace que cada cancion tenga su propia huella.
         nov = {}
-        for b0 in range(PH, n_bars - 8, 4):
-            pre, post = M[max(0, b0 - 8):b0], M[b0:b0 + 8]
+        for b in range(PASO, fin_util - 8, PASO):
+            pre, post = M[max(0, b - 8):b], M[b:b + 8]
             if pre.size and post.size:
-                nov[b0] = float(np.linalg.norm(post.mean(0) - pre.mean(0)))
-        if not nov:
+                nov[b] = float(np.linalg.norm(post.mean(0) - pre.mean(0)))
+        if len(nov) < 4:
             return None
-        nov_max = max(nov.values()) or 1.0
 
-        # ── A · MIX-IN — R1: nunca el compas 0; primera frase ya estable ──────
-        # El criterio se apoya en el KICK (graves) + energia total, no en los
-        # medios: en tech house percusivo el core no tiene pads y un criterio de
-        # medios no se cumplia hasta el breakdown (refutado con senal sintetica:
-        # daba compas 64 en vez de 16).
-        a_bar = None
-        for b0 in range(PH, n_bars - PH, PH):
-            if med("low", b0, PH) >= lowref - 6 and float(np.median(tot[b0:b0 + PH])) >= ref - 10:
-                a_bar = b0
-                break
-        if a_bar is None:
-            a_bar = PH
-
-        # ── B · BASS-IN — primer multiplo de 8 con bajo pleno ────────────────
-        b_bar = a_bar
-        for b0 in range(a_bar, max(a_bar + 1, n_bars - 8), 8):
-            if med("low", b0, 8) >= lowref - 3:
-                b_bar = b0
-                break
-
-        # ── H · MIX-OUT — R3: cola real, nunca el ultimo drop ────────────────
-        # `tail_end` = ultimo compas con AUDIO (no silencio). El umbral debe ser
-        # de silencio real (-25 dB bajo el p90), no de "energia alta": con -12 dB
-        # el propio OUTRO quedaba clasificado como silencio y se recortaba el
-        # final del track, que es justo el tramo que buscamos para el MIX-OUT.
-        activos = np.where(tot >= ref - 25)[0]
-        tail_end = int(activos[-1]) if activos.size else n_bars - 1
-        RUNWAY_OBJETIVO, RUNWAY_MINIMO = 32, 16
-        # El MIX-OUT es el INICIO DEL OUTRO = comienzo del ULTIMO TRAMO
-        # CONTIGUO de baja energia que llega hasta el final del track.
-        # Dos criterios previos fallaron y quedan documentados:
-        #   (a) "ultima caida sostenida": un breakdown tambien es una caida y
-        #       H se iba al compas 48 con el outro en 144;
-        #   (b) mediana del tramo restante < p90-3 dB: la mediana de una region
-        #       mixta (drop + core + outro) cae bajo ese umbral igual, asi que
-        #       H quedaba a media seccion.
-        # Este criterio mira compas a compas hacia atras desde el final y para
-        # en cuanto la energia vuelve: es lo que define un outro.
-        UMBRAL_OUTRO = 4.0                    # dB por debajo del p90 del track
-        TOLERANCIA_HUECOS = 2                 # compases altos aislados permitidos
-        bajo = tot < (ref - UMBRAL_OUTRO)
-        b = tail_end
-        huecos = 0
-        inicio_outro = None
-        while b > b_bar + PH:
-            if bajo[b]:
-                inicio_outro = b
-                huecos = 0
-            else:
-                huecos += 1
-                if huecos > TOLERANCIA_HUECOS:
+        # Objetivo de reparto: el perfil mediano medido en MIK, escalado a
+        # este track. H apunta al ~79% del audio util (regla 4).
+        # Perfil objetivo escalado al audio util. El ultimo valor era 0.79 (la
+        # mediana medida en MIK) y resulto DEMASIADO CORTO: la validacion sobre
+        # 180 tracks mostro que ese tope dejaba al detector sin candidatos antes
+        # de los 8 cues (solo 113/180 llegaban a 8) y se comia el 9.4% de los
+        # cues de MIK, que en 85 de 180 tracks pone cues despues del 79%.
+        objetivo_rel = (0.0, 0.14, 0.25, 0.35, 0.46, 0.57, 0.68, 0.88)
+        elegidos = [0]
+        for rel in objetivo_rel[1:]:
+            ideal = rel * fin_util
+            # Candidatos: limites de frase alcanzables con un salto del
+            # repertorio desde el cue anterior, dentro de una ventana del
+            # objetivo. Gana el de mayor novedad musical: el algoritmo
+            # elige, no reparte.
+            cands = []
+            for salto in SALTOS:
+                b = elegidos[-1] + salto
+                if b in nov and b <= fin_util - 8 and abs(b - ideal) <= 40:
+                    cands.append(b)
+            if not cands:
+                cands = [b for b in nov
+                         if b > elegidos[-1] and abs(b - ideal) <= 24]
+            if not cands:
+                b = elegidos[-1] + 16
+                if b > fin_util - 8:
                     break
-            b -= 1
-        if inicio_outro is not None:
-            h_bar = (inicio_outro // PH) * PH          # frase completa
-        else:                                          # sin outro claro
-            h_bar = ((tail_end - RUNWAY_OBJETIVO) // PH) * PH
-        h_bar = max(h_bar, b_bar + PH)
-        h_bar = min(h_bar, max(b_bar + PH, tail_end - RUNWAY_MINIMO))
-
-        # ── G · PEAK — informativo (caso de falla 1 de la regla) ─────────────
-        frases = list(range(b_bar + PH, h_bar, PH))
-        g_bar = (max(frases, key=lambda b: med("mid", b, PH) + med("low", b, PH))
-                 if frases else b_bar)
-
-        # ── C-F · bordes de seccion de mayor novedad entre B y H ─────────────
-        cand = sorted((b for b in nov if b_bar < b < h_bar and b != g_bar),
-                      key=lambda b: -nov[b])
-        medios = []
-        for b in cand:
-            if all(abs(b - m) >= 8 for m in medios + [a_bar, b_bar, g_bar, h_bar]):
-                medios.append(b)
-            if len(medios) == 4:
+                cands = [b]
+            elegidos.append(max(cands, key=lambda b: nov.get(b, 0.0)))
+        # Relleno cuando no se llega a 8 cues. Primero hacia adelante; si ya
+        # no hay lugar (tracks cortos), se INSERTA en el hueco mas grande,
+        # siempre sobre la grilla de frase. MIK entrega 8 cues incluso en
+        # tracks de 4 minutos: quedarse en 6 no reproduce su metodologia.
+        while len(elegidos) < 8:
+            b = elegidos[-1] + 16
+            if b > fin_util - 8:
+                b = elegidos[-1] + 8
+            if b <= fin_util - 8 and b > elegidos[-1]:
+                elegidos.append(b)
+                continue
+            # Sin lugar al final: partir el hueco mas grande por la mitad,
+            # cuantizado a 8 compases, eligiendo el candidato mas "musical".
+            elegidos = sorted(set(elegidos))
+            huecos = [(elegidos[i + 1] - elegidos[i], i)
+                      for i in range(len(elegidos) - 1)]
+            if not huecos:
                 break
-        # Relleno honesto cuando no hay 4 bordes claros: repartir en el hueco
-        # mas grande, sin duplicar (una version previa generaba dos cues en el
-        # mismo compas).
-        while len(medios) < 4:
-            marcas = sorted(set([b_bar] + medios + [h_bar]))
-            hueco = max(zip(marcas, marcas[1:]), key=lambda p: p[1] - p[0])
-            nuevo = hueco[0] + max(4, ((hueco[1] - hueco[0]) // 8) * 4)
-            if nuevo <= hueco[0] or nuevo >= h_bar or nuevo in medios:
+            ancho, i = max(huecos)
+            if ancho < 2 * PASO:      # sin lugar ni para un cue intermedio
                 break
-            medios.append(nuevo)
-        medios = sorted(set(medios))[:4]
-
-        # R4 — reparto: al menos 2 cues en la segunda mitad
-        mitad = n_bars // 2
-        orden = [a_bar, b_bar] + medios + [g_bar, h_bar]
-        if sum(1 for b in orden if b >= mitad) < 2:
-            tardios = sorted((b for b in nov if b >= mitad and b < h_bar),
-                             key=lambda b: -nov[b])
-            if tardios:
-                medios[-1] = tardios[0]
-                medios.sort()
-                orden = [a_bar, b_bar] + medios + [g_bar, h_bar]
-
-        # ── Confianza por cue (R5) ──────────────────────────────────────────
-        def confianza(b, es_mezcla):
-            n = nov.get(b, nov.get(4 * round(b / 4), 0.0)) / nov_max
-            base = min(1.0, 0.35 + 0.65 * n)
-            if b % PH == 0:
-                base = min(1.0, base + 0.10)      # cae en frase completa
-            if es_mezcla and b % PH != 0:
-                base *= 0.6                        # R2: mezcla exige frase
-            return round(float(max(0.05, min(1.0, base))), 2)
+            lo, hi = elegidos[i], elegidos[i + 1]
+            cands = [b for b in range(lo + 8, hi, PASO) if b not in elegidos]
+            if not cands:
+                break
+            elegidos.append(max(cands, key=lambda b: nov.get(b, 0.0)))
+        elegidos = sorted(set(elegidos))[:8]
+        if len(elegidos) < 6:
+            return None
 
         cues = []
-        for num, b in enumerate(orden):
-            pos = int(round(anchor + b * bar_ms))
-            if pos < 0 or pos >= dur_ms - 500:
+        for num, b in enumerate(elegidos):
+            pos = int(round(b * bar_ms))
+            if pos >= dur_ms - 500:
                 continue
             label, color = CUE_DEF[num]
+            seg = tot[b:b + 8]
+            energia = _energia_1_10(
+                float(np.median(seg)) if seg.size else p10, p10, p90)
+            n = nov.get(b, 0.0)
+            nmax = max(nov.values()) or 1.0
+            conf = 0.4 + 0.6 * min(1.0, n / nmax) if num else 1.0
             cues.append({
                 "number": num, "label": label, "color": color,
                 "positionMs": pos,
-                "confidence": confianza(b, num in (0, 7)),
+                "energy": energia,
+                "confidence": round(float(min(1.0, conf)), 2),
             })
-        if len(cues) < 6:
-            return None
-        return cues
+        return cues if len(cues) >= 6 else None
     except Exception as e:
-        print(f"    detect_cues v7.3 fallo: {e}", flush=True)
+        print(f"    detect_cues v7.4 fallo: {e}", flush=True)
         return None
 
 
@@ -1648,7 +1621,7 @@ def poll_set_render():
 
 
 def main():
-    print("DeepMancho worker iniciado (v7.3: ancla al ATAQUE del kick + CUES POR ESTRUCTURA MUSICAL (MIX-IN nunca en el compas 0, MIX-OUT en el outro, confianza por cue)). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.4: ancla al ATAQUE del kick + HOT CUES metodologia MIK (A en cero, grilla de 8 compases, energia 1-10) + rendition MP3 192k). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     if GOLDEN_EXAM:
