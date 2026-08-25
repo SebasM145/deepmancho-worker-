@@ -3,7 +3,7 @@ DeepMancho — Worker de análisis de audio (server-side).
 
 Procesa una cola `analysis_jobs` en Supabase:
   1. Reclama un job pendiente (RPC atómico claim_analysis_job).
-  2. Descarga el audio del track desde Storage (rendition m4a o master).
+  2. Descarga el audio del track desde Storage (rendition o master).
   3. Analiza con librosa: BPM, key (Camelot), beatgrid, waveform (peaks/rms/bandas),
      8 cue points "DeepMancho Standard", energy 1-10.
   4. Escribe los resultados en music_tracks y marca el job como 'done'.
@@ -268,208 +268,202 @@ def compute_energy(rms_full: np.ndarray, bands: dict) -> int:
         return None
 
 
+def _bar_band_energies(y, sr, anchor_ms, bar_ms, n_bars):
+    """dB RMS por compás en 4 bandas. Filtro Butterworth de fase cero (sin
+    corrimiento temporal: importa porque estos valores deciden POSICIONES)."""
+    from scipy.signal import butter, sosfiltfilt
+    BANDAS = {"low": (30, 130), "lowmid": (130, 300), "mid": (300, 3000), "high": (5000, 9000)}
+    out = {}
+    for nombre, (lo, hi) in BANDAS.items():
+        hi = min(hi, sr / 2 - 100)
+        if hi <= lo:
+            out[nombre] = np.full(n_bars, -120.0)
+            continue
+        sos = butter(4, [lo / (sr / 2), hi / (sr / 2)], btype="band", output="sos")
+        b = sosfiltfilt(sos, y.astype(np.float64))
+        e = np.empty(n_bars)
+        for i in range(n_bars):
+            a0 = int((anchor_ms + i * bar_ms) * sr / 1000.0)
+            a1 = int((anchor_ms + (i + 1) * bar_ms) * sr / 1000.0)
+            seg = b[max(0, a0):max(0, a1)]
+            e[i] = np.sqrt(np.mean(seg ** 2)) if seg.size else 1e-6
+        out[nombre] = 20 * np.log10(np.maximum(e, 1e-6))
+    return out
+
+
 def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
-    """8 cue points sobre estructura + energía, snapeados a frase de 16 compases."""
+    """v7.3 — 8 cue points por ESTRUCTURA MUSICAL medida (REGLA-HOT-CUES.md).
+
+    Reemplaza la plantilla proporcional de `computed_v3`, que fue refutada con
+    medicion sobre 15 tracks: cue[0] era literalmente `first_beat_offset_ms` en
+    15/15 (el MIX-IN caia en el segundo 0.2-1.7), los 105 saltos entre cues eran
+    multiplos exactos de {8,16,24,32}, y solo el 44% de los cues coincidia con un
+    borde de seccion real del audio.
+
+    Reglas duras aplicadas (ver REGLA-HOT-CUES.md):
+      R1 el MIX-IN nunca es el compas 0        R2 snap a 4 compases (16 en A y H)
+      R3 el MIX-OUT deja >=16 compases de cola  R4 >=2 cues en la 2a mitad
+      R5 cada cue lleva confianza 0-1
+    Devuelve lista de dicts con positionMs, label, color, number y confidence.
+    """
     if not bpm or bpm < 40 or first_beat_ms is None:
         return None
     try:
-        beat_ms = 60000.0 / bpm
-        bar_ms = beat_ms * 4
+        bar_ms = (60000.0 / bpm) * 4
         dur_ms = (len(y) / sr) * 1000.0
-
-        # envolvente RMS por compás
-        hop = 512
-        rms = librosa.feature.rms(y=y, hop_length=hop)[0]
-        times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop) * 1000.0
-        # bandas por frame
-        S = np.abs(librosa.stft(y, n_fft=2048, hop_length=hop))
-        freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
-        bass = S[freqs < 200, :].sum(axis=0)
-        high = S[freqs >= 2000, :].sum(axis=0)
-
-        n_bars = int(max(0, (dur_ms - first_beat_ms) // bar_ms))
-        if n_bars < 4:
+        anchor = float(first_beat_ms)
+        n_bars = int((dur_ms - anchor) // bar_ms)
+        if n_bars < 24:                       # track muy corto: sin estructura util
             return None
 
-        def frame_val(arr, t0, t1):
-            m = (times >= t0) & (times < t1)
-            return float(np.mean(arr[m])) if m.any() else 0.0
+        F = _bar_band_energies(y, sr, anchor, bar_ms, n_bars)
+        tot = 20 * np.log10(np.maximum(
+            np.sqrt(sum(10 ** (F[k] / 10) for k in F)), 1e-6))
+        ref, lowref, midref = (float(np.percentile(tot, 90)),
+                               float(np.percentile(F["low"], 90)),
+                               float(np.percentile(F["mid"], 90)))
 
-        full_b = np.array([frame_val(rms, first_beat_ms + b * bar_ms, first_beat_ms + (b + 1) * bar_ms) for b in range(n_bars)])
-        bass_b = np.array([frame_val(bass, first_beat_ms + b * bar_ms, first_beat_ms + (b + 1) * bar_ms) for b in range(n_bars)])
-        high_b = np.array([frame_val(high, first_beat_ms + b * bar_ms, first_beat_ms + (b + 1) * bar_ms) for b in range(n_bars)])
-        full_b = _norm_max(full_b); bass_b = _norm_max(bass_b); high_b = _norm_max(high_b)
+        M = np.vstack([F[k] for k in ("low", "lowmid", "mid", "high")]).T
+        M = (M - M.mean(0)) / (M.std(0) + 1e-6)
+        PH = 16
 
-        # segmentación estructural (novedad sobre self-similarity de MFCC/chroma)
-        try:
-            seg_hop = max(hop, sr // 2)  # ~0.5s por frame → segmentación rápida
-            feat = librosa.feature.mfcc(y=y, sr=sr, hop_length=seg_hop, n_mfcc=13)
-            bounds = librosa.segment.agglomerative(feat, min(8, max(2, n_bars // 8)))
-            bound_ms = librosa.frames_to_time(bounds, sr=sr, hop_length=seg_hop) * 1000.0
-            boundaries = sorted(set(int(round((bm - first_beat_ms) / bar_ms)) for bm in bound_ms if bm > first_beat_ms))
-            boundaries = [b for b in boundaries if 0 <= b < n_bars]
-        except Exception:
-            boundaries = []
+        def med(key, b0, span):
+            seg = F[key][max(0, b0):b0 + span]
+            return float(np.median(seg)) if seg.size else -120.0
 
-        phrase_bars = 16 if n_bars >= 32 else 8
-        phrase_ms = phrase_bars * bar_ms
+        # Novedad estructural en cada limite de frase: 8 compases antes vs despues.
+        nov = {}
+        for b0 in range(PH, n_bars - 8, 4):
+            pre, post = M[max(0, b0 - 8):b0], M[b0:b0 + 8]
+            if pre.size and post.size:
+                nov[b0] = float(np.linalg.norm(post.mean(0) - pre.mean(0)))
+        if not nov:
+            return None
+        nov_max = max(nov.values()) or 1.0
 
-        # ── CAMBIO 3 (v5.1) — cuantizar a 4 compases, no a 16 ────────────────
-        # ANTES: snap a frase de 16 compases. Eso puede MOVER un cue hasta 8
-        # compases (~15 s a 128 BPM): se detectaba bien la frontera y después se
-        # la corría quince segundos.
-        # Además contradecía la medición del propio catálogo: 91% de las
-        # distancias entre cues son múltiplos de 8 compases y 96% de 4 — forzar
-        # todo a múltiplos de 16 no reproduce esa distribución.
-        # AHORA: snap a 4 compases (error máximo 2 compases, ~3.75 s a 128 BPM).
-        # Corrige el error de detección sin reubicar el cue. Los múltiplos de
-        # 8/16 aparecen solos, porque así está construida la música.
-        SNAP_BARS = 4
-        snap_ms = SNAP_BARS * bar_ms
-
-        def snap(ms):
-            return first_beat_ms + round((ms - first_beat_ms) / snap_ms) * snap_ms
-
-        chosen = {}
-
-        def add(num, ms):
-            s = snap(ms)
-            if s < 0 or s >= dur_ms:
-                return
-            for k, v in chosen.items():
-                if k != num and abs(v - s) < 8 * bar_ms:
-                    return
-            if num in chosen:
-                return
-            chosen[num] = int(round(s))
-
-        def bar_to_ms(b):
-            return first_beat_ms + b * bar_ms
-
-        def jump_at(b):
-            if b < 4 or b + 4 > n_bars:
-                return -1e9
-            return float(np.mean(full_b[b:b + 4]) - np.mean(full_b[b - 4:b]))
-
-        # ---- Asignación por CAMBIOS DE ENERGÍA (metodología DeepMancho refinada) ----
-        # Reglas (German): A = inicio real, B..G = SOLO en cambios de energía reales
-        # (sube/baja considerablemente), H = último punto alto justo antes de la caída
-        # sostenida hasta el final. Nada en zona plana ni a media bajada.
-        THRESH = 0.15   # cambio de energía mínimo (0-1) para marcar un cue
-        HIGH = 0.5      # umbral de "parte alta"
-
-        def _win(arr, a, b):
-            a = max(0, int(a)); b = min(n_bars, int(b))
-            if b <= a:
-                return 0.0
-            return float(np.mean(arr[a:b]))
-
-        def win(a, b):          # energía total (banda ancha)
-            return _win(full_b, a, b)
-
-        def winb(a, b):         # energía de GRAVES (kick + bajo)
-            return _win(bass_b, a, b)
-
-        # ── CAMBIO 2 (v5.1) — la banda de graves entra en la decisión ────────
-        # ANTES: `bass_b` y `high_b` se calculaban y NO se usaban en ningún cue;
-        # todo se decidía con `full_b` (RMS de banda ancha).
-        # Ese es justo el dato que NO captura el criterio real: en un breakdown
-        # el kick desaparece (el waveform de Rekordbox se pone verde) pero si
-        # los medios siguen fuertes, el RMS de banda ancha casi no se mueve y el
-        # cambio no se marca.
-        # AHORA: el cambio se mide como el promedio del salto en banda ancha y
-        # del salto en graves. Una caída SOLO de graves (kick que sale) ya
-        # alcanza para marcar el cue, que es la regla que se quería.
-        def delta(b):  # +sube / -baja (compara 4 compases antes/después)
-            d_full = win(b, b + 4) - win(b - 4, b)
-            d_bass = winb(b, b + 4) - winb(b - 4, b)
-            return 0.5 * d_full + 0.5 * d_bass
-
-        # A (0) — inicio real: primer compás con energía sostenida
-        a_bar = 0
-        for b in range(n_bars):
-            if win(b, b + 4) > 0.12:
-                a_bar = b
+        # ── A · MIX-IN — R1: nunca el compas 0; primera frase ya estable ──────
+        # El criterio se apoya en el KICK (graves) + energia total, no en los
+        # medios: en tech house percusivo el core no tiene pads y un criterio de
+        # medios no se cumplia hasta el breakdown (refutado con senal sintetica:
+        # daba compas 64 en vez de 16).
+        a_bar = None
+        for b0 in range(PH, n_bars - PH, PH):
+            if med("low", b0, PH) >= lowref - 6 and float(np.median(tot[b0:b0 + PH])) >= ref - 10:
+                a_bar = b0
                 break
-        add(0, bar_to_ms(a_bar))
+        if a_bar is None:
+            a_bar = PH
 
-        # ── CAMBIO 1 (v5.1) — CAUSA RAÍZ del MIX-OUT al ~95% ────────────────
-        # EL BUG: la búsqueda arrancaba en `b = n_bars - 4` y medía la cola como
-        # `win(b + 4, n_bars)` = `win(n_bars, n_bars)` = 0.0 — una ventana VACÍA.
-        # Con tail=0.0, la condición `tail < here - 0.12` se cumple siempre que
-        # el compás tenga algo de energía, así que la PRIMERA iteración acertaba
-        # y H quedaba a 4 compases del final, en todos los tracks. Ese es el 95%
-        # sistemático que hubo que pisar a mano con el 78.4%.
-        #
-        # EL ARREGLO, tres condiciones:
-        #   1. La cola es una ventana REAL (mínimo TAIL_BARS compases).
-        #   2. La caída se SOSTIENE hasta el final (se mira el promedio de toda
-        #      la cola Y los últimos 8 compases, para que no valga una bajada
-        #      momentánea seguida de un repunte).
-        #   3. Queda RUNWAY suficiente después de H para mezclar (>= RUNWAY_BARS).
-        #      Esto ataca de raíz los `h_cue_runway_override` (hubo cues con
-        #      0.13 s de margen; el guardrail los atrapaba, pero el dato nacía mal).
-        TAIL_BARS = 16      # cola mínima a evaluar (~30 s a 128 BPM)
-        RUNWAY_BARS = 8     # audio mínimo después de H (~15 s a 128 BPM)
-
-        h_bar = -1
-        b = n_bars - TAIL_BARS
-        while b > a_bar + phrase_bars:
-            here = win(b - 4, b)                  # energía justo ANTES del punto
-            tail = win(b, n_bars)                 # todo lo que queda
-            tail_end = win(n_bars - 8, n_bars)    # el final propiamente dicho
-            if here >= HIGH and tail < here - 0.12 and tail_end < here - 0.12:
-                h_bar = b
+        # ── B · BASS-IN — primer multiplo de 8 con bajo pleno ────────────────
+        b_bar = a_bar
+        for b0 in range(a_bar, max(a_bar + 1, n_bars - 8), 8):
+            if med("low", b0, 8) >= lowref - 3:
+                b_bar = b0
                 break
-            b -= 4
 
-        if h_bar < 0:
-            # Fallback honesto: si la caída no se detecta (p. ej. el track
-            # termina de golpe a plena energía), se usa la mediana medida del
-            # catálogo (78.4% de la duración). Es ubicar por porcentaje, con la
-            # incertidumbre conocida de ±30 s — por eso es SOLO el fallback,
-            # nunca el camino principal.
-            h_bar = int(round(n_bars * 0.784))
+        # ── H · MIX-OUT — R3: cola real, nunca el ultimo drop ────────────────
+        # `tail_end` = ultimo compas con AUDIO (no silencio). El umbral debe ser
+        # de silencio real (-25 dB bajo el p90), no de "energia alta": con -12 dB
+        # el propio OUTRO quedaba clasificado como silencio y se recortaba el
+        # final del track, que es justo el tramo que buscamos para el MIX-OUT.
+        activos = np.where(tot >= ref - 25)[0]
+        tail_end = int(activos[-1]) if activos.size else n_bars - 1
+        RUNWAY_OBJETIVO, RUNWAY_MINIMO = 32, 16
+        # El MIX-OUT es el INICIO DEL OUTRO = comienzo del ULTIMO TRAMO
+        # CONTIGUO de baja energia que llega hasta el final del track.
+        # Dos criterios previos fallaron y quedan documentados:
+        #   (a) "ultima caida sostenida": un breakdown tambien es una caida y
+        #       H se iba al compas 48 con el outro en 144;
+        #   (b) mediana del tramo restante < p90-3 dB: la mediana de una region
+        #       mixta (drop + core + outro) cae bajo ese umbral igual, asi que
+        #       H quedaba a media seccion.
+        # Este criterio mira compas a compas hacia atras desde el final y para
+        # en cuanto la energia vuelve: es lo que define un outro.
+        UMBRAL_OUTRO = 4.0                    # dB por debajo del p90 del track
+        TOLERANCIA_HUECOS = 2                 # compases altos aislados permitidos
+        bajo = tot < (ref - UMBRAL_OUTRO)
+        b = tail_end
+        huecos = 0
+        inicio_outro = None
+        while b > b_bar + PH:
+            if bajo[b]:
+                inicio_outro = b
+                huecos = 0
+            else:
+                huecos += 1
+                if huecos > TOLERANCIA_HUECOS:
+                    break
+            b -= 1
+        if inicio_outro is not None:
+            h_bar = (inicio_outro // PH) * PH          # frase completa
+        else:                                          # sin outro claro
+            h_bar = ((tail_end - RUNWAY_OBJETIVO) // PH) * PH
+        h_bar = max(h_bar, b_bar + PH)
+        h_bar = min(h_bar, max(b_bar + PH, tail_end - RUNWAY_MINIMO))
 
-        h_bar = max(a_bar + phrase_bars, min(h_bar, n_bars - RUNWAY_BARS))
-        add(7, bar_to_ms(h_bar))
+        # ── G · PEAK — informativo (caso de falla 1 de la regla) ─────────────
+        frases = list(range(b_bar + PH, h_bar, PH))
+        g_bar = (max(frases, key=lambda b: med("mid", b, PH) + med("low", b, PH))
+                 if frases else b_bar)
 
-        # Cambios significativos entre A y H (resolución de media frase)
-        cands = []
-        for b in range(a_bar + 4, max(a_bar + 5, h_bar - 4), 4):
-            d = delta(b)
-            if abs(d) >= THRESH:
-                cands.append((b, d))
-        # dedupe por cercanía (mín 8 compases), conservando el cambio más fuerte
-        cands.sort(key=lambda x: x[0])
-        filtered = []
-        for cb, cd in cands:
-            if filtered and (cb - filtered[-1][0]) < 8:
-                if abs(cd) > abs(filtered[-1][1]):
-                    filtered[-1] = (cb, cd)
+        # ── C-F · bordes de seccion de mayor novedad entre B y H ─────────────
+        cand = sorted((b for b in nov if b_bar < b < h_bar and b != g_bar),
+                      key=lambda b: -nov[b])
+        medios = []
+        for b in cand:
+            if all(abs(b - m) >= 8 for m in medios + [a_bar, b_bar, g_bar, h_bar]):
+                medios.append(b)
+            if len(medios) == 4:
+                break
+        # Relleno honesto cuando no hay 4 bordes claros: repartir en el hueco
+        # mas grande, sin duplicar (una version previa generaba dos cues en el
+        # mismo compas).
+        while len(medios) < 4:
+            marcas = sorted(set([b_bar] + medios + [h_bar]))
+            hueco = max(zip(marcas, marcas[1:]), key=lambda p: p[1] - p[0])
+            nuevo = hueco[0] + max(4, ((hueco[1] - hueco[0]) // 8) * 4)
+            if nuevo <= hueco[0] or nuevo >= h_bar or nuevo in medios:
+                break
+            medios.append(nuevo)
+        medios = sorted(set(medios))[:4]
+
+        # R4 — reparto: al menos 2 cues en la segunda mitad
+        mitad = n_bars // 2
+        orden = [a_bar, b_bar] + medios + [g_bar, h_bar]
+        if sum(1 for b in orden if b >= mitad) < 2:
+            tardios = sorted((b for b in nov if b >= mitad and b < h_bar),
+                             key=lambda b: -nov[b])
+            if tardios:
+                medios[-1] = tardios[0]
+                medios.sort()
+                orden = [a_bar, b_bar] + medios + [g_bar, h_bar]
+
+        # ── Confianza por cue (R5) ──────────────────────────────────────────
+        def confianza(b, es_mezcla):
+            n = nov.get(b, nov.get(4 * round(b / 4), 0.0)) / nov_max
+            base = min(1.0, 0.35 + 0.65 * n)
+            if b % PH == 0:
+                base = min(1.0, base + 0.10)      # cae en frase completa
+            if es_mezcla and b % PH != 0:
+                base *= 0.6                        # R2: mezcla exige frase
+            return round(float(max(0.05, min(1.0, base))), 2)
+
+        cues = []
+        for num, b in enumerate(orden):
+            pos = int(round(anchor + b * bar_ms))
+            if pos < 0 or pos >= dur_ms - 500:
                 continue
-            filtered.append((cb, cd))
-        # si hay más de 6, conserva los 6 cambios más fuertes y reordénalos por tiempo
-        if len(filtered) > 6:
-            filtered = sorted(sorted(filtered, key=lambda x: -abs(x[1]))[:6], key=lambda x: x[0])
-
-        # Asigna B..G (1..6) en orden de tiempo; sólo avanza el número si el cue entró
-        num = 1
-        for cb, cd in filtered:
-            if num > 6:
-                break
-            before = len(chosen)
-            add(num, bar_to_ms(cb))
-            if len(chosen) > before:
-                num += 1
-
-        result = []
-        for num in sorted(chosen.keys()):
             label, color = CUE_DEF[num]
-            result.append({"number": num, "label": label, "color": color, "positionMs": chosen[num], "type": "cue"})
-        return result or None
-    except Exception:
-        traceback.print_exc()
+            cues.append({
+                "number": num, "label": label, "color": color,
+                "positionMs": pos,
+                "confidence": confianza(b, num in (0, 7)),
+            })
+        if len(cues) < 6:
+            return None
+        return cues
+    except Exception as e:
+        print(f"    detect_cues v7.3 fallo: {e}", flush=True)
         return None
 
 
@@ -1269,13 +1263,40 @@ def next_job():
     return job, data.get("track") or {}, data.get("audio_url"), data.get("rendition_upload")
 
 
+# ---------------------------------------------------------------------------
+# FORMATO ESTANDAR DE LA PLATAFORMA (DJCONNECT_AUDIO_STANDARD v1, 25-ago-2026)
+# MP3 (libmp3lame) CBR 192 kbps, 44.1 kHz, estereo. Documentado en
+# docs/estrategia-almacenamiento.md y en el doc 08 del Project Knowledge.
+# Por que MP3 y no AAC: el contenedor MP4 depende del atomo `moov` y ya produjo
+# archivos corruptos -> DEMUXER_ERROR_NO_SUPPORTED_STREAMS y "Media failed to
+# decode" en iOS Safari, medidos en produccion. MP3 no tiene contenedor fragil,
+# decodifica en todo el parque (Safari/PWA, Web Audio, Liquidsoap) y en CBR da
+# seek deterministico, que es lo que necesitan el beatgrid y los hot cues.
+# NUNCA aplicar loudnorm/volume aca: `loudness_lufs` se mide sobre el audio y la
+# normalizacion se aplica en REPRODUCCION. Normalizar en el archivo rompe esa
+# medicion y puede introducir clipping en los picos de graves.
+# ---------------------------------------------------------------------------
+AUDIO_STANDARD = {
+    "codec": "libmp3lame", "bitrate": "192k", "sample_rate": "44100",
+    "channels": "2", "ext": ".mp3", "mime": "audio/mpeg",
+}
+
+
 def make_rendition(src_path: str):
-    """Convierte a m4a/AAC 192k (reproducible en navegador). Devuelve ruta o None."""
+    """Convierte al ESTANDAR de la plataforma (MP3 CBR 192k). Ruta o None."""
     try:
-        out = src_path + ".stream.m4a"
+        out = src_path + ".stream" + AUDIO_STANDARD["ext"]
         proc = subprocess.run(
-            ["ffmpeg", "-y", "-i", src_path, "-vn", "-c:a", "aac", "-b:a", "192k",
-             "-movflags", "+faststart", out],
+            ["ffmpeg", "-y", "-i", src_path,
+             "-vn",
+             "-map_metadata", "0",          # preserva titulo/artista/BPM/key
+             "-id3v2_version", "3",
+             "-write_xing", "1",            # header Xing: duracion y seek fiables
+             "-ar", AUDIO_STANDARD["sample_rate"],
+             "-ac", AUDIO_STANDARD["channels"],
+             "-c:a", AUDIO_STANDARD["codec"],
+             "-b:a", AUDIO_STANDARD["bitrate"],
+             "-f", "mp3", out],
             capture_output=True, timeout=180,
         )
         if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
@@ -1285,15 +1306,15 @@ def make_rendition(src_path: str):
         return None
 
 
-def upload_rendition(signed_url: str, m4a_path: str) -> bool:
-    """Sube el m4a a la URL firmada de subida de Supabase Storage."""
+def upload_rendition(signed_url: str, rendition_path: str) -> bool:
+    """Sube la rendition estandar (MP3) a la URL firmada de Supabase Storage."""
     try:
-        with open(m4a_path, "rb") as f:
+        with open(rendition_path, "rb") as f:
             data = f.read()
         r = requests.put(
             signed_url,
             data=data,
-            headers={"content-type": "audio/mp4", "x-upsert": "true"},
+            headers={"content-type": AUDIO_STANDARD["mime"], "x-upsert": "true"},
             timeout=180,
         )
         return r.status_code in (200, 201)
@@ -1359,18 +1380,20 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
                         print(f"[job {job_id}] CM2 residuo alto ({anc['residuo_ms']}ms) — ancla NO escrita", flush=True)
             except Exception as e:
                 print(f"[job {job_id}] CM2 fallo (no bloquea el job): {e}", flush=True)
-        # Rendition: si la canción no tiene versión reproducible (ej. AIFF), conviértela a
-        # m4a/AAC y súbela vía la URL firmada; el backend fija stream_asset_path.
+        # Rendition: si la cancion no tiene version reproducible (ej. AIFF),
+        # conviertela al ESTANDAR (MP3 CBR 192k) y subila via la URL firmada.
+        # El backend debe fijar `stream_mp3_asset_path` con ese path; el campo
+        # `stream_asset_path` (AAC) queda LEGACY y no se escribe mas.
         if rendition_upload and rendition_upload.get("url") and rendition_upload.get("path"):
-            m4a = make_rendition(tmp)
-            if m4a:
-                if upload_rendition(rendition_upload["url"], m4a):
+            rend = make_rendition(tmp)
+            if rend:
+                if upload_rendition(rendition_upload["url"], rend):
                     result["rendition_path"] = rendition_upload["path"]
                     print(f"[job {job_id}] rendition subida: {rendition_upload['path']}", flush=True)
                 else:
                     print(f"[job {job_id}] WARN: no se pudo subir la rendition", flush=True)
                 try:
-                    os.remove(m4a)
+                    os.remove(rend)
                 except Exception:
                     pass
         # respetar bpm/key de tags: el backend solo los usa si el track no los tenía
@@ -1625,7 +1648,7 @@ def poll_set_render():
 
 
 def main():
-    print("DeepMancho worker iniciado (v7.2.1: ancla al ATAQUE del kick + downbeat por snare + cues en la rejilla nueva + grid_confidence + examen recalibrado). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.3: ancla al ATAQUE del kick + CUES POR ESTRUCTURA MUSICAL (MIX-IN nunca en el compas 0, MIX-OUT en el outro, confianza por cue)). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     if GOLDEN_EXAM:
