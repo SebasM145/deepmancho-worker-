@@ -366,35 +366,47 @@ def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
         # cues de MIK, que en 85 de 180 tracks pone cues despues del 79%.
         objetivo_rel = (0.0, 0.14, 0.25, 0.35, 0.46, 0.57, 0.68, 0.88)
         elegidos = [0]
-        for rel in objetivo_rel[1:]:
-            ideal = rel * fin_util
-            # Candidatos: limites de frase alcanzables con un salto del
-            # repertorio desde el cue anterior, dentro de una ventana del
-            # objetivo. Gana el de mayor novedad musical: el algoritmo
-            # elige, no reparte.
+
+        # --- H (SALIDA) se elige PRIMERO y con criterio propio ---------------
+        # Prioridad del dueño: el cue de inicio y el de salida son los que mas
+        # importan. H no puede ser "el ultimo que sobro": se busca el limite de
+        # frase con mayor cambio musical en la ventana final (75-92% del audio
+        # util), prefiriendo una CAIDA de energia sostenida (inicio del outro).
+        v0, v1 = int(0.75 * fin_util), int(0.92 * fin_util)
+        vent = [b for b in nov if v0 <= b <= v1]
+        if vent:
+            def score_h(b):
+                antes = float(np.median(tot[max(0, b - 8):b]))
+                despues = float(np.median(tot[b:b + 8]))
+                caida = max(0.0, antes - despues) / 6.0      # bonus si baja
+                return nov[b] / (max(nov.values()) or 1.0) + caida
+            h_bar = max(vent, key=score_h)
+        else:
+            h_bar = ((fin_util - 8) // PASO) * PASO
+
+        # --- B..G: recorren el perfil objetivo hasta llegar a H --------------
+        for rel in objetivo_rel[1:-1]:
+            ideal = rel * h_bar
             cands = []
             for salto in SALTOS:
                 b = elegidos[-1] + salto
-                if b in nov and b <= fin_util - 8 and abs(b - ideal) <= 40:
+                if b in nov and b < h_bar and abs(b - ideal) <= 40:
                     cands.append(b)
             if not cands:
                 cands = [b for b in nov
-                         if b > elegidos[-1] and abs(b - ideal) <= 24]
+                         if b > elegidos[-1] and b < h_bar and abs(b - ideal) <= 24]
             if not cands:
                 b = elegidos[-1] + 16
-                if b > fin_util - 8:
+                if b >= h_bar:
                     break
                 cands = [b]
             elegidos.append(max(cands, key=lambda b: nov.get(b, 0.0)))
-        # Relleno cuando no se llega a 8 cues. Primero hacia adelante; si ya
-        # no hay lugar (tracks cortos), se INSERTA en el hueco mas grande,
-        # siempre sobre la grilla de frase. MIK entrega 8 cues incluso en
-        # tracks de 4 minutos: quedarse en 6 no reproduce su metodologia.
+
         while len(elegidos) < 8:
-            b = elegidos[-1] + 16
-            if b > fin_util - 8:
-                b = elegidos[-1] + 8
-            if b <= fin_util - 8 and b > elegidos[-1]:
+            b = max(x for x in elegidos if x < h_bar) + 16 if any(x < h_bar for x in elegidos) else 16
+            if b >= h_bar:
+                b = max(x for x in elegidos if x < h_bar) + 8
+            if b < h_bar and b not in elegidos:
                 elegidos.append(b)
                 continue
             # Sin lugar al final: partir el hueco mas grande por la mitad,
@@ -412,6 +424,7 @@ def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
             if not cands:
                 break
             elegidos.append(max(cands, key=lambda b: nov.get(b, 0.0)))
+        elegidos = sorted(set(b for b in elegidos if b < h_bar))[:7] + [h_bar]
         elegidos = sorted(set(elegidos))[:8]
         if len(elegidos) < 6:
             return None
@@ -1024,13 +1037,15 @@ def compute_anchor(path: str, bpm: float):
 
     # --- ATAQUE de cada kick: último cruce del 25% de SU pico, hacia atrás ---
     lim_atras = int(0.150 * sr)  # un ataque real no dura más de 150 ms
-    ataques = np.empty(len(pk)); pesos = props["peak_heights"].astype(np.float64)
+    ataques = np.empty(len(pk)); subidas = np.empty(len(pk))
+    pesos = props["peak_heights"].astype(np.float64)
     for i, p in enumerate(pk):
         th = 0.25 * env[p]
         j, lo = p, max(0, p - lim_atras)
         while j > lo and env[j] > th:
             j -= 1
         ataques[i] = j / sr
+        subidas[i] = (p - j) / sr * 1000.0     # ms de ataque: el kick es seco
 
     # --- Grilla fina de tempo (BPM protegido ±0.05): histograma plegado ---
     NBINS = 256
@@ -1056,6 +1071,19 @@ def compute_anchor(path: str, bpm: float):
             mejor = (nitidez, p, H)
     nitidez, periodo_real, H = mejor
     t_beat0 = pico_interp(H, periodo_real)
+
+    # NOTA (25-ago-2026): aca se probo una DESAMBIGUACION DE FASE (v7.5) que
+    # elegia entre 4 fases candidatas la de menor "residuo de inliers + 0.6 x
+    # tiempo de ataque". FUE REFUTADA con medicion sobre 80 tracks de audio real
+    # con arbitro ciego comun: cambio la fase en 23 tracks y EMPEORO 19 de ellos.
+    #   p90 <= 20 ms : 80.0% (esta version) -> 67.5% (con seleccion)
+    #   p90 <= 10 ms : 61.3% -> 48.8%
+    #   SD del offset entre canciones: 3.26 ms -> 18.69 ms (5.7x peor)
+    # Causa: cada fase candidata armaba su PROPIO conjunto de inliers, asi que
+    # podia ganar una fase con pocos golpes secos aunque representara peor al
+    # tren global. Si alguna vez se reintenta: evaluar los candidatos contra un
+    # soporte GLOBAL congelado y exigir una ventaja minima antes de abandonar
+    # el pico del histograma. Ver docs/validacion-fase-v75.md.
 
     # --- Residuo: dispersión del pico por segmentos (solo segmentos con kicks) ---
     SEGS = 8
