@@ -328,13 +328,20 @@ def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
     try:
         bar_ms = (60000.0 / bpm) * 4
         dur_ms = (len(y) / sr) * 1000.0
-        n_bars = int(dur_ms // bar_ms)
+        # La GRILLA se cuenta desde el PRIMER BEAT REAL (ancla certificada), no
+        # desde t=0. Medido sobre 10 tracks: contando desde cero, los cues caian
+        # en compases 6.01, 18.01, 15.36... es decir, en multiplos de compas pero
+        # DESFASADOS de la frase musical, porque el archivo arranca antes del
+        # primer golpe. El cue A sigue yendo al segundo 0 (metodologia MIK), pero
+        # los otros 7 se cuentan desde el ancla para caer en frases reales.
+        anchor_ms = float(first_beat_ms or 0.0)
+        if anchor_ms < 0 or anchor_ms > dur_ms:
+            anchor_ms = 0.0
+        n_bars = int((dur_ms - anchor_ms) // bar_ms)
         if n_bars < 24:
             return None
 
-        # El cue A es el CERO: toda la grilla se mide desde el arranque del
-        # audio, no desde el ancla de rejilla (regla 1).
-        F = _bar_band_energies(y, sr, 0.0, bar_ms, n_bars)
+        F = _bar_band_energies(y, sr, anchor_ms, bar_ms, n_bars)
         tot = 20 * np.log10(np.maximum(
             np.sqrt(sum(10 ** (F[k] / 10) for k in F)), 1e-6))
         p10, p90 = float(np.percentile(tot, 10)), float(np.percentile(tot, 90))
@@ -431,7 +438,9 @@ def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
 
         cues = []
         for num, b in enumerate(elegidos):
-            pos = int(round(b * bar_ms))
+            # cue A = segundo 0 del archivo (metodologia MIK); el resto sobre la
+            # grilla de frase medida desde el primer beat real.
+            pos = 0 if num == 0 else int(round(anchor_ms + b * bar_ms))
             if pos >= dur_ms - 500:
                 continue
             label, color = CUE_DEF[num]
@@ -1649,7 +1658,7 @@ def poll_set_render():
 
 
 def main():
-    print("DeepMancho worker iniciado (v7.4: ancla al ATAQUE del kick + HOT CUES metodologia MIK (A en cero, grilla de 8 compases, energia 1-10) + rendition MP3 192k). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.4.1: ancla al ATAQUE del kick + HOT CUES metodologia MIK (grilla desde el primer beat) (A en cero, grilla de 8 compases, energia 1-10) + rendition MP3 192k). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     if GOLDEN_EXAM:
