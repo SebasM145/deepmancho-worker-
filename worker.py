@@ -771,7 +771,12 @@ def analyze(path: str, bpm_seed=None) -> dict:
     rms_full = librosa.feature.rms(y=y)[0]
     energy = compute_energy(rms_full, bands)
     key, camelot = detect_key(y, sr)
-    cues = detect_cues(y, sr, bpm, first_beat_ms)
+    # Los cues NO se calculan aca: dependen del ANCLA, que se mide mas abajo
+    # (compute_anchor). Una version previa los calculaba en este punto con la
+    # rejilla vieja y despues el ancla cambiaba, dejando los cues cuantizados
+    # contra una rejilla que ya no existia. Medido sobre 40 tracks reales: solo
+    # el 8% quedaba en la grilla de frase.
+    cues = None
     vocal_segments = detect_vocal_segments(y, sr, bpm, first_beat_ms)
 
     out = {
@@ -822,6 +827,10 @@ def analyze(path: str, bpm_seed=None) -> dict:
                 fb = float(first_beat_ms or 0)
                 print("    v7 ancla: fallback a la rejilla interna", flush=True)
 
+            # AHORA si: los cues se calculan sobre el ancla DEFINITIVA.
+            cues = detect_cues(y, sr, bpm_grid, fb)
+            out["cue_points"] = cues
+
             # 2-3) MIX-IN/MIX-OUT v7.1: REFUTADOS en el lote de 25 (20-ago) —
             # MIX-IN roto en tracks dinámicos, MIX-OUT empeoró el conjunto.
             # Quedan detrás de ENABLE_MIX_V7=1 (default APAGADO). La colocación
@@ -851,6 +860,12 @@ def analyze(path: str, bpm_seed=None) -> dict:
                             c2["positionMs"] = int(mo)
                     nuevos.append(c2)
                 for c2 in nuevos:
+                    # El cue A va SIEMPRE al segundo 0 del archivo (metodologia
+                    # MIK: es el punto de carga). Esta re-cuantizacion lo movia
+                    # al downbeat mas cercano (medido: 0 -> 907 ms).
+                    if int(c2.get("number", -1)) == 0:
+                        c2["positionMs"] = 0
+                        continue
                     p = c2["positionMs"]
                     # MIX-IN/OUT al compás; el resto de los cues al BEAT (los
                     # hot cues intermedios pueden legítimamente caer a mitad
@@ -1658,7 +1673,7 @@ def poll_set_render():
 
 
 def main():
-    print("DeepMancho worker iniciado (v7.4.1: ancla al ATAQUE del kick + HOT CUES metodologia MIK (grilla desde el primer beat) (A en cero, grilla de 8 compases, energia 1-10) + rendition MP3 192k). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.4.2: HOT CUES metodologia MIK sobre el ancla DEFINITIVA (A en cero, grilla de 8 compases, energia 1-10) + rendition MP3 192k). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     if GOLDEN_EXAM:
