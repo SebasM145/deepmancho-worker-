@@ -1,0 +1,10 @@
+# DeepMancho — verificador de rejilla (servicio aparte del worker, misma repo).
+# Imagen mínima: ffmpeg + numpy/scipy. No usa librosa ni requirements.txt.
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+RUN pip install --no-cache-dir "numpy>=1.26,<3" "scipy>=1.11,<2"
+COPY grid_verifier.py .
+ENV PYTHONUNBUFFERED=1
+CMD ["python", "-u", "grid_verifier.py"]
