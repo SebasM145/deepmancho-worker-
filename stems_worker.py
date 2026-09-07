@@ -45,10 +45,10 @@ SECRET = os.environ["WORKER_SECRET"]
 POLL = int(os.environ.get("POLL_INTERVAL_SECONDS", "15"))
 MODEL = os.environ.get("STEMS_MODEL", "htdemucs_6s")
 # Los modelos htdemucs no aceptan segmentos > 7.8 s (largo de entrenamiento).
-SEGMENT = str(min(7.8, float(os.environ.get("DEMUCS_SEGMENT", "7"))))
+SEGMENT = str(int(min(7, int(float(os.environ.get("DEMUCS_SEGMENT", "7"))))))  # entero: demucs no acepta decimales
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.1"
+VERSION = "1.2"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
