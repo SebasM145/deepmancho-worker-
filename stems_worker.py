@@ -49,7 +49,7 @@ MODEL = os.environ.get("STEMS_MODEL", "htdemucs_6s")
 SEGMENT = str(int(min(7, int(float(os.environ.get("DEMUCS_SEGMENT", "7"))))))  # entero: demucs no acepta decimales
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.3"
+VERSION = "1.4"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -198,6 +198,29 @@ def drum_grid(path: Path, bpm: float, anchor_ms: float, duration: float):
     kick_t = band_onsets(30, 150, 0.6)
     snare_t = band_onsets(150, 2500, 0.5)
     hat_t = band_onsets(5000, 11000, 0.4)
+
+    # BOMBO LIMPIO: el bajo se cuela en la banda de graves. Un bombo real trae
+    # un transitorio ("clic") en 2–6 kHz que el bajo no tiene. Se exige ese
+    # clic y, además, un solo golpe por corchea (el más fuerte).
+    if len(kick_t):
+        click = S[(freqs >= 2000) & (freqs < 6000)].sum(axis=0)
+        low = S[(freqs >= 30) & (freqs < 150)].sum(axis=0)
+        fr = lambda t: min(len(low) - 1, int(t * sr / hop))
+        click_med = np.median(click[click > 0]) if np.any(click > 0) else 0.0
+        kept = []
+        for t in kick_t:
+            i = fr(t)
+            has_click = click[i] > 1.5 * click_med
+            if has_click:
+                kept.append((t, low[i]))
+        # un bombo por corchea: si dos caen en la misma corchea, queda el más fuerte
+        eighth = 60.0 / bpm / 2.0
+        by_slot = {}
+        for t, energy in kept:
+            slot = int(round(t / eighth))
+            if slot not in by_slot or energy > by_slot[slot][1]:
+                by_slot[slot] = (t, energy)
+        kick_t = np.array(sorted(t for t, _ in by_slot.values()))
 
     # La banda de medios recoge el cuerpo del bombo: un "golpe de caja" que
     # coincide (±25 ms) con un bombo y no tiene más energía en 1.5–4 kHz que
