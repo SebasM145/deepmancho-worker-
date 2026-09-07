@@ -1,0 +1,23 @@
+# Dockerfile.stems — servicio de stems y patrones (DJConnect)
+# Mismo patrón que Dockerfile.verifier: imagen propia, arranque propio, no toca worker.py
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    OMP_NUM_THREADS=2 \
+    MKL_NUM_THREADS=2 \
+    TORCH_HOME=/models \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libsndfile1 \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements-stems.txt .
+# torch solo CPU: la imagen queda en ~2 GB en vez de ~6
+RUN pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements-stems.txt
+
+# Descarga el modelo de Demucs en el build para que el primer job no espere 300 MB
+RUN python -c "from demucs.pretrained import get_model; get_model('htdemucs_6s'); get_model('htdemucs')"
+
+COPY stems_worker.py .
+CMD ["python", "-u", "stems_worker.py"]
