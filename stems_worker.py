@@ -44,9 +44,11 @@ API = os.environ["WORKER_API_URL"].rstrip("/")
 SECRET = os.environ["WORKER_SECRET"]
 POLL = int(os.environ.get("POLL_INTERVAL_SECONDS", "15"))
 MODEL = os.environ.get("STEMS_MODEL", "htdemucs_6s")
-SEGMENT = os.environ.get("DEMUCS_SEGMENT", "8")
+# Los modelos htdemucs no aceptan segmentos > 7.8 s (largo de entrenamiento).
+SEGMENT = str(min(7.8, float(os.environ.get("DEMUCS_SEGMENT", "7"))))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
+VERSION = "1.1"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -84,10 +86,16 @@ def download(url: str, dest: Path):
     return dest
 
 
-def upload(url: str, path: Path, content_type="audio/mpeg"):
+def upload(target, path: Path, content_type="audio/mpeg"):
+    """`target` es el objeto {path, url, token} que entrega stems-next (o una URL simple)."""
+    url = target["url"] if isinstance(target, dict) else target
+    headers = {"Content-Type": content_type, "x-upsert": "true"}
+    if isinstance(target, dict) and target.get("token") and "token=" not in url:
+        headers["Authorization"] = f"Bearer {target['token']}"
     with open(path, "rb") as f:
-        r = requests.put(url, data=f, headers={"Content-Type": content_type, "x-upsert": "true"}, timeout=600)
-    r.raise_for_status()
+        r = requests.put(url, data=f, headers=headers, timeout=600)
+    if not r.ok:
+        raise RuntimeError(f"subida falló {r.status_code}: {r.text[:200]}")
 
 
 # ----------------------------------------------------------------------------- audio
@@ -114,7 +122,10 @@ def run_demucs(src: Path, outdir: Path) -> dict[str, Path]:
         "--segment", SEGMENT, "--mp3", "--mp3-bitrate", "192", "-o", str(outdir), str(src),
     ]
     log("demucs:", " ".join(cmd[2:]))
-    subprocess.run(cmd, check=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "")[-1500:]
+        raise RuntimeError(f"demucs salió con {proc.returncode}: {tail}")
     base = outdir / MODEL / src.stem
     stems = {p.stem: p for p in base.glob("*.mp3")}
     if not stems:
@@ -287,9 +298,11 @@ def process(job: dict):
         stems_out = {}
         for name, p in stems.items():
             if name in uploads:
-                upload(uploads[name], p)
-                stems_out[name] = {"path": None, "duration_seconds": round(ffprobe_duration(p), 2), "lufs": lufs_of(p)}
-                log(f"  subido {name}")
+                target = uploads[name]
+                upload(target, p)
+                stored_path = target["path"] if isinstance(target, dict) else None
+                stems_out[name] = {"path": stored_path, "duration_seconds": round(ffprobe_duration(p), 2), "lufs": lufs_of(p)}
+                log(f"  subido {name} -> {stored_path}")
 
         _, to_beat = beat_grid(bpm, anchor_ms)
         bass_midi = midi_notes(stems["bass"], to_beat, 24, 60) if "bass" in stems else []
@@ -316,7 +329,7 @@ def process(job: dict):
 
 
 def main():
-    log(f"stems_worker listo · modelo {MODEL} · segmento {SEGMENT}s · sondeo cada {POLL}s")
+    log(f"stems_worker v{VERSION} listo · modelo {MODEL} · segmento {SEGMENT}s · sondeo cada {POLL}s")
     while True:
         try:
             job = claim()
