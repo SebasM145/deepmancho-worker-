@@ -30,6 +30,7 @@ import json
 import math
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -48,7 +49,7 @@ MODEL = os.environ.get("STEMS_MODEL", "htdemucs_6s")
 SEGMENT = str(int(min(7, int(float(os.environ.get("DEMUCS_SEGMENT", "7"))))))  # entero: demucs no acepta decimales
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.2"
+VERSION = "1.3"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -198,6 +199,21 @@ def drum_grid(path: Path, bpm: float, anchor_ms: float, duration: float):
     snare_t = band_onsets(150, 2500, 0.5)
     hat_t = band_onsets(5000, 11000, 0.4)
 
+    # La banda de medios recoge el cuerpo del bombo: un "golpe de caja" que
+    # coincide (±25 ms) con un bombo y no tiene más energía en 1.5–4 kHz que
+    # el bombo en su banda, es bombo colado. Se descarta.
+    if len(kick_t) and len(snare_t):
+        hi = S[(freqs >= 1500) & (freqs < 4000)].sum(axis=0)
+        lo = S[(freqs >= 30) & (freqs < 150)].sum(axis=0)
+        fr = lambda t: min(len(hi) - 1, int(t * sr / hop))
+        keep = []
+        for t in snare_t:
+            near = np.abs(kick_t - t).min() < 0.025
+            if near and hi[fr(t)] < 0.35 * lo[fr(t)]:
+                continue
+            keep.append(t)
+        snare_t = np.array(keep)
+
     ms_per_beat, to_beat = beat_grid(bpm, anchor_ms)
     steps_per_bar = 16
     total_beats = max(0.0, to_beat(duration))
@@ -328,13 +344,39 @@ def process(job: dict):
         shutil.rmtree(work, ignore_errors=True)
 
 
+CURRENT_JOB = {"id": None}
+
+
+def requeue(job_id: str):
+    """Devuelve a la cola un trabajo que este proceso no va a terminar."""
+    try:
+        requests.post(f"{API}/stems-result", headers=HEADERS,
+                      json={"job_id": job_id, "ok": False, "error": "requeue:shutdown"}, timeout=15)
+        log(f"[{job_id[:8]}] devuelto a la cola por apagado")
+    except Exception as e:  # noqa: BLE001
+        log("no se pudo devolver el trabajo:", repr(e))
+
+
+def _on_shutdown(signum, _frame):
+    log(f"señal {signum}: apagando")
+    if CURRENT_JOB["id"]:
+        requeue(CURRENT_JOB["id"])
+    sys.exit(0)
+
+
 def main():
+    signal.signal(signal.SIGTERM, _on_shutdown)
+    signal.signal(signal.SIGINT, _on_shutdown)
     log(f"stems_worker v{VERSION} listo · modelo {MODEL} · segmento {SEGMENT}s · sondeo cada {POLL}s")
     while True:
         try:
             job = claim()
             if job:
-                process(job)
+                CURRENT_JOB["id"] = job["job_id"]
+                try:
+                    process(job)
+                finally:
+                    CURRENT_JOB["id"] = None
                 continue
         except Exception as e:  # noqa: BLE001
             log("error en el sondeo:", repr(e))
