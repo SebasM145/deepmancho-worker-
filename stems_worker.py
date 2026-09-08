@@ -49,7 +49,7 @@ MODEL = os.environ.get("STEMS_MODEL", "htdemucs_6s")
 SEGMENT = str(int(min(7, int(float(os.environ.get("DEMUCS_SEGMENT", "7"))))))  # entero: demucs no acepta decimales
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.4"
+VERSION = "1.5"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -321,6 +321,174 @@ def stem_stats(stems: dict[str, Path], bass_notes, grid):
 
 
 # ----------------------------------------------------------------------------- job
+# ───────────────────────── PERFIL DE SONIDO (para clonar) ────────────────────
+# Mide, sobre cada stem, lo que un productor ajusta para reconstruir el sonido
+# con su propio instrumento: afinación, cola, brillo, clic, sidechain. NO copia
+# audio: devuelve números. Con esos números el Estudio arma un preset y lo
+# valida A/B contra el stem original.
+
+def _env_db(y, sr, hop=256):
+    frames = np.lib.stride_tricks.sliding_window_view(y, hop)[::hop]
+    rms = np.sqrt((frames ** 2).mean(axis=1) + 1e-12)
+    return 20 * np.log10(rms + 1e-9)
+
+
+def _decay_ms(seg, sr, drop_db=20.0):
+    """Tiempo hasta que la envolvente cae `drop_db` por debajo del pico."""
+    if len(seg) < 64:
+        return 0.0
+    env = _env_db(seg, sr)
+    if not len(env):
+        return 0.0
+    peak_i = int(np.argmax(env))
+    thr = env[peak_i] - drop_db
+    below = np.where(env[peak_i:] < thr)[0]
+    frames = (below[0] if len(below) else len(env) - peak_i)
+    return round(frames * 256 / sr * 1000.0, 1)
+
+
+def _centroid_hz(seg, sr):
+    if len(seg) < 512:
+        return 0.0
+    spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg))))
+    freqs = np.fft.rfftfreq(len(seg), 1 / sr)
+    tot = spec.sum()
+    return round(float((spec * freqs).sum() / tot), 1) if tot > 0 else 0.0
+
+
+def _band_ratio(seg, sr, lo, hi):
+    if len(seg) < 64:
+        return 0.0
+    n = max(2048, len(seg))  # relleno con ceros: los tramos cortos (clic) también se miden
+    spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg)), n=n)) ** 2
+    freqs = np.fft.rfftfreq(n, 1 / sr)
+    tot = spec.sum()
+    return round(float(spec[(freqs >= lo) & (freqs < hi)].sum() / tot), 3) if tot > 0 else 0.0
+
+
+def _cutoff_hz(seg, sr, pct=0.9):
+    """Frecuencia bajo la cual está el `pct` de la energía (proxy del corte de filtro)."""
+    if len(seg) < 1024:
+        return 0.0
+    spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg)))) ** 2
+    freqs = np.fft.rfftfreq(len(seg), 1 / sr)
+    cum = np.cumsum(spec) / (spec.sum() + 1e-12)
+    return round(float(freqs[int(np.searchsorted(cum, pct))]), 1)
+
+
+def _dominant_hz(seg, sr, lo=30, hi=200):
+    if len(seg) < 1024:
+        return 0.0
+    spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg))))
+    freqs = np.fft.rfftfreq(len(seg), 1 / sr)
+    m = (freqs >= lo) & (freqs < hi)
+    return round(float(freqs[m][int(np.argmax(spec[m]))]), 1) if m.any() else 0.0
+
+
+def _hits(y, sr, onsets_s, pre=0.0, post=0.4, max_n=40):
+    out = []
+    for t in onsets_s[:max_n]:
+        a = int(max(0, (t - pre) * sr)); b = int(min(len(y), (t + post) * sr))
+        if b - a > 256:
+            out.append(y[a:b])
+    return out
+
+
+def sound_profile(stems: dict, grid: dict, bpm: float, anchor_ms: float) -> dict:
+    """Un perfil por rol con los parámetros que hacen falta para clonarlo."""
+    prof = {}
+    try:
+        beat = 60.0 / bpm
+        anchor = anchor_ms / 1000.0
+        if "drums" in stems:
+            y, sr = to_wav_mono(stems["drums"], 22050)
+            spb = grid.get("steps_per_bar", 16)
+            def times_of(row_name):
+                ts = []
+                rows = grid.get(row_name) or []
+                for bi, row in enumerate(rows):
+                    for s, v in enumerate(row):
+                        if v:
+                            ts.append(anchor + bi * 4 * beat + s * (4 * beat / spb))
+                return ts
+            kick_hits = _hits(y, sr, times_of("kick"), post=0.5)
+            if kick_hits:
+                prof["kick"] = {
+                    "tune_hz": float(np.median([_dominant_hz(h, sr) for h in kick_hits])),
+                    "decay_ms": float(np.median([_decay_ms(h, sr) for h in kick_hits])),
+                    "click_ratio": float(np.median([_band_ratio(h[: int(0.01 * sr)], sr, 2000, 6000) for h in kick_hits])),
+                    "sub_ratio": float(np.median([_band_ratio(h, sr, 30, 80) for h in kick_hits])),
+                }
+            hat_hits = _hits(y, sr, times_of("hat"), post=0.25)
+            if hat_hits:
+                prof["hats"] = {
+                    "centroid_hz": float(np.median([_centroid_hz(h, sr) for h in hat_hits])),
+                    "decay_ms": float(np.median([_decay_ms(h, sr, 15.0) for h in hat_hits])),
+                }
+            snare_hits = _hits(y, sr, times_of("snare"), post=0.3)
+            if snare_hits:
+                prof["clap"] = {
+                    "centroid_hz": float(np.median([_centroid_hz(h, sr) for h in snare_hits])),
+                    "decay_ms": float(np.median([_decay_ms(h, sr) for h in snare_hits])),
+                }
+        if "bass" in stems:
+            yb, sr = to_wav_mono(stems["bass"], 22050)
+            mid = yb[len(yb) // 3: 2 * len(yb) // 3]
+            seg = mid[: sr * 8] if len(mid) > sr * 8 else mid
+            bass = {
+                "cutoff_hz": _cutoff_hz(seg, sr),
+                "centroid_hz": _centroid_hz(seg, sr),
+                "harmonic_ratio": _band_ratio(seg, sr, 200, 2000),
+                "sub_ratio": _band_ratio(seg, sr, 30, 90),
+            }
+            # Sidechain: cuánto cae el bajo justo después de cada bombo.
+            kicks = []
+            if "drums" in stems and grid.get("kick"):
+                spb = grid.get("steps_per_bar", 16)
+                for bi, row in enumerate(grid["kick"]):
+                    for s, v in enumerate(row):
+                        if v:
+                            kicks.append(anchor + bi * 4 * beat + s * (4 * beat / spb))
+            if kicks:
+                env = _env_db(yb, sr)
+                fr = lambda t: min(len(env) - 1, int(t * sr / 256))
+                dips = []
+                for t in kicks[:200]:
+                    a = env[fr(t + 0.02)]; b = env[fr(t + 0.16)]
+                    if np.isfinite(a) and np.isfinite(b):
+                        dips.append(b - a)
+                if dips:
+                    bass["sidechain_db"] = round(float(np.median(dips)), 1)
+            prof["bass"] = bass
+        if "other" in stems:
+            yo, sr = to_wav_mono(stems["other"], 22050)
+            mid = yo[len(yo) // 3: 2 * len(yo) // 3]
+            seg = mid[: sr * 8] if len(mid) > sr * 8 else mid
+            env = _env_db(seg, sr)
+            # Ataque medio: pads suben lento, stabs suben rápido.
+            rises = []
+            for i in range(1, len(env)):
+                if env[i] - env[i - 1] > 6:
+                    j = i
+                    while j < len(env) - 1 and env[j + 1] > env[j]:
+                        j += 1
+                    rises.append((j - i + 1) * 256 / sr * 1000.0)
+            prof["other"] = {
+                "centroid_hz": _centroid_hz(seg, sr),
+                "cutoff_hz": _cutoff_hz(seg, sr),
+                "attack_ms": round(float(np.median(rises)), 1) if rises else 0.0,
+                "character": "stab" if rises and np.median(rises) < 40 else "pad",
+            }
+        if "vocals" in stems:
+            yv, sr = to_wav_mono(stems["vocals"], 22050)
+            prof["vocals"] = {"centroid_hz": _centroid_hz(yv[len(yv)//3: len(yv)//3 + sr*8], sr)}
+    except Exception as e:  # noqa: BLE001
+        log("perfil de sonido incompleto:", repr(e))
+    for k, v in prof.items():
+        prof[k] = {kk: (round(float(vv), 3) if isinstance(vv, (int, float, np.floating)) else vv) for kk, vv in v.items()}
+    return prof
+
+
 def process(job: dict):
     job_id = job["job_id"]
     bpm = float(job.get("bpm_fine") or job.get("bpm") or 126)
@@ -352,8 +520,9 @@ def process(job: dict):
         chords = chords_per_bar([stems[s] for s in ("bass", "other", "piano") if s in stems], bpm, anchor_ms, grid["bars"])
         stats = stem_stats(stems, bass_midi, grid)
 
+        profile = sound_profile(stems, grid, bpm, anchor_ms)
         patterns = {"bass_midi": bass_midi, "melody_midi": melody_midi, "drum_grid": grid,
-                    "chords": chords, "stats": stats, "model": MODEL}
+                    "chords": chords, "stats": stats, "model": MODEL, "sound_profile": profile}
         report(job_id, True, stems_out, patterns)
         log(f"[{job_id[:8]}] listo: {len(stems_out)} stems, {len(bass_midi)} notas de bajo, {grid['bars']} compases")
     except Exception as e:  # noqa: BLE001
