@@ -56,7 +56,7 @@ os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.9"
+VERSION = "1.10"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -134,10 +134,16 @@ def run_demucs(src: Path, outdir: Path, model: str = MODEL) -> dict[str, Path]:
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "")[-1500:]
         raise RuntimeError(f"demucs salió con {proc.returncode}: {tail}")
-    base = outdir / MODEL / src.stem
+    # OJO: demucs guarda en <salida>/<modelo>/<nombre>/ — hay que usar el
+    # modelo que se le pasó, no el de por defecto. (Bug de la v1.9.)
+    base = outdir / model / src.stem
     stems = {p.stem: p for p in base.glob("*.mp3")}
     if not stems:
-        raise RuntimeError("demucs no produjo stems")
+        encontrado = [str(p.relative_to(outdir)) for p in outdir.rglob("*.mp3")][:8]
+        raise RuntimeError(
+            f"demucs no produjo stems en {base.relative_to(outdir)}"
+            + (f"; sí hay: {encontrado}" if encontrado else "")
+        )
     return stems
 
 
