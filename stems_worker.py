@@ -47,9 +47,16 @@ POLL = int(os.environ.get("POLL_INTERVAL_SECONDS", "15"))
 MODEL = os.environ.get("STEMS_MODEL", "htdemucs_6s")
 # Los modelos htdemucs no aceptan segmentos > 7.8 s (largo de entrenamiento).
 SEGMENT = str(int(min(7, int(float(os.environ.get("DEMUCS_SEGMENT", "7"))))))  # entero: demucs no acepta decimales
+# La máquina tiene 24 núcleos y demucs usaba 2,4. JOBS procesa trozos en
+# paralelo (cada uno pide memoria: 4 jobs ≈ 8 GB, entra de sobra en 24 GB).
+JOBS = str(max(1, int(os.environ.get("DEMUCS_JOBS", "4"))))
+# overlap 0.25 es el defecto; 0.15 acelera ~15 % con diferencia inaudible.
+OVERLAP = str(float(os.environ.get("DEMUCS_OVERLAP", "0.15")))
+os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
+os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.6"
+VERSION = "1.7"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -120,7 +127,7 @@ def to_wav_mono(path: Path, sr: int = 22050) -> tuple[np.ndarray, int]:
 def run_demucs(src: Path, outdir: Path) -> dict[str, Path]:
     cmd = [
         sys.executable, "-m", "demucs", "-n", MODEL, "-d", "cpu",
-        "--segment", SEGMENT, "--mp3", "--mp3-bitrate", "192", "-o", str(outdir), str(src),
+        "--segment", SEGMENT, "-j", JOBS, "--overlap", OVERLAP, "--mp3", "--mp3-bitrate", "192", "-o", str(outdir), str(src),
     ]
     log("demucs:", " ".join(cmd[2:]))
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -590,7 +597,7 @@ def _on_shutdown(signum, _frame):
 def main():
     signal.signal(signal.SIGTERM, _on_shutdown)
     signal.signal(signal.SIGINT, _on_shutdown)
-    log(f"stems_worker v{VERSION} listo · modelo {MODEL} · segmento {SEGMENT}s · sondeo cada {POLL}s")
+    log(f"stems_worker v{VERSION} listo · modelo {MODEL} · segmento {SEGMENT}s · jobs {JOBS} · overlap {OVERLAP} · hilos {os.environ.get('OMP_NUM_THREADS')} · sondeo cada {POLL}s")
     while True:
         try:
             job = claim()
