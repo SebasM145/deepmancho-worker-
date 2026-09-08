@@ -56,7 +56,7 @@ os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.10"
+VERSION = "1.11"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -192,6 +192,39 @@ def midi_notes(path: Path, to_beat, lo: int, hi: int, max_notes=4000):
 BPM_GLOBAL = [126.0]  # se fija por job; evita pasar bpm por todos lados
 
 
+def refine_anchor(kick_times, bpm: float, anchor_s: float) -> float:
+    """Ajusta el ancla al pulso real del bombo.
+
+    La rejilla se arma desde `anchor_s`. Si esa ancla está mal (o no viene,
+    como en los temas generados, donde llega NULL y se asume 0), TODO sale
+    corrido: el riff empieza en el paso equivocado, el patrón reusado entra a
+    destiempo y el vaivén se mide mal.
+
+    Como el bombo de club cae en el pulso, se mide cuánto se desvía cada golpe
+    respecto de la rejilla y se corre el ancla esa cantidad. Es estimación de
+    fase de toda la vida, hecha sobre el instrumento más confiable.
+    """
+    if len(kick_times) < 8:
+        return anchor_s
+    beat = 60.0 / bpm
+    # Desvío de cada golpe respecto del pulso más cercano, en fracción de pulso.
+    fases = ((np.asarray(kick_times) - anchor_s) / beat) % 1.0
+    # Media circular: los desvíos viven en un círculo (0.99 y 0.01 están juntos).
+    ang = 2 * np.pi * fases
+    media = np.arctan2(np.sin(ang).mean(), np.cos(ang).mean()) / (2 * np.pi)
+    if media < 0:
+        media += 1.0
+    if media > 0.5:
+        media -= 1.0            # corregir hacia atrás si está más cerca por ese lado
+    corr = media * beat
+    # Cuánto de acuerdo están los golpes entre sí (0 = dispersos, 1 = clavados).
+    fuerza = float(np.hypot(np.sin(ang).mean(), np.cos(ang).mean()))
+    if fuerza < 0.5 or abs(corr) < 0.005:
+        return anchor_s          # sin consenso o ya está bien: no tocar
+    log(f"ancla corregida {corr*1000:+.0f} ms (acuerdo {fuerza:.2f})")
+    return anchor_s + corr
+
+
 def drum_grid(path: Path, bpm: float, anchor_ms: float, duration: float):
     """Rejilla kick/snare/hat por semicorchea a partir de picos de energía por banda."""
     import librosa
@@ -234,6 +267,10 @@ def drum_grid(path: Path, bpm: float, anchor_ms: float, duration: float):
             if slot not in by_slot or energy > by_slot[slot][1]:
                 by_slot[slot] = (t, energy)
         kick_t = np.array(sorted(t for t, _ in by_slot.values()))
+
+    # El ancla manda sobre TODO lo que viene después: corregirla acá, con el
+    # bombo ya limpio, antes de armar la rejilla.
+    anchor_ms = refine_anchor(kick_t, bpm, anchor_ms / 1000.0) * 1000.0
 
     # La banda de medios recoge el cuerpo del bombo: un "golpe de caja" que
     # coincide (±25 ms) con un bombo y no tiene más energía en 1.5–4 kHz que
