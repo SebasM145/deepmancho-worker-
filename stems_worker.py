@@ -56,7 +56,7 @@ os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.8"
+VERSION = "1.9"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -124,9 +124,9 @@ def to_wav_mono(path: Path, sr: int = 22050) -> tuple[np.ndarray, int]:
     return np.frombuffer(raw, dtype=np.float32), sr
 
 
-def run_demucs(src: Path, outdir: Path) -> dict[str, Path]:
+def run_demucs(src: Path, outdir: Path, model: str = MODEL) -> dict[str, Path]:
     cmd = [
-        sys.executable, "-m", "demucs", "-n", MODEL, "-d", "cpu",
+        sys.executable, "-m", "demucs", "-n", model, "-d", "cpu",
         "--segment", SEGMENT, "-j", JOBS, "--overlap", OVERLAP, "--mp3", "--mp3-bitrate", "192", "-o", str(outdir), str(src),
     ]
     log("demucs:", " ".join(cmd[2:]))
@@ -545,7 +545,12 @@ def process(job: dict):
         duration = float(job.get("duration_seconds") or ffprobe_duration(src))
         log(f"[{job_id[:8]}] {duration:.0f}s @ {bpm:.2f} bpm, ancla {anchor_ms:.0f} ms")
 
-        stems = run_demucs(src, work / "out")
+        # El trabajo puede pedir otro modelo: htdemucs_6s separa piano y
+        # guitarra en pistas propias (a cambio de algo menos de limpieza).
+        model = str(job.get("model") or MODEL)
+        if model not in ("htdemucs", "htdemucs_ft", "htdemucs_6s", "mdx_extra"):
+            model = MODEL
+        stems = run_demucs(src, work / "out", model)
         uploads = job.get("uploads", {})
         stems_out = {}
         for name, p in stems.items():
@@ -560,6 +565,30 @@ def process(job: dict):
         bass_midi = midi_notes(stems["bass"], to_beat, 24, 60) if "bass" in stems else []
         melody_src = [s for s in ("piano", "other", "guitar") if s in stems]
         melody_midi = midi_notes(stems[melody_src[0]], to_beat, 48, 96) if melody_src else []
+
+        # PARTES COMPLETAS POR INSTRUMENTO
+        # No alcanza con "el riff": el DJ quiere todo lo que toca cada
+        # instrumento en la canción entera, para editarlo y reusarlo. Basic
+        # Pitch es polifónico, así que un piano o unos pads salen con sus
+        # acordes reales, no con una etiqueta por compás.
+        parts = {}
+        RANGES = {          # rango de notas MIDI razonable por instrumento
+            "piano": (36, 96), "guitar": (40, 88), "other": (36, 96),
+            "vocals": (48, 84), "bass": (24, 60),
+        }
+        for name, (lo, hi) in RANGES.items():
+            if name not in stems:
+                continue
+            if name == "bass":
+                parts["bass"] = bass_midi          # ya transcrito
+                continue
+            try:
+                seq = midi_notes(stems[name], to_beat, lo, hi, max_notes=6000)
+                if seq:
+                    parts[name] = seq
+                    log(f"[{job_id[:8]}] parte {name}: {len(seq)} notas")
+            except Exception as e:  # noqa: BLE001
+                log(f"[{job_id[:8]}] no se pudo transcribir {name}:", repr(e))
         grid = drum_grid(stems["drums"], bpm, anchor_ms, duration) if "drums" in stems else \
             {"steps_per_bar": 16, "bars": 0, "kick": [], "snare": [], "hat": []}
         chords = chords_per_bar([stems[s] for s in ("bass", "other", "piano") if s in stems], bpm, anchor_ms, grid["bars"])
@@ -567,7 +596,8 @@ def process(job: dict):
 
         profile = sound_profile(stems, grid, bpm, anchor_ms)
         patterns = {"bass_midi": bass_midi, "melody_midi": melody_midi, "drum_grid": grid,
-                    "chords": chords, "stats": stats, "model": MODEL, "sound_profile": profile}
+                    "chords": chords, "stats": stats, "model": model, "sound_profile": profile,
+                    "parts": parts}
         report(job_id, True, stems_out, patterns)
         log(f"[{job_id[:8]}] listo: {len(stems_out)} stems, {len(bass_midi)} notas de bajo, {grid['bars']} compases")
     except Exception as e:  # noqa: BLE001
