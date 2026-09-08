@@ -56,7 +56,7 @@ os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.7"
+VERSION = "1.8"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -529,7 +529,14 @@ def sound_profile(stems: dict, grid: dict, bpm: float, anchor_ms: float) -> dict
 
 def process(job: dict):
     job_id = job["job_id"]
-    bpm = float(job.get("bpm_fine") or job.get("bpm") or 126)
+    # bpm_fine NO es el tempo: es una corrección de milésimas sobre bpm.
+    # Usarlo como tempo absoluto daba 0.001 BPM y toda la rejilla salía vacía.
+    bpm = float(job.get("bpm") or 0) + float(job.get("bpm_fine") or 0)
+    if not (60.0 <= bpm <= 200.0):
+        raise RuntimeError(
+            f"tempo fuera de rango ({bpm:.3f} BPM): sin tempo no hay compases ni patrones. "
+            "Revisar bpm/bpm_fine de la canción."
+        )
     BPM_GLOBAL[0] = bpm
     anchor_ms = float(job.get("first_beat_offset_ms") or 0)
     work = Path(tempfile.mkdtemp(prefix="stems-"))
