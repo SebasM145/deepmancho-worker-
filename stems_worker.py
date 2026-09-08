@@ -49,7 +49,7 @@ MODEL = os.environ.get("STEMS_MODEL", "htdemucs_6s")
 SEGMENT = str(int(min(7, int(float(os.environ.get("DEMUCS_SEGMENT", "7"))))))  # entero: demucs no acepta decimales
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.5"
+VERSION = "1.6"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -347,6 +347,24 @@ def _decay_ms(seg, sr, drop_db=20.0):
     return round(frames * 256 / sr * 1000.0, 1)
 
 
+def _highpass(seg, sr, fc):
+    """Pasa-altos de un polo: para medir hats sin el cuerpo del bombo."""
+    a = np.exp(-2 * np.pi * fc / sr)
+    out = np.zeros_like(seg); prev_x = 0.0; prev_y = 0.0
+    for i, x in enumerate(seg):
+        prev_y = a * (prev_y + x - prev_x); prev_x = x; out[i] = prev_y
+    return out
+
+
+def _snap_to_peak(y, sr, t, window=0.03):
+    """La rejilla da el tiempo teórico; el golpe real puede estar unos ms antes
+    o después. Devuelve el instante del pico de energía en esa ventana."""
+    a = int(max(0, (t - window) * sr)); b = int(min(len(y), (t + window) * sr))
+    if b - a < 32:
+        return t
+    return a / sr + int(np.argmax(np.abs(y[a:b]))) / sr
+
+
 def _centroid_hz(seg, sr):
     if len(seg) < 512:
         return 0.0
@@ -385,10 +403,12 @@ def _dominant_hz(seg, sr, lo=30, hi=200):
     return round(float(freqs[m][int(np.argmax(spec[m]))]), 1) if m.any() else 0.0
 
 
-def _hits(y, sr, onsets_s, pre=0.0, post=0.4, max_n=40):
+def _hits(y, sr, onsets_s, pre=0.0, post=0.4, max_n=40, snap=True):
+    """Trozos de audio alrededor de cada golpe, alineados al ataque real."""
     out = []
     for t in onsets_s[:max_n]:
-        a = int(max(0, (t - pre) * sr)); b = int(min(len(y), (t + post) * sr))
+        tt = _snap_to_peak(y, sr, t) if snap else t
+        a = int(max(0, (tt - pre) * sr)); b = int(min(len(y), (tt + post) * sr))
         if b - a > 256:
             out.append(y[a:b])
     return out
@@ -403,6 +423,8 @@ def sound_profile(stems: dict, grid: dict, bpm: float, anchor_ms: float) -> dict
         if "drums" in stems:
             y, sr = to_wav_mono(stems["drums"], 22050)
             spb = grid.get("steps_per_bar", 16)
+            if not (grid.get("kick") or grid.get("hat")):
+                log("rejilla de batería vacía: no se puede medir el perfil de percusión")
             def times_of(row_name):
                 ts = []
                 rows = grid.get(row_name) or []
@@ -416,14 +438,17 @@ def sound_profile(stems: dict, grid: dict, bpm: float, anchor_ms: float) -> dict
                 prof["kick"] = {
                     "tune_hz": float(np.median([_dominant_hz(h, sr) for h in kick_hits])),
                     "decay_ms": float(np.median([_decay_ms(h, sr) for h in kick_hits])),
-                    "click_ratio": float(np.median([_band_ratio(h[: int(0.01 * sr)], sr, 2000, 6000) for h in kick_hits])),
+                    "click_ratio": float(np.median([_band_ratio(h[: int(0.012 * sr)], sr, 2000, 6000) for h in kick_hits])),
                     "sub_ratio": float(np.median([_band_ratio(h, sr, 30, 80) for h in kick_hits])),
                 }
             hat_hits = _hits(y, sr, times_of("hat"), post=0.25)
             if hat_hits:
+                # Los hats se miden SOBRE LA BANDA ALTA: en la pista de batería
+                # completa manda el bombo y el brillo sale falseado hacia abajo.
+                hp = [_highpass(h, sr, 3000) for h in hat_hits]
                 prof["hats"] = {
-                    "centroid_hz": float(np.median([_centroid_hz(h, sr) for h in hat_hits])),
-                    "decay_ms": float(np.median([_decay_ms(h, sr, 15.0) for h in hat_hits])),
+                    "centroid_hz": float(np.median([_centroid_hz(h, sr) for h in hp])),
+                    "decay_ms": float(np.median([_decay_ms(h, sr, 15.0) for h in hp])),
                 }
             snare_hits = _hits(y, sr, times_of("snare"), post=0.3)
             if snare_hits:
@@ -452,13 +477,19 @@ def sound_profile(stems: dict, grid: dict, bpm: float, anchor_ms: float) -> dict
             if kicks:
                 env = _env_db(yb, sr)
                 fr = lambda t: min(len(env) - 1, int(t * sr / 256))
+                # Nivel de referencia del bajo cuando SÍ está sonando.
+                active = env[env > (np.percentile(env, 60) - 12)]
+                floor_db = float(np.percentile(active, 20)) if len(active) else -60.0
                 dips = []
                 for t in kicks[:200]:
-                    a = env[fr(t + 0.02)]; b = env[fr(t + 0.16)]
-                    if np.isfinite(a) and np.isfinite(b):
-                        dips.append(b - a)
-                if dips:
+                    justo = env[fr(t + 0.02)]     # apenas pega el bombo: el bajo está agachado
+                    luego = env[fr(t + 0.18)]     # ya se recuperó
+                    # Solo cuenta si el bajo está tocando en ese compás.
+                    if luego > floor_db and np.isfinite(justo) and np.isfinite(luego):
+                        dips.append(justo - luego)
+                if len(dips) >= 8:
                     bass["sidechain_db"] = round(float(np.median(dips)), 1)
+                    bass["sidechain_muestras"] = len(dips)
             prof["bass"] = bass
         if "other" in stems:
             yo, sr = to_wav_mono(stems["other"], 22050)
