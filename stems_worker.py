@@ -56,7 +56,7 @@ os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.12"
+VERSION = "1.13"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -760,17 +760,26 @@ def process(job: dict):
         # PAQUETES: lo que el DJ realmente usa, ya cortado y ordenado.
         total_bars = int(grid.get("bars") or 0) or 1
         blocks = {}
-        for nombre, seq in parts.items():
-            b = bloques_de(seq, total_bars)
-            if b:
-                blocks[nombre] = b
-        bat = bloque_bateria(grid)
-        if bat:
-            blocks["drums"] = bat
+        try:
+            for nombre, seq in parts.items():
+                b = bloques_de(seq, total_bars)
+                if b:
+                    blocks[nombre] = b
+            bat = bloque_bateria(grid)
+            if bat:
+                blocks["drums"] = bat
+        except Exception as e:  # noqa: BLE001
+            log(f"[{job_id[:8]}] no se pudieron armar los bloques:", repr(e))
         log(f"[{job_id[:8]}] bloques: " + (", ".join(f"{k} {len(v)}" for k, v in blocks.items()) or "ninguno"))
 
-        arreglo = mapa_arreglo(stems, bpm, anchor_ms, dur)
-        log(f"[{job_id[:8]}] arreglo: {len(arreglo['instrumentos'])} instrumentos en {arreglo['compases']} compases")
+        # La variable se llama `duration` (v1.12 usaba `dur` y rompía el análisis).
+        # Y si el mapa falla, NO se pierde todo el trabajo: se reporta sin él.
+        try:
+            arreglo = mapa_arreglo(stems, bpm, anchor_ms, duration)
+            log(f"[{job_id[:8]}] arreglo: {len(arreglo['instrumentos'])} instrumentos en {arreglo['compases']} compases")
+        except Exception as e:  # noqa: BLE001
+            log(f"[{job_id[:8]}] no se pudo armar el mapa de arreglo:", repr(e))
+            arreglo = None
 
         patterns = {"bass_midi": bass_midi, "melody_midi": melody_midi, "drum_grid": grid,
                     "chords": chords, "stats": stats, "model": model, "sound_profile": profile,
