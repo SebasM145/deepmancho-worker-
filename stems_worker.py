@@ -56,7 +56,7 @@ os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.14"
+VERSION = "1.15"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -598,40 +598,74 @@ def _huella(notas, rejilla=0.25):
     return "|".join(sorted(f'{round(n["b"] / rejilla) * rejilla:.2f}:{n["n"]}' for n in notas))
 
 
-def bloques_de(notes, total_bars, largos=(1, 2, 4), minimo=3, tope=4, rejilla=0.25):
+def _similitud(a: set, b: set) -> float:
+    """Cuánto se parecen dos compases: notas en común sobre notas totales."""
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def bloques_de(notes, total_bars, largos=(1, 2, 4), minimo=3, tope=4,
+               rejilla=0.25, parecido=0.7):
     """Los bloques que valen la pena de una parte, ordenados por repetición.
 
-    Antes de comparar nada se CUADRAN las notas a la semicorchea. Sin eso, una
-    nota que cae en 3,97 se reparte al compás anterior y el mismo riff aparece
-    partido en varios bloques distintos. Cuadrar también deja las notas listas
-    para reusar en otro tema.
+    IMPORTANTE: se agrupa por PARECIDO, no por coincidencia exacta.
+
+    Medido sobre canciones reales: exigiendo repetición idéntica, el mejor
+    bloque de bajo de un tech house cubría el 3 % de la canción. No era un
+    problema de detección: un bajo real nunca se repite exactamente igual —
+    cambia una nota fantasma, se corre un golpe, varía la fuerza. Con un
+    umbral de parecido del 70 %, el riff se reconoce como lo que es.
+
+    De cada grupo se guarda el compás MÁS REPRESENTATIVO (el que más se parece
+    a todos los demás del grupo), no el primero: así el bloque que se lleva el
+    DJ es la versión típica del riff, no una variación de entrada.
     """
     if not notes or total_bars <= 0:
         return []
     notes = [dict(n, b=round(round(n["b"] / rejilla) * rejilla, 3)) for n in notes]
-    salida, vistas = [], set()
+    salida = []
     for bars in largos:
-        grupos = {}
+        candidatos = []
         for bar in range(0, total_bars - bars + 1, bars):
             trozo = _notes_in(notes, bar * 4, (bar + bars) * 4)
             if len(trozo) < minimo:
                 continue
-            grupos.setdefault(_huella(trozo), []).append((bar, trozo))
-        for h, apariciones in grupos.items():
-            if len(apariciones) < 2 or h in vistas:
+            firma = {(round(n["b"], 2), n["n"]) for n in trozo}
+            candidatos.append((bar, trozo, firma))
+        usados, grupos = set(), []
+        for i, (bar_i, trozo_i, firma_i) in enumerate(candidatos):
+            if i in usados:
                 continue
-            vistas.add(h)
-            bar, trozo = apariciones[0]
+            grupo = [(bar_i, trozo_i, firma_i)]
+            usados.add(i)
+            for j in range(i + 1, len(candidatos)):
+                if j in usados:
+                    continue
+                if _similitud(firma_i, candidatos[j][2]) >= parecido:
+                    grupo.append(candidatos[j])
+                    usados.add(j)
+            if len(grupo) >= 2:
+                grupos.append(grupo)
+        for grupo in grupos:
+            # El más representativo: el que más se parece al resto del grupo.
+            mejor, mejor_puntaje = grupo[0], -1.0
+            for cand in grupo:
+                puntaje = sum(_similitud(cand[2], otro[2]) for otro in grupo)
+                if puntaje > mejor_puntaje:
+                    mejor, mejor_puntaje = cand, puntaje
+            bar, trozo, _ = mejor
             salida.append({
                 "bars": bars,
                 "desde_compas": bar + 1,
-                "repite": len(apariciones),
-                "aparece_en": [b + 1 for b, _ in apariciones[:12]],
-                # Cuánto de la parte ocupa: si es alto, ESE bloque ES la parte.
-                "cubre": round(min(1.0, len(apariciones) * bars / max(1, total_bars)), 3),
+                "repite": len(grupo),
+                "aparece_en": sorted(b + 1 for b, _, _ in grupo)[:12],
+                "cubre": round(min(1.0, len(grupo) * bars / max(1, total_bars)), 3),
                 "notas": trozo,
             })
-    salida.sort(key=lambda x: (-x["repite"], x["bars"]))
+    salida.sort(key=lambda x: (-x["cubre"], x["bars"]))
     return salida[:tope]
 
 
