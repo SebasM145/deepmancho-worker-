@@ -56,7 +56,7 @@ os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.13"
+VERSION = "1.14"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -586,15 +586,29 @@ def _notes_in(notes, start_beat, end_beat):
     return out
 
 
-def _huella(notas):
-    """Firma de un bloque: posiciones y alturas. Sirve para contar repeticiones."""
-    return "|".join(sorted(f'{round(n["b"], 2)}:{n["n"]}' for n in notas))
+def _huella(notas, rejilla=0.25):
+    """Firma de un bloque: posiciones y alturas.
+
+    Las posiciones se redondean a la SEMICORCHEA, no al centésimo de tiempo.
+    Con dos decimales, una nota corrida un milisegundo hacía que el mismo riff
+    contara como dos bloques distintos, y en música real eso pasa siempre.
+    La fuerza no entra en la firma: el mismo riff tocado más fuerte es el mismo
+    riff.
+    """
+    return "|".join(sorted(f'{round(n["b"] / rejilla) * rejilla:.2f}:{n["n"]}' for n in notas))
 
 
-def bloques_de(notes, total_bars, largos=(1, 2, 4), minimo=3, tope=4):
-    """Los bloques que valen la pena de una parte, ordenados por repetición."""
+def bloques_de(notes, total_bars, largos=(1, 2, 4), minimo=3, tope=4, rejilla=0.25):
+    """Los bloques que valen la pena de una parte, ordenados por repetición.
+
+    Antes de comparar nada se CUADRAN las notas a la semicorchea. Sin eso, una
+    nota que cae en 3,97 se reparte al compás anterior y el mismo riff aparece
+    partido en varios bloques distintos. Cuadrar también deja las notas listas
+    para reusar en otro tema.
+    """
     if not notes or total_bars <= 0:
         return []
+    notes = [dict(n, b=round(round(n["b"] / rejilla) * rejilla, 3)) for n in notes]
     salida, vistas = [], set()
     for bars in largos:
         grupos = {}
