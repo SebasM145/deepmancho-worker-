@@ -56,7 +56,7 @@ os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.11"
+VERSION = "1.12"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -570,6 +570,125 @@ def sound_profile(stems: dict, grid: dict, bpm: float, anchor_ms: float) -> dict
     return prof
 
 
+# ─────────────────────── PAQUETES LISTOS PARA USAR ───────────────────────
+# El DJ no quiere 1.156 notas: quiere BLOQUES. "El riff del drop, 2 compases,
+# aparece 43 veces". Acá la canción se corta sola en pedazos usables, cada uno
+# con lo que hace falta para arrastrarlo a un tema.
+
+def _notes_in(notes, start_beat, end_beat):
+    """Notas de un tramo, con el tiempo llevado a cero."""
+    out = []
+    for n in notes:
+        if start_beat <= n["b"] < end_beat:
+            m = dict(n)
+            m["b"] = round(n["b"] - start_beat, 3)
+            out.append(m)
+    return out
+
+
+def _huella(notas):
+    """Firma de un bloque: posiciones y alturas. Sirve para contar repeticiones."""
+    return "|".join(sorted(f'{round(n["b"], 2)}:{n["n"]}' for n in notas))
+
+
+def bloques_de(notes, total_bars, largos=(1, 2, 4), minimo=3, tope=4):
+    """Los bloques que valen la pena de una parte, ordenados por repetición."""
+    if not notes or total_bars <= 0:
+        return []
+    salida, vistas = [], set()
+    for bars in largos:
+        grupos = {}
+        for bar in range(0, total_bars - bars + 1, bars):
+            trozo = _notes_in(notes, bar * 4, (bar + bars) * 4)
+            if len(trozo) < minimo:
+                continue
+            grupos.setdefault(_huella(trozo), []).append((bar, trozo))
+        for h, apariciones in grupos.items():
+            if len(apariciones) < 2 or h in vistas:
+                continue
+            vistas.add(h)
+            bar, trozo = apariciones[0]
+            salida.append({
+                "bars": bars,
+                "desde_compas": bar + 1,
+                "repite": len(apariciones),
+                "aparece_en": [b + 1 for b, _ in apariciones[:12]],
+                # Cuánto de la parte ocupa: si es alto, ESE bloque ES la parte.
+                "cubre": round(min(1.0, len(apariciones) * bars / max(1, total_bars)), 3),
+                "notas": trozo,
+            })
+    salida.sort(key=lambda x: (-x["repite"], x["bars"]))
+    return salida[:tope]
+
+
+def bloque_bateria(grid, tope=3):
+    """Lo mismo para la batería: no son notas, es una rejilla de 16 pasos."""
+    filas = ("kick", "snare", "hat")
+    if not any(grid.get(f) for f in filas):
+        return []
+    compases = max(len(grid.get(f) or []) for f in filas)
+    grupos = {}
+    for i in range(compases):
+        patron = {}
+        for f in filas:
+            fila = grid.get(f) or []
+            patron[f] = fila[i] if i < len(fila) else [0] * 16
+        if not any(sum(v) for v in patron.values()):
+            continue
+        h = "|".join("".join(str(x) for x in patron[f]) for f in filas)
+        grupos.setdefault(h, []).append((i, patron))
+    salida = []
+    for h, apar in grupos.items():
+        if len(apar) < 2:
+            continue
+        i, patron = apar[0]
+        salida.append({
+            "bars": 1, "desde_compas": i + 1, "repite": len(apar),
+            "aparece_en": [x + 1 for x, _ in apar[:12]],
+            "cubre": round(min(1.0, len(apar) / max(1, compases)), 3),
+            "rejilla": patron,
+        })
+    salida.sort(key=lambda x: -x["repite"])
+    return salida[:tope]
+
+
+def mapa_arreglo(stems, bpm, anchor_ms, duration):
+    """En qué compás entra y sale cada instrumento: la receta de la canción."""
+    beat = 60.0 / bpm
+    compas = 4 * beat
+    total = max(1, int((duration - anchor_ms / 1000.0) / compas))
+    mapa = {}
+    for nombre, path in stems.items():
+        try:
+            y, sr = to_wav_mono(path, 22050)
+        except Exception as e:  # noqa: BLE001
+            log("mapa: no se pudo leer", nombre, repr(e))
+            continue
+        niveles = []
+        for i in range(total):
+            a = int((anchor_ms / 1000.0 + i * compas) * sr)
+            b = min(len(y), int(a + compas * sr))
+            niveles.append(float(np.sqrt((y[a:b] ** 2).mean() + 1e-12)) if b > a else 0.0)
+        pico = max(niveles) if niveles else 0.0
+        if pico <= 1e-6:
+            continue
+        # Umbral RELATIVO a su propio pico: un pad bajo también cuenta como que suena.
+        umbral = pico * 0.12
+        tramos, ini = [], None
+        for i, n in enumerate(niveles):
+            on = n > umbral
+            if on and ini is None:
+                ini = i
+            elif not on and ini is not None:
+                if i - ini >= 4:          # menos de 4 compases no es una entrada
+                    tramos.append({"desde": ini + 1, "hasta": i})
+                ini = None
+        if ini is not None:
+            tramos.append({"desde": ini + 1, "hasta": len(niveles)})
+        mapa[nombre] = {"tramos": tramos, "energia": [round(n / pico, 3) for n in niveles]}
+    return {"compases": total, "instrumentos": mapa}
+
+
 def process(job: dict):
     job_id = job["job_id"]
     # bpm_fine NO es el tempo: es una corrección de milésimas sobre bpm.
@@ -638,9 +757,24 @@ def process(job: dict):
         stats = stem_stats(stems, bass_midi, grid)
 
         profile = sound_profile(stems, grid, bpm, anchor_ms)
+        # PAQUETES: lo que el DJ realmente usa, ya cortado y ordenado.
+        total_bars = int(grid.get("bars") or 0) or 1
+        blocks = {}
+        for nombre, seq in parts.items():
+            b = bloques_de(seq, total_bars)
+            if b:
+                blocks[nombre] = b
+        bat = bloque_bateria(grid)
+        if bat:
+            blocks["drums"] = bat
+        log(f"[{job_id[:8]}] bloques: " + (", ".join(f"{k} {len(v)}" for k, v in blocks.items()) or "ninguno"))
+
+        arreglo = mapa_arreglo(stems, bpm, anchor_ms, dur)
+        log(f"[{job_id[:8]}] arreglo: {len(arreglo['instrumentos'])} instrumentos en {arreglo['compases']} compases")
+
         patterns = {"bass_midi": bass_midi, "melody_midi": melody_midi, "drum_grid": grid,
                     "chords": chords, "stats": stats, "model": model, "sound_profile": profile,
-                    "parts": parts}
+                    "parts": parts, "blocks": blocks, "arrangement_map": arreglo}
         report(job_id, True, stems_out, patterns)
         log(f"[{job_id[:8]}] listo: {len(stems_out)} stems, {len(bass_midi)} notas de bajo, {grid['bars']} compases")
     except Exception as e:  # noqa: BLE001
