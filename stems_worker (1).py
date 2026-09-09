@@ -56,7 +56,7 @@ os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.7"
+VERSION = "1.15"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -124,9 +124,9 @@ def to_wav_mono(path: Path, sr: int = 22050) -> tuple[np.ndarray, int]:
     return np.frombuffer(raw, dtype=np.float32), sr
 
 
-def run_demucs(src: Path, outdir: Path) -> dict[str, Path]:
+def run_demucs(src: Path, outdir: Path, model: str = MODEL) -> dict[str, Path]:
     cmd = [
-        sys.executable, "-m", "demucs", "-n", MODEL, "-d", "cpu",
+        sys.executable, "-m", "demucs", "-n", model, "-d", "cpu",
         "--segment", SEGMENT, "-j", JOBS, "--overlap", OVERLAP, "--mp3", "--mp3-bitrate", "192", "-o", str(outdir), str(src),
     ]
     log("demucs:", " ".join(cmd[2:]))
@@ -134,10 +134,16 @@ def run_demucs(src: Path, outdir: Path) -> dict[str, Path]:
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "")[-1500:]
         raise RuntimeError(f"demucs salió con {proc.returncode}: {tail}")
-    base = outdir / MODEL / src.stem
+    # OJO: demucs guarda en <salida>/<modelo>/<nombre>/ — hay que usar el
+    # modelo que se le pasó, no el de por defecto. (Bug de la v1.9.)
+    base = outdir / model / src.stem
     stems = {p.stem: p for p in base.glob("*.mp3")}
     if not stems:
-        raise RuntimeError("demucs no produjo stems")
+        encontrado = [str(p.relative_to(outdir)) for p in outdir.rglob("*.mp3")][:8]
+        raise RuntimeError(
+            f"demucs no produjo stems en {base.relative_to(outdir)}"
+            + (f"; sí hay: {encontrado}" if encontrado else "")
+        )
     return stems
 
 
@@ -186,6 +192,39 @@ def midi_notes(path: Path, to_beat, lo: int, hi: int, max_notes=4000):
 BPM_GLOBAL = [126.0]  # se fija por job; evita pasar bpm por todos lados
 
 
+def refine_anchor(kick_times, bpm: float, anchor_s: float) -> float:
+    """Ajusta el ancla al pulso real del bombo.
+
+    La rejilla se arma desde `anchor_s`. Si esa ancla está mal (o no viene,
+    como en los temas generados, donde llega NULL y se asume 0), TODO sale
+    corrido: el riff empieza en el paso equivocado, el patrón reusado entra a
+    destiempo y el vaivén se mide mal.
+
+    Como el bombo de club cae en el pulso, se mide cuánto se desvía cada golpe
+    respecto de la rejilla y se corre el ancla esa cantidad. Es estimación de
+    fase de toda la vida, hecha sobre el instrumento más confiable.
+    """
+    if len(kick_times) < 8:
+        return anchor_s
+    beat = 60.0 / bpm
+    # Desvío de cada golpe respecto del pulso más cercano, en fracción de pulso.
+    fases = ((np.asarray(kick_times) - anchor_s) / beat) % 1.0
+    # Media circular: los desvíos viven en un círculo (0.99 y 0.01 están juntos).
+    ang = 2 * np.pi * fases
+    media = np.arctan2(np.sin(ang).mean(), np.cos(ang).mean()) / (2 * np.pi)
+    if media < 0:
+        media += 1.0
+    if media > 0.5:
+        media -= 1.0            # corregir hacia atrás si está más cerca por ese lado
+    corr = media * beat
+    # Cuánto de acuerdo están los golpes entre sí (0 = dispersos, 1 = clavados).
+    fuerza = float(np.hypot(np.sin(ang).mean(), np.cos(ang).mean()))
+    if fuerza < 0.5 or abs(corr) < 0.005:
+        return anchor_s          # sin consenso o ya está bien: no tocar
+    log(f"ancla corregida {corr*1000:+.0f} ms (acuerdo {fuerza:.2f})")
+    return anchor_s + corr
+
+
 def drum_grid(path: Path, bpm: float, anchor_ms: float, duration: float):
     """Rejilla kick/snare/hat por semicorchea a partir de picos de energía por banda."""
     import librosa
@@ -228,6 +267,10 @@ def drum_grid(path: Path, bpm: float, anchor_ms: float, duration: float):
             if slot not in by_slot or energy > by_slot[slot][1]:
                 by_slot[slot] = (t, energy)
         kick_t = np.array(sorted(t for t, _ in by_slot.values()))
+
+    # El ancla manda sobre TODO lo que viene después: corregirla acá, con el
+    # bombo ya limpio, antes de armar la rejilla.
+    anchor_ms = refine_anchor(kick_t, bpm, anchor_ms / 1000.0) * 1000.0
 
     # La banda de medios recoge el cuerpo del bombo: un "golpe de caja" que
     # coincide (±25 ms) con un bombo y no tiene más energía en 1.5–4 kHz que
@@ -527,9 +570,183 @@ def sound_profile(stems: dict, grid: dict, bpm: float, anchor_ms: float) -> dict
     return prof
 
 
+# ─────────────────────── PAQUETES LISTOS PARA USAR ───────────────────────
+# El DJ no quiere 1.156 notas: quiere BLOQUES. "El riff del drop, 2 compases,
+# aparece 43 veces". Acá la canción se corta sola en pedazos usables, cada uno
+# con lo que hace falta para arrastrarlo a un tema.
+
+def _notes_in(notes, start_beat, end_beat):
+    """Notas de un tramo, con el tiempo llevado a cero."""
+    out = []
+    for n in notes:
+        if start_beat <= n["b"] < end_beat:
+            m = dict(n)
+            m["b"] = round(n["b"] - start_beat, 3)
+            out.append(m)
+    return out
+
+
+def _huella(notas, rejilla=0.25):
+    """Firma de un bloque: posiciones y alturas.
+
+    Las posiciones se redondean a la SEMICORCHEA, no al centésimo de tiempo.
+    Con dos decimales, una nota corrida un milisegundo hacía que el mismo riff
+    contara como dos bloques distintos, y en música real eso pasa siempre.
+    La fuerza no entra en la firma: el mismo riff tocado más fuerte es el mismo
+    riff.
+    """
+    return "|".join(sorted(f'{round(n["b"] / rejilla) * rejilla:.2f}:{n["n"]}' for n in notas))
+
+
+def _similitud(a: set, b: set) -> float:
+    """Cuánto se parecen dos compases: notas en común sobre notas totales."""
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def bloques_de(notes, total_bars, largos=(1, 2, 4), minimo=3, tope=4,
+               rejilla=0.25, parecido=0.7):
+    """Los bloques que valen la pena de una parte, ordenados por repetición.
+
+    IMPORTANTE: se agrupa por PARECIDO, no por coincidencia exacta.
+
+    Medido sobre canciones reales: exigiendo repetición idéntica, el mejor
+    bloque de bajo de un tech house cubría el 3 % de la canción. No era un
+    problema de detección: un bajo real nunca se repite exactamente igual —
+    cambia una nota fantasma, se corre un golpe, varía la fuerza. Con un
+    umbral de parecido del 70 %, el riff se reconoce como lo que es.
+
+    De cada grupo se guarda el compás MÁS REPRESENTATIVO (el que más se parece
+    a todos los demás del grupo), no el primero: así el bloque que se lleva el
+    DJ es la versión típica del riff, no una variación de entrada.
+    """
+    if not notes or total_bars <= 0:
+        return []
+    notes = [dict(n, b=round(round(n["b"] / rejilla) * rejilla, 3)) for n in notes]
+    salida = []
+    for bars in largos:
+        candidatos = []
+        for bar in range(0, total_bars - bars + 1, bars):
+            trozo = _notes_in(notes, bar * 4, (bar + bars) * 4)
+            if len(trozo) < minimo:
+                continue
+            firma = {(round(n["b"], 2), n["n"]) for n in trozo}
+            candidatos.append((bar, trozo, firma))
+        usados, grupos = set(), []
+        for i, (bar_i, trozo_i, firma_i) in enumerate(candidatos):
+            if i in usados:
+                continue
+            grupo = [(bar_i, trozo_i, firma_i)]
+            usados.add(i)
+            for j in range(i + 1, len(candidatos)):
+                if j in usados:
+                    continue
+                if _similitud(firma_i, candidatos[j][2]) >= parecido:
+                    grupo.append(candidatos[j])
+                    usados.add(j)
+            if len(grupo) >= 2:
+                grupos.append(grupo)
+        for grupo in grupos:
+            # El más representativo: el que más se parece al resto del grupo.
+            mejor, mejor_puntaje = grupo[0], -1.0
+            for cand in grupo:
+                puntaje = sum(_similitud(cand[2], otro[2]) for otro in grupo)
+                if puntaje > mejor_puntaje:
+                    mejor, mejor_puntaje = cand, puntaje
+            bar, trozo, _ = mejor
+            salida.append({
+                "bars": bars,
+                "desde_compas": bar + 1,
+                "repite": len(grupo),
+                "aparece_en": sorted(b + 1 for b, _, _ in grupo)[:12],
+                "cubre": round(min(1.0, len(grupo) * bars / max(1, total_bars)), 3),
+                "notas": trozo,
+            })
+    salida.sort(key=lambda x: (-x["cubre"], x["bars"]))
+    return salida[:tope]
+
+
+def bloque_bateria(grid, tope=3):
+    """Lo mismo para la batería: no son notas, es una rejilla de 16 pasos."""
+    filas = ("kick", "snare", "hat")
+    if not any(grid.get(f) for f in filas):
+        return []
+    compases = max(len(grid.get(f) or []) for f in filas)
+    grupos = {}
+    for i in range(compases):
+        patron = {}
+        for f in filas:
+            fila = grid.get(f) or []
+            patron[f] = fila[i] if i < len(fila) else [0] * 16
+        if not any(sum(v) for v in patron.values()):
+            continue
+        h = "|".join("".join(str(x) for x in patron[f]) for f in filas)
+        grupos.setdefault(h, []).append((i, patron))
+    salida = []
+    for h, apar in grupos.items():
+        if len(apar) < 2:
+            continue
+        i, patron = apar[0]
+        salida.append({
+            "bars": 1, "desde_compas": i + 1, "repite": len(apar),
+            "aparece_en": [x + 1 for x, _ in apar[:12]],
+            "cubre": round(min(1.0, len(apar) / max(1, compases)), 3),
+            "rejilla": patron,
+        })
+    salida.sort(key=lambda x: -x["repite"])
+    return salida[:tope]
+
+
+def mapa_arreglo(stems, bpm, anchor_ms, duration):
+    """En qué compás entra y sale cada instrumento: la receta de la canción."""
+    beat = 60.0 / bpm
+    compas = 4 * beat
+    total = max(1, int((duration - anchor_ms / 1000.0) / compas))
+    mapa = {}
+    for nombre, path in stems.items():
+        try:
+            y, sr = to_wav_mono(path, 22050)
+        except Exception as e:  # noqa: BLE001
+            log("mapa: no se pudo leer", nombre, repr(e))
+            continue
+        niveles = []
+        for i in range(total):
+            a = int((anchor_ms / 1000.0 + i * compas) * sr)
+            b = min(len(y), int(a + compas * sr))
+            niveles.append(float(np.sqrt((y[a:b] ** 2).mean() + 1e-12)) if b > a else 0.0)
+        pico = max(niveles) if niveles else 0.0
+        if pico <= 1e-6:
+            continue
+        # Umbral RELATIVO a su propio pico: un pad bajo también cuenta como que suena.
+        umbral = pico * 0.12
+        tramos, ini = [], None
+        for i, n in enumerate(niveles):
+            on = n > umbral
+            if on and ini is None:
+                ini = i
+            elif not on and ini is not None:
+                if i - ini >= 4:          # menos de 4 compases no es una entrada
+                    tramos.append({"desde": ini + 1, "hasta": i})
+                ini = None
+        if ini is not None:
+            tramos.append({"desde": ini + 1, "hasta": len(niveles)})
+        mapa[nombre] = {"tramos": tramos, "energia": [round(n / pico, 3) for n in niveles]}
+    return {"compases": total, "instrumentos": mapa}
+
+
 def process(job: dict):
     job_id = job["job_id"]
-    bpm = float(job.get("bpm_fine") or job.get("bpm") or 126)
+    # bpm_fine NO es el tempo: es una corrección de milésimas sobre bpm.
+    # Usarlo como tempo absoluto daba 0.001 BPM y toda la rejilla salía vacía.
+    bpm = float(job.get("bpm") or 0) + float(job.get("bpm_fine") or 0)
+    if not (60.0 <= bpm <= 200.0):
+        raise RuntimeError(
+            f"tempo fuera de rango ({bpm:.3f} BPM): sin tempo no hay compases ni patrones. "
+            "Revisar bpm/bpm_fine de la canción."
+        )
     BPM_GLOBAL[0] = bpm
     anchor_ms = float(job.get("first_beat_offset_ms") or 0)
     work = Path(tempfile.mkdtemp(prefix="stems-"))
@@ -538,7 +755,12 @@ def process(job: dict):
         duration = float(job.get("duration_seconds") or ffprobe_duration(src))
         log(f"[{job_id[:8]}] {duration:.0f}s @ {bpm:.2f} bpm, ancla {anchor_ms:.0f} ms")
 
-        stems = run_demucs(src, work / "out")
+        # El trabajo puede pedir otro modelo: htdemucs_6s separa piano y
+        # guitarra en pistas propias (a cambio de algo menos de limpieza).
+        model = str(job.get("model") or MODEL)
+        if model not in ("htdemucs", "htdemucs_ft", "htdemucs_6s", "mdx_extra"):
+            model = MODEL
+        stems = run_demucs(src, work / "out", model)
         uploads = job.get("uploads", {})
         stems_out = {}
         for name, p in stems.items():
@@ -553,14 +775,63 @@ def process(job: dict):
         bass_midi = midi_notes(stems["bass"], to_beat, 24, 60) if "bass" in stems else []
         melody_src = [s for s in ("piano", "other", "guitar") if s in stems]
         melody_midi = midi_notes(stems[melody_src[0]], to_beat, 48, 96) if melody_src else []
+
+        # PARTES COMPLETAS POR INSTRUMENTO
+        # No alcanza con "el riff": el DJ quiere todo lo que toca cada
+        # instrumento en la canción entera, para editarlo y reusarlo. Basic
+        # Pitch es polifónico, así que un piano o unos pads salen con sus
+        # acordes reales, no con una etiqueta por compás.
+        parts = {}
+        RANGES = {          # rango de notas MIDI razonable por instrumento
+            "piano": (36, 96), "guitar": (40, 88), "other": (36, 96),
+            "vocals": (48, 84), "bass": (24, 60),
+        }
+        for name, (lo, hi) in RANGES.items():
+            if name not in stems:
+                continue
+            if name == "bass":
+                parts["bass"] = bass_midi          # ya transcrito
+                continue
+            try:
+                seq = midi_notes(stems[name], to_beat, lo, hi, max_notes=6000)
+                if seq:
+                    parts[name] = seq
+                    log(f"[{job_id[:8]}] parte {name}: {len(seq)} notas")
+            except Exception as e:  # noqa: BLE001
+                log(f"[{job_id[:8]}] no se pudo transcribir {name}:", repr(e))
         grid = drum_grid(stems["drums"], bpm, anchor_ms, duration) if "drums" in stems else \
             {"steps_per_bar": 16, "bars": 0, "kick": [], "snare": [], "hat": []}
         chords = chords_per_bar([stems[s] for s in ("bass", "other", "piano") if s in stems], bpm, anchor_ms, grid["bars"])
         stats = stem_stats(stems, bass_midi, grid)
 
         profile = sound_profile(stems, grid, bpm, anchor_ms)
+        # PAQUETES: lo que el DJ realmente usa, ya cortado y ordenado.
+        total_bars = int(grid.get("bars") or 0) or 1
+        blocks = {}
+        try:
+            for nombre, seq in parts.items():
+                b = bloques_de(seq, total_bars)
+                if b:
+                    blocks[nombre] = b
+            bat = bloque_bateria(grid)
+            if bat:
+                blocks["drums"] = bat
+        except Exception as e:  # noqa: BLE001
+            log(f"[{job_id[:8]}] no se pudieron armar los bloques:", repr(e))
+        log(f"[{job_id[:8]}] bloques: " + (", ".join(f"{k} {len(v)}" for k, v in blocks.items()) or "ninguno"))
+
+        # La variable se llama `duration` (v1.12 usaba `dur` y rompía el análisis).
+        # Y si el mapa falla, NO se pierde todo el trabajo: se reporta sin él.
+        try:
+            arreglo = mapa_arreglo(stems, bpm, anchor_ms, duration)
+            log(f"[{job_id[:8]}] arreglo: {len(arreglo['instrumentos'])} instrumentos en {arreglo['compases']} compases")
+        except Exception as e:  # noqa: BLE001
+            log(f"[{job_id[:8]}] no se pudo armar el mapa de arreglo:", repr(e))
+            arreglo = None
+
         patterns = {"bass_midi": bass_midi, "melody_midi": melody_midi, "drum_grid": grid,
-                    "chords": chords, "stats": stats, "model": MODEL, "sound_profile": profile}
+                    "chords": chords, "stats": stats, "model": model, "sound_profile": profile,
+                    "parts": parts, "blocks": blocks, "arrangement_map": arreglo}
         report(job_id, True, stems_out, patterns)
         log(f"[{job_id[:8]}] listo: {len(stems_out)} stems, {len(bass_midi)} notas de bajo, {grid['bars']} compases")
     except Exception as e:  # noqa: BLE001
