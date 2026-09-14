@@ -56,7 +56,7 @@ os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.15"
+VERSION = "1.17"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -737,6 +737,128 @@ def mapa_arreglo(stems, bpm, anchor_ms, duration):
     return {"compases": total, "instrumentos": mapa}
 
 
+# ──────────────────────── CALIDAD DE CADA PISTA SEPARADA ────────────────────────
+# Una pista separada nunca sale perfecta: al piano se le cuela algo de batería,
+# a la voz algo de sintes. Acá se mide CUÁNTO, para que la pantalla lo diga en
+# una palabra ("limpio", "con algo de batería", "mezclado con batería") en vez
+# de dejar que el DJ lo descubra escuchando.
+#
+# Método: envolvente de energía de cada pista, y correlación entre pares. Si la
+# envolvente del piano sube y baja al ritmo de la batería, hay filtración.
+
+def _envolvente(y, sr, ventana_ms=20):
+    """Envolvente normalizada y nivel crudo. El nivel crudo se guarda ANTES de
+    normalizar: el silencio normalizado parece señal, y eso engañaba."""
+    n = max(1, int(sr * ventana_ms / 1000))
+    total = len(y) // n
+    if total < 4:
+        return np.zeros(4), 0.0
+    e = np.sqrt((y[: total * n].reshape(total, n) ** 2).mean(axis=1) + 1e-12)
+    # Se devuelve el PICO (una batería es fuerte pero suena poco tiempo: con el
+    # promedio parecía débil) y cuánto FLUCTÚA (std/media): un piano sostenido
+    # con un poquito de batería encima coincide en el ritmo, pero casi no se
+    # mueve, y eso es lo que distingue "un poco" de "mucho".
+    fluct = float(e.std() / (e.mean() + 1e-9))
+    return e / (e.max() + 1e-9), float(e.max()), fluct
+
+
+def calidad_pistas(stems: dict) -> dict:
+    """Para cada pista: qué tan limpia salió y de quién trae filtración.
+
+    La filtración va del FUERTE al DÉBIL: si el piano sube y baja al ritmo de
+    la batería y la batería es más fuerte, el piano trae batería, no al revés.
+    Sin esa regla la correlación (que es simétrica) acusaba a los dos.
+    """
+    envs, niveles, fluct = {}, {}, {}
+    for nombre, path in stems.items():
+        try:
+            y, sr = to_wav_mono(path, 22050)
+            envs[nombre], niveles[nombre], fluct[nombre] = _envolvente(y, sr)
+        except Exception as e:  # noqa: BLE001
+            log("calidad: no se pudo leer", nombre, repr(e))
+    salida = {}
+    for a, ea in envs.items():
+        if niveles[a] < 1e-3:
+            salida[a] = {"estado": "vacia", "de": None, "correlacion": 0.0}
+            continue
+        peor, peor_c = None, 0.0
+        for b, eb in envs.items():
+            if a == b or niveles[b] <= niveles[a] * 1.2:
+                continue                       # solo puede contaminarme alguien más fuerte
+            m = min(len(ea), len(eb))
+            if m < 8:
+                continue
+            x, y_ = ea[:m] - ea[:m].mean(), eb[:m] - eb[:m].mean()
+            den = float(np.sqrt((x ** 2).sum() * (y_ ** 2).sum())) + 1e-9
+            c = float((x * y_).sum() / den)
+            # La filtración real es "coincide en el ritmo" × "cuánto se mueve".
+            c = c * min(1.0, fluct[a])
+            if c > peor_c:
+                peor, peor_c = b, c
+        estado = "limpia" if peor_c < 0.25 else ("con_algo" if peor_c < 0.6 else "mezclada")
+        salida[a] = {"estado": estado, "de": peor if estado != "limpia" else None,
+                     "correlacion": round(peor_c, 3)}
+    return salida
+
+
+# ───────────────────── NOTAS SUELTAS PARA CLONAR EL INSTRUMENTO ─────────────────────
+# El clon por parámetros no funcionó (cuatro números no reconstruyen un piano).
+# Lo que sí funciona es lo que hacen los samplers de verdad: tomar NOTAS REALES
+# del instrumento, una por altura, y tocar cualquier cosa nueva estirándolas.
+#
+# Acá se buscan, en la transcripción, las notas que suenan SOLAS (sin otra
+# encima ni pegada) y se elige la más limpia por altura. El recorte del audio
+# y el sampler se arman en el cliente con estos tiempos.
+
+def notas_sueltas(seq, bpm, anchor_ms, margen_beats=0.5, minimo_dur=0.2, tope_por_altura=1):
+    """Por altura MIDI: la nota más aislada y larga, con su instante en segundos."""
+    if not seq:
+        return {}
+    beat = 60.0 / bpm
+    notas = sorted(seq, key=lambda n: n["b"])
+    elegidas = {}
+    for i, n in enumerate(notas):
+        if n["d"] < minimo_dur:
+            continue
+        ini, fin = n["b"], n["b"] + n["d"]
+        sola = True
+        for m in notas[max(0, i - 12): i + 12]:
+            if m is n:
+                continue
+            mi, mf = m["b"], m["b"] + m["d"]
+            # Otra nota que se solape o quede a menos de medio tiempo: no está sola.
+            if mi < fin + margen_beats and mf > ini - margen_beats:
+                sola = False
+                break
+        if not sola:
+            continue
+        altura = int(n["n"])
+        cand = {
+            "n": altura,
+            "t": round(anchor_ms / 1000.0 + ini * beat, 3),
+            "dur": round(n["d"] * beat, 3),
+            "v": n.get("v", 0.5),
+        }
+        actual = elegidas.get(altura)
+        # Se prefiere la más larga; a igual largo, la más fuerte.
+        if actual is None or (cand["dur"], cand["v"]) > (actual["dur"], actual["v"]):
+            elegidas[altura] = cand
+    return elegidas
+
+
+def resumen_sampler(por_altura: dict) -> dict:
+    """Cuántas alturas hay y qué tan cubierto queda el teclado, para decidir
+    si el instrumento se puede clonar bien o solo a medias."""
+    if not por_altura:
+        return {"alturas": 0, "rango": None, "huecos_max": None, "clonable": "no"}
+    alturas = sorted(por_altura)
+    huecos = max((b - a for a, b in zip(alturas, alturas[1:])), default=0)
+    # Con una nota real cada 3 semitonos o menos, el estirado no se nota.
+    clonable = "bien" if huecos <= 3 and len(alturas) >= 5 else ("a_medias" if len(alturas) >= 3 else "no")
+    return {"alturas": len(alturas), "rango": [alturas[0], alturas[-1]],
+            "huecos_max": huecos, "clonable": clonable}
+
+
 def process(job: dict):
     job_id = job["job_id"]
     # bpm_fine NO es el tempo: es una corrección de milésimas sobre bpm.
@@ -829,9 +951,30 @@ def process(job: dict):
             log(f"[{job_id[:8]}] no se pudo armar el mapa de arreglo:", repr(e))
             arreglo = None
 
+        try:
+            calidad = calidad_pistas(stems)
+            log(f"[{job_id[:8]}] calidad: " + ", ".join(f"{k} {v['estado']}" + (f"(de {v['de']})" if v['de'] else "") for k, v in calidad.items()))
+        except Exception as e:  # noqa: BLE001
+            log(f"[{job_id[:8]}] no se pudo medir la calidad:", repr(e))
+            calidad = None
+
+        # NOTAS SUELTAS por instrumento melódico: la materia prima del clon.
+        sampler = {}
+        try:
+            for nombre, seq in parts.items():
+                if nombre in ("vocals",):          # una voz no se clona por notas
+                    continue
+                por_altura = notas_sueltas(seq, bpm, anchor_ms)
+                if por_altura:
+                    sampler[nombre] = {"notas": por_altura, **resumen_sampler(por_altura)}
+            log(f"[{job_id[:8]}] sampler: " + (", ".join(f"{k} {v['alturas']} alturas ({v['clonable']})" for k, v in sampler.items()) or "ninguno"))
+        except Exception as e:  # noqa: BLE001
+            log(f"[{job_id[:8]}] no se pudieron buscar notas sueltas:", repr(e))
+
         patterns = {"bass_midi": bass_midi, "melody_midi": melody_midi, "drum_grid": grid,
                     "chords": chords, "stats": stats, "model": model, "sound_profile": profile,
-                    "parts": parts, "blocks": blocks, "arrangement_map": arreglo}
+                    "parts": parts, "blocks": blocks, "arrangement_map": arreglo,
+                    "stem_quality": calidad, "sampler": sampler}
         report(job_id, True, stems_out, patterns)
         log(f"[{job_id[:8]}] listo: {len(stems_out)} stems, {len(bass_midi)} notas de bajo, {grid['bars']} compases")
     except Exception as e:  # noqa: BLE001
