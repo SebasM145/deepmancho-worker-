@@ -1,1709 +1,1030 @@
+#!/usr/bin/env python3
 """
-DeepMancho — Worker de análisis de audio (server-side).
+stems_worker.py — DJConnect · separación en pistas y extracción de patrones.
 
-Procesa una cola `analysis_jobs` en Supabase:
-  1. Reclama un job pendiente (RPC atómico claim_analysis_job).
-  2. Descarga el audio del track desde Storage (rendition o master).
-  3. Analiza con librosa: BPM, key (Camelot), beatgrid, waveform (peaks/rms/bandas),
-     8 cue points "DeepMancho Standard", energy 1-10.
-  4. Escribe los resultados en music_tracks y marca el job como 'done'.
+Mismo patrón que grid_verifier.py: sondea una Edge Function, procesa una
+canción, sube resultados, reporta. No toca worker.py ni sus tablas.
 
-100% offline respecto al navegador del DJ: escala a cientos de tracks sin cargar su equipo,
-y con mejor calidad de cues/beat/key que las heurísticas de Web Audio.
+Qué hace por canción:
+  1. Descarga el audio (URL firmada que entrega stems-next).
+  2. Demucs (htdemucs_6s por defecto): vocals, drums, bass, other, piano, guitar.
+  3. Sube cada stem como MP3 a la URL firmada de subida (bucket privado).
+  4. Extrae PATRONES (esto es lo que el DJ guarda y reusa; no es audio ajeno):
+       - bass_midi / melody_midi : notas MIDI (Basic Pitch) en beats desde el ancla
+       - drum_grid               : rejilla de 16 pasos por compás (kick / snare / hat)
+       - chords                  : acorde por compás (plantillas mayor/menor sobre chroma)
+       - stats                   : energía por stem, densidad, rango del bajo
+  5. POST a stems-result.
 
-Config por variables de entorno:
-  SUPABASE_URL           (obligatorio)  ej: https://xxxx.supabase.co
-  SUPABASE_SERVICE_KEY   (obligatorio)  service_role key (SECRETO)
-  MUSIC_BUCKET           (opcional, default 'music')
-  POLL_INTERVAL_SECONDS  (opcional, default 5)
-  MAX_ATTEMPTS           (opcional, default 3)
+Variables de entorno (Railway):
+  WORKER_API_URL        p.ej. https://<proj>.supabase.co/functions/v1
+  WORKER_SECRET         el mismo que usa el worker (header x-worker-secret)
+  POLL_INTERVAL_SECONDS default 15
+  STEMS_MODEL           default htdemucs_6s (alternativa más liviana: htdemucs)
+  DEMUCS_SEGMENT        default 8 (segundos; menos = menos RAM, más lento)
+  MAX_TRACK_MB          default 60
 """
+from __future__ import annotations
 
-import os
-import sys
-import time
-import math
 import json
-import tempfile
-import traceback
+import math
+import os
+import shutil
+import signal
 import subprocess
+import sys
+import tempfile
+import time
+import traceback
+from pathlib import Path
 
 import numpy as np
-import librosa
-from grid_detect import detect_grid
 import requests
 
-# ----------------------------------------------------------------------------
-# Config — el worker habla con dos Edge Functions (worker-next / worker-result).
-# NO necesita service key de Supabase: se autentica con un secreto compartido.
-# ----------------------------------------------------------------------------
-# WORKER_API_URL: base de las funciones, ej: https://TU-PROYECTO.supabase.co/functions/v1
-WORKER_API_URL = os.environ.get("WORKER_API_URL", "").rstrip("/")
-WORKER_SECRET = os.environ.get("WORKER_SECRET", "")
-POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
-# Fase 2 (opcional): identificación por huella acústica (Chromaprint + AcoustID).
-# Si no está la key o falta `fpcalc`, el worker sigue funcionando igual sin identificar.
-ACOUSTID_API_KEY = os.environ.get("ACOUSTID_API_KEY", "")
-
-SR = 11025          # más liviano que 22050; suficiente para beat/estructura/energía
-MAX_DURATION = 600  # analiza como máximo 10 min (tope de tiempo/memoria)
-# Resolución de la waveform. 800 se veía en bloques al hacer zoom en el mezclador;
-# 3000 da ~4x de detalle para el zoom por compás sin inflar demasiado el payload.
-BUCKETS = 3000
-HEADERS = {"x-worker-secret": WORKER_SECRET, "Content-Type": "application/json"}
-
-if not WORKER_API_URL or not WORKER_SECRET:
-    print("ERROR: faltan WORKER_API_URL o WORKER_SECRET", flush=True)
-    sys.exit(1)
-
-# ----------------------------------------------------------------------------
-# CM2 (v6) — Ancla de rejilla de precisión sobre la RENDITION + examen golden set
-# CM1-bis (v6) — Restauración del cálculo de loudness (LUFS), perdido en la
-#                reescritura v5 (regresión detectada el 18-ago: jobs 'done'
-#                sin llenar loudness_lufs).
-#
-# Diagnóstico que motiva CM2 (18-ago-2026, sesión de mixer con telemetría):
-#   - El motor del mixer alinea bien (test mismo-track = perfecto).
-#   - El ancla de rejilla por track tiene errores de 40-120 ms porque:
-#     (a) el análisis corre a SR=11025 (~46 ms por frame), y
-#     (b) la rejilla se calcula sobre el máster, pero el navegador
-#         reproduce la rendition (timeline distinto por encoder delay).
-#   - Se validó de punta a punta que corregir SOLO el dato arregla la mezcla
-#     (par Right Thing × Till There Was You: phaseMs 118.5 -> ~0).
-#
-# Por eso CM2: (1) calcula el ancla a 22050 Hz / hop 128 (~5.8 ms de frame,
-# con ajuste de fase sobre todo el track -> precisión de pocos ms), (2) la
-# calcula sobre el MISMO audio que sirve stream-track (lo que oye el DJ), y
-# (3) antes de tocar el catálogo, rinde un EXAMEN contra 6 tracks calibrados
-# por el oído del DJ ("golden set"). Sin examen aprobado no hay backfill.
-# ----------------------------------------------------------------------------
-ENABLE_SET_RENDER = os.environ.get("ENABLE_SET_RENDER", "").lower() == "true"
-SET_SR = 44100           # SR de render del set (calidad final, no analisis)
-XFADE_BARS = 16          # duracion objetivo de transicion, en compases
-MIN_XFADE_BARS = 8
-MAX_STRETCH_PCT = 6.0    # tope de time-stretch: mas alla los artefactos se oyen
-BASS_HZ = 70.0           # low-shelf del bass-swap (referencia DJM-800)
-SET_TARGET_LUFS = -14.0
-
-GOLDEN_EXAM = os.environ.get("GOLDEN_EXAM", "true").lower() != "false"
-ENABLE_ANCHOR_BACKFILL = os.environ.get("ENABLE_ANCHOR_BACKFILL", "").lower() == "true"
-ENABLE_MIX_V7 = os.environ.get("ENABLE_MIX_V7", "0") == "1"  # v7.1 MIX-IN/OUT refutados: apagados por default
-ANCHOR_SR = 22050    # SR del análisis de ancla (independiente del SR=11025 general)
-ANCHOR_HOP = 128     # ~5.8 ms por frame de onset a 22050 Hz
-ANCHOR_TOL_MS = 10.0 # criterio del examen (error relativo por par)
-
-# Golden set — anclas validadas por oído + telemetría (18-ago-2026).
-# gold_ms = first_beat_detected_ms vigente en la base tras la calibración manual.
-GOLDEN_TRACKS = [
-    # (track_id, titulo, bpm, gold_ancla_ms_MOD_BEAT)
-    # RECALIBRADO 23-ago-2026 con la metodologia certificada de
-    # docs/golden-set-mixer.md (banda de kick 35-130 Hz Butterworth + envolvente
-    # de Hilbert + ataque al 25% entre piso y pico, 90 s desde el 35% del track),
-    # medido de forma INDEPENDIENTE del worker. Los gold anteriores (81/128/238/
-    # 158/398/372) venian de la metodologia vieja basada en el PICO y resultaron
-    # dispersos (-140 a +170 ms), no un corrimiento constante: eran la regla
-    # equivocada. Validacion cruzada: el detector de la v7.2 coincidio con la
-    # medicion independiente en 5 de 6 tracks dentro de +-5 ms.
-    ("b411743d-de03-4190-b6fe-f44aa6685ba8", "Make It Hot (Mustafa Ismaeel Rmx)", 122.0, 12),
-    ("a16963a1-0d15-4354-80e5-ba27500dd7b1", "Blame (Claptone Extended Mix)",     122.0, 57),
-    ("4cc427fb-03a6-4165-8ca3-2025b6ebe779", "No Time for Tears (Original Mix)",  122.0, 98),
-    ("7d377de8-6562-416d-8b0b-97317f9b6c7f", "Slip Away (Original Mix)",          122.0, 41),
-    ("cfaaaa0e-26d1-4e96-ab3c-8a5a49f34f07", "Right Thing (Instrumental)",        123.0, 43),
-    # RETIRADO del examen: "Till There Was You (Vanilla Ace)" (b3f57c3c) tiene
-    # jitter p90 de 14.6 ms y tempo real ~123.04 (deriva): su propia fase depende
-    # del BPM asumido, asi que RECHAZA los criterios del golden set y no sirve
-    # como referencia. Reponer el tercer par cuando se certifique un reemplazo.
-]
-
-# El ancla del examen se compara MODULO el periodo de beat: el valor absoluto que
-# reporta el worker (p. ej. 16284.3 ms) es el mismo ancla + n*beat.
-GOLDEN_PAIRS = [(0, 1), (2, 3)]  # indices (deck A, deck B); el orden fija el signo.
-# El tercer par quedo pendiente al retirar "Till There Was You" (dato malo).
-
-# Prueba CIEGA (v6.2): tracks jamas calibrados por oido. El examen imprime sus
-# anclas calculadas (no hay gold contra el cual comparar); se escriben a mano
-# via SQL y el DJ las valida alineando por rejilla en el mixer.
-BLIND_TRACKS = [
-    ("a83916eb-2333-43e8-b131-77071032db59", "This Sound (Extended Mix)",  124.0),
-    ("cf7f1585-f6cf-451a-bf12-e4ebe01c8d89", "Day 'N' Nite (Extended Mix)", 124.0),
-]
-
-# ----------------------------------------------------------------------------
-# Estándar de 8 cues (debe coincidir con src/lib/djCueStandard.ts)
-# ----------------------------------------------------------------------------
-DJ_CUE_STANDARD = [
-    (0, "MIX-IN", "#28E214"),
-    (1, "BASS-IN", "#E6C800"),
-    (2, "BUILD", "#FFA000"),
-    (3, "DROP 1", "#E61414"),
-    (4, "BREAK", "#AA50FF"),
-    (5, "DROP 2", "#FF3264"),
-    (6, "VOCALS", "#FFFFFF"),
-    (7, "MIX-OUT", "#2864E2"),
-]
-CUE_DEF = {n: (label, color) for n, label, color in DJ_CUE_STANDARD}
-
-# Perfiles Krumhansl-Schmuckler (calibrados con música CLÁSICA — se dejan como
-# referencia/fallback, ya no se usan por defecto).
-KS_MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
-KS_MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
-
-# ── CAMBIO 4 (v5.1) — perfiles de tonalidad para MÚSICA ELECTRÓNICA ──────────
-# Perfiles 'edma' (Faraldo et al., proyecto GiantSteps): extraídos por análisis
-# de corpus de EDM. En el benchmark GiantSteps (604 tracks de Beatport) superan
-# a Krumhansl y a KeyFinder.
-#
-# Fuente de los coeficientes: código fuente de Essentia,
-#   src/algorithms/tonal/key.cpp, arreglo `profileTypesWithOther`, entrada 'edma'.
-# Copiados textualmente del archivo, NO de memoria.
-#
-# Se usan SOLO los doce números de cada perfil: no se importa Essentia (su
-# licencia AGPLv3 exigiría licencia comercial de la UPF). Los coeficientes son
-# datos publicados; la implementación de abajo es propia sobre librosa.
-EDMA_MAJOR = np.array([1.00, 0.29, 0.50, 0.40, 0.60, 0.56, 0.32, 0.80, 0.31, 0.45, 0.42, 0.39])
-EDMA_MINOR = np.array([1.00, 0.31, 0.44, 0.58, 0.33, 0.49, 0.29, 0.78, 0.43, 0.29, 0.53, 0.32])
-NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-
-# Nota (0=C) -> Camelot. Menores = letra A, mayores = letra B (rueda estándar).
-MINOR_CAMELOT = {  # índice de nota (0=C) -> camelot menor
-    0: "5A", 1: "12A", 2: "7A", 3: "2A", 4: "9A", 5: "4A",
-    6: "11A", 7: "6A", 8: "1A", 9: "8A", 10: "3A", 11: "10A",
-}
-MAJOR_CAMELOT = {  # índice de nota (0=C) -> camelot mayor
-    0: "8B", 1: "3B", 2: "10B", 3: "5B", 4: "12B", 5: "7B",
-    6: "2B", 7: "9B", 8: "4B", 9: "11B", 10: "6B", 11: "1B",
-}
+API = os.environ["WORKER_API_URL"].rstrip("/")
+SECRET = os.environ["WORKER_SECRET"]
+POLL = int(os.environ.get("POLL_INTERVAL_SECONDS", "15"))
+MODEL = os.environ.get("STEMS_MODEL", "htdemucs_6s")
+# Los modelos htdemucs no aceptan segmentos > 7.8 s (largo de entrenamiento).
+SEGMENT = str(int(min(7, int(float(os.environ.get("DEMUCS_SEGMENT", "7"))))))  # entero: demucs no acepta decimales
+# La máquina tiene 24 núcleos y demucs usaba 2,4. JOBS procesa trozos en
+# paralelo (cada uno pide memoria: 4 jobs ≈ 8 GB, entra de sobra en 24 GB).
+JOBS = str(max(1, int(os.environ.get("DEMUCS_JOBS", "4"))))
+# overlap 0.25 es el defecto; 0.15 acelera ~15 % con diferencia inaudible.
+OVERLAP = str(float(os.environ.get("DEMUCS_OVERLAP", "0.15")))
+os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
+os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
+MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
+HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
+VERSION = "1.17"
+STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
-# ----------------------------------------------------------------------------
-# Utilidades DSP
-# ----------------------------------------------------------------------------
-def _norm_max(a: np.ndarray) -> np.ndarray:
-    m = float(np.max(a)) if a.size else 0.0
-    return (a / m) if m > 0 else a
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, flush=True)
 
 
-def bucket_reduce(values: np.ndarray, buckets: int, mode: str) -> list:
-    if values.size == 0:
-        return []
-    idx = np.linspace(0, values.size, buckets + 1).astype(int)
-    out = np.zeros(buckets, dtype=np.float64)
-    for b in range(buckets):
-        s, e = idx[b], max(idx[b] + 1, idx[b + 1])
-        seg = values[s:e]
-        if seg.size == 0:
-            out[b] = 0.0
-        elif mode == "peak":
-            out[b] = float(np.max(np.abs(seg)))
-        else:  # rms
-            out[b] = float(np.sqrt(np.mean(seg ** 2)))
-    out = _norm_max(out)
-    return [round(float(x), 4) for x in out]
-
-
-def compute_bands(y: np.ndarray, sr: int, buckets: int) -> dict:
-    """Picos por banda (bass<200, mid 200-2k, high>2k) en `buckets` cubos."""
-    n_fft = 2048
-    hop = max(1, len(y) // (buckets * 2))
-    S = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=hop))
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
-    bass_mask = freqs < 200
-    mid_mask = (freqs >= 200) & (freqs < 2000)
-    high_mask = freqs >= 2000
-
-    def band_series(mask):
-        e = S[mask, :].sum(axis=0) if mask.any() else np.zeros(S.shape[1])
-        # remuestrear a `buckets`
-        if e.size == 0:
-            return [0.0] * buckets
-        idx = np.linspace(0, e.size, buckets + 1).astype(int)
-        out = np.array([float(np.max(e[idx[b]:max(idx[b] + 1, idx[b + 1])]) or 0.0) for b in range(buckets)])
-        out = _norm_max(out)
-        return [round(float(x), 4) for x in out]
-
-    return {"bass": band_series(bass_mask), "mid": band_series(mid_mask), "high": band_series(high_mask)}
-
-
-def detect_key(y: np.ndarray, sr: int):
-    """Correlación de perfiles sobre chroma. Devuelve (key_musical, camelot).
-
-    CAMBIO 4 (v5.1): usa los perfiles 'edma' (calibrados con EDM) en vez de
-    Krumhansl-Schmuckler (calibrado con música clásica). Mismo algoritmo, misma
-    velocidad, mismo costo: cambian doce números por perfil.
-    """
-    try:
-        chroma = librosa.feature.chroma_stft(y=y, sr=sr)  # más rápido que chroma_cqt
-        prof = chroma.mean(axis=1)
-        prof = prof / (prof.sum() + 1e-9)
-        best = (-1e9, 0, True)
-        for i in range(12):
-            maj = np.corrcoef(np.roll(EDMA_MAJOR, i), prof)[0, 1]
-            mino = np.corrcoef(np.roll(EDMA_MINOR, i), prof)[0, 1]
-            if maj > best[0]:
-                best = (maj, i, False)
-            if mino > best[0]:
-                best = (mino, i, True)
-        _, note_idx, is_minor = best
-        if is_minor:
-            key = NOTE_NAMES[note_idx] + "m"
-            cam = MINOR_CAMELOT[note_idx]
-        else:
-            key = NOTE_NAMES[note_idx]
-            cam = MAJOR_CAMELOT[note_idx]
-        return key, cam
-    except Exception:
-        return None, None
-
-
-def compute_energy(rms_full: np.ndarray, bands: dict) -> int:
-    """Energy 1-10 tipo Mixed In Key."""
-    try:
-        loud = float(np.mean(rms_full)) if rms_full.size else 0.0
-        perceptual = math.sqrt(max(0.0, loud))
-        high = np.array(bands.get("high", []), dtype=float)
-        high_act = float(np.mean(high)) if high.size else 0.0
-        e01 = max(0.0, min(1.0, 0.6 * min(1.0, perceptual * 3.0) + 0.4 * high_act))
-        return int(max(1, min(10, round(1 + 9 * e01))))
-    except Exception:
+# ----------------------------------------------------------------------------- API
+def claim():
+    r = requests.post(f"{API}/stems-next", headers=HEADERS, json={}, timeout=60)
+    if r.status_code == 204:
         return None
-
-
-def _bar_band_energies(y, sr, anchor_ms, bar_ms, n_bars):
-    """dB RMS por compás en 4 bandas. Filtro Butterworth de fase cero (sin
-    corrimiento temporal: importa porque estos valores deciden POSICIONES)."""
-    from scipy.signal import butter, sosfiltfilt
-    BANDAS = {"low": (30, 130), "lowmid": (130, 300), "mid": (300, 3000), "high": (5000, 9000)}
-    out = {}
-    for nombre, (lo, hi) in BANDAS.items():
-        hi = min(hi, sr / 2 - 100)
-        if hi <= lo:
-            out[nombre] = np.full(n_bars, -120.0)
-            continue
-        sos = butter(4, [lo / (sr / 2), hi / (sr / 2)], btype="band", output="sos")
-        b = sosfiltfilt(sos, y.astype(np.float64))
-        e = np.empty(n_bars)
-        for i in range(n_bars):
-            a0 = int((anchor_ms + i * bar_ms) * sr / 1000.0)
-            a1 = int((anchor_ms + (i + 1) * bar_ms) * sr / 1000.0)
-            seg = b[max(0, a0):max(0, a1)]
-            e[i] = np.sqrt(np.mean(seg ** 2)) if seg.size else 1e-6
-        out[nombre] = 20 * np.log10(np.maximum(e, 1e-6))
-    return out
-
-
-def _energia_1_10(db_val, p10, p90):
-    """Escala la energia medida al 1-10 estilo Mixed In Key.
-    Calibrado contra 7493 cues reales: MIK concentra sus valores en 4-6
-    (Energy 6 n=3178, 5 n=2435, 4 n=1013), con extremos raros. Por eso el
-    mapeo comprime hacia el centro en vez de repartir linealmente 1..10."""
-    if p90 <= p10:
-        return 5
-    x = (db_val - p10) / (p90 - p10)          # 0..1 dentro del propio track
-    x = max(0.0, min(1.0, x))
-    return int(max(1, min(10, round(3.5 + 4.0 * x))))
-
-
-def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
-    """v7.4 — 8 hot cues siguiendo la METODOLOGIA INFERIDA DE MIXED IN KEY.
-
-    No copia posiciones: replica el metodo. Inferido de 951 canciones del
-    catalogo con sus 7493 cues reales de MIK (export de Rekordbox):
-
-      1. El cue A esta SIEMPRE en el segundo 0 (mediana 0.07 s; 94% < 1 s).
-         Es el punto de carga, no un punto de mezcla.
-      2. Los 8 cues caen SIEMPRE en la grilla de frases de 8 compases medida
-         desde A. Afinando el BPM, el error de ajuste da 0.00 compases de
-         mediana y el 65% de los tracks encaja perfecto.
-      3. El espaciado NO es regular: 0% de los tracks tiene todos los saltos
-         iguales, el 100% varia. El algoritmo ELIGE segun la musica.
-         Saltos usados: 16 (n=1599), 8 (1202), 32 (851), 24 (596).
-      4. Cobertura: el ultimo cue cae al ~79% de la duracion.
-      5. Cada cue lleva un nivel de ENERGIA 1-10 (MIK concentra en 4-6).
-
-    Perfil mediano de MIK que este detector reproduce (compas desde A):
-      A=0 · B=32 · C=48 · D=64 · E=88 · F=104 · G=128 · H=151
-    """
-    if not bpm or bpm < 40:
-        return None
-    try:
-        bar_ms = (60000.0 / bpm) * 4
-        dur_ms = (len(y) / sr) * 1000.0
-        # La GRILLA se cuenta desde el PRIMER BEAT REAL (ancla certificada), no
-        # desde t=0. Medido sobre 10 tracks: contando desde cero, los cues caian
-        # en compases 6.01, 18.01, 15.36... es decir, en multiplos de compas pero
-        # DESFASADOS de la frase musical, porque el archivo arranca antes del
-        # primer golpe. El cue A sigue yendo al segundo 0 (metodologia MIK), pero
-        # los otros 7 se cuentan desde el ancla para caer en frases reales.
-        anchor_ms = float(first_beat_ms or 0.0)
-        if anchor_ms < 0 or anchor_ms > dur_ms:
-            anchor_ms = 0.0
-        n_bars = int((dur_ms - anchor_ms) // bar_ms)
-        if n_bars < 24:
-            return None
-
-        F = _bar_band_energies(y, sr, anchor_ms, bar_ms, n_bars)
-        tot = 20 * np.log10(np.maximum(
-            np.sqrt(sum(10 ** (F[k] / 10) for k in F)), 1e-6))
-        p10, p90 = float(np.percentile(tot, 10)), float(np.percentile(tot, 90))
-
-        M = np.vstack([F[k] for k in ("low", "lowmid", "mid", "high")]).T
-        M = (M - M.mean(0)) / (M.std(0) + 1e-6)
-
-        PASO = 8                      # grilla de frase (regla 2)
-        SALTOS = (8, 16, 24, 32)      # repertorio observado (regla 3)
-        activos = np.where(tot >= p90 - 25)[0]
-        fin_util = int(activos[-1]) if activos.size else n_bars - 1
-
-        # Novedad estructural en cada limite de frase: 8 compases antes vs
-        # despues. Es lo que hace que cada cancion tenga su propia huella.
-        nov = {}
-        for b in range(PASO, fin_util - 8, PASO):
-            pre, post = M[max(0, b - 8):b], M[b:b + 8]
-            if pre.size and post.size:
-                nov[b] = float(np.linalg.norm(post.mean(0) - pre.mean(0)))
-        if len(nov) < 4:
-            return None
-
-        # Objetivo de reparto: el perfil mediano medido en MIK, escalado a
-        # este track. H apunta al ~79% del audio util (regla 4).
-        # Perfil objetivo escalado al audio util. El ultimo valor era 0.79 (la
-        # mediana medida en MIK) y resulto DEMASIADO CORTO: la validacion sobre
-        # 180 tracks mostro que ese tope dejaba al detector sin candidatos antes
-        # de los 8 cues (solo 113/180 llegaban a 8) y se comia el 9.4% de los
-        # cues de MIK, que en 85 de 180 tracks pone cues despues del 79%.
-        objetivo_rel = (0.0, 0.14, 0.25, 0.35, 0.46, 0.57, 0.68, 0.88)
-        elegidos = [0]
-
-        # --- H (SALIDA) se elige PRIMERO y con criterio propio ---------------
-        # Prioridad del dueño: el cue de inicio y el de salida son los que mas
-        # importan. H no puede ser "el ultimo que sobro": se busca el limite de
-        # frase con mayor cambio musical en la ventana final (75-92% del audio
-        # util), prefiriendo una CAIDA de energia sostenida (inicio del outro).
-        v0, v1 = int(0.75 * fin_util), int(0.92 * fin_util)
-        vent = [b for b in nov if v0 <= b <= v1]
-        if vent:
-            def score_h(b):
-                antes = float(np.median(tot[max(0, b - 8):b]))
-                despues = float(np.median(tot[b:b + 8]))
-                caida = max(0.0, antes - despues) / 6.0      # bonus si baja
-                return nov[b] / (max(nov.values()) or 1.0) + caida
-            h_bar = max(vent, key=score_h)
-        else:
-            h_bar = ((fin_util - 8) // PASO) * PASO
-
-        # --- B..G: recorren el perfil objetivo hasta llegar a H --------------
-        for rel in objetivo_rel[1:-1]:
-            ideal = rel * h_bar
-            cands = []
-            for salto in SALTOS:
-                b = elegidos[-1] + salto
-                if b in nov and b < h_bar and abs(b - ideal) <= 40:
-                    cands.append(b)
-            if not cands:
-                cands = [b for b in nov
-                         if b > elegidos[-1] and b < h_bar and abs(b - ideal) <= 24]
-            if not cands:
-                b = elegidos[-1] + 16
-                if b >= h_bar:
-                    break
-                cands = [b]
-            elegidos.append(max(cands, key=lambda b: nov.get(b, 0.0)))
-
-        while len(elegidos) < 8:
-            b = max(x for x in elegidos if x < h_bar) + 16 if any(x < h_bar for x in elegidos) else 16
-            if b >= h_bar:
-                b = max(x for x in elegidos if x < h_bar) + 8
-            if b < h_bar and b not in elegidos:
-                elegidos.append(b)
-                continue
-            # Sin lugar al final: partir el hueco mas grande por la mitad,
-            # cuantizado a 8 compases, eligiendo el candidato mas "musical".
-            elegidos = sorted(set(elegidos))
-            huecos = [(elegidos[i + 1] - elegidos[i], i)
-                      for i in range(len(elegidos) - 1)]
-            if not huecos:
-                break
-            ancho, i = max(huecos)
-            if ancho < 2 * PASO:      # sin lugar ni para un cue intermedio
-                break
-            lo, hi = elegidos[i], elegidos[i + 1]
-            cands = [b for b in range(lo + 8, hi, PASO) if b not in elegidos]
-            if not cands:
-                break
-            elegidos.append(max(cands, key=lambda b: nov.get(b, 0.0)))
-        elegidos = sorted(set(b for b in elegidos if b < h_bar))[:7] + [h_bar]
-        elegidos = sorted(set(elegidos))[:8]
-        if len(elegidos) < 6:
-            return None
-
-        cues = []
-        for num, b in enumerate(elegidos):
-            # cue A = segundo 0 del archivo (metodologia MIK); el resto sobre la
-            # grilla de frase medida desde el primer beat real.
-            pos = 0 if num == 0 else int(round(anchor_ms + b * bar_ms))
-            if pos >= dur_ms - 500:
-                continue
-            label, color = CUE_DEF[num]
-            seg = tot[b:b + 8]
-            energia = _energia_1_10(
-                float(np.median(seg)) if seg.size else p10, p10, p90)
-            n = nov.get(b, 0.0)
-            nmax = max(nov.values()) or 1.0
-            conf = 0.4 + 0.6 * min(1.0, n / nmax) if num else 1.0
-            cues.append({
-                "number": num, "label": label, "color": color,
-                "positionMs": pos,
-                "energy": energia,
-                "confidence": round(float(min(1.0, conf)), 2),
-            })
-        return cues if len(cues) >= 6 else None
-    except Exception as e:
-        print(f"    detect_cues v7.4 fallo: {e}", flush=True)
-        return None
-
-
-def detect_vocal_segments(y: np.ndarray, sr: int, bpm, first_beat_ms):
-    """Regiones (tramos) con voz — capa aparte de los cue points.
-    Banda vocal ~300-3000 Hz sostenida y por encima de los agudos. Best-effort."""
-    if not bpm or bpm < 40 or first_beat_ms is None:
-        return None
-    try:
-        beat_ms = 60000.0 / bpm
-        bar_ms = beat_ms * 4
-        dur_ms = (len(y) / sr) * 1000.0
-        hop = 512
-        S = np.abs(librosa.stft(y, n_fft=2048, hop_length=hop))
-        freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
-        times = librosa.frames_to_time(np.arange(S.shape[1]), sr=sr, hop_length=hop) * 1000.0
-        vocal = S[(freqs >= 300) & (freqs < 3000), :].sum(axis=0)
-        high = S[freqs >= 3000, :].sum(axis=0)
-        n_bars = int(max(0, (dur_ms - first_beat_ms) // bar_ms))
-        if n_bars < 4:
-            return None
-
-        def bar_mean(arr, b):
-            t0 = first_beat_ms + b * bar_ms
-            t1 = t0 + bar_ms
-            m = (times >= t0) & (times < t1)
-            return float(np.mean(arr[m])) if m.any() else 0.0
-
-        voc_b = _norm_max(np.array([bar_mean(vocal, b) for b in range(n_bars)]))
-        hi_b = _norm_max(np.array([bar_mean(high, b) for b in range(n_bars)]))
-        active = [bool(voc_b[b] > 0.45 and voc_b[b] > hi_b[b] * 1.15) for b in range(n_bars)]
-
-        segments = []
-        b = 0
-        while b < n_bars:
-            if active[b]:
-                start = b
-                while b < n_bars and active[b]:
-                    b += 1
-                if b - start >= 4:  # mínimo 4 compases para evitar falsos positivos
-                    segments.append({
-                        "startMs": int(round(first_beat_ms + start * bar_ms)),
-                        "endMs": int(round(min(dur_ms, first_beat_ms + b * bar_ms))),
-                    })
-            else:
-                b += 1
-        return segments or None
-    except Exception:
-        return None
-
-
-# ============================================================================
-# v7 — PIPELINE "LISTO PARA MEZCLAR"
-# ============================================================================
-# Contexto (medido, no supuesto): 996/1005 tracks tenían bpm_fine=0, es decir
-# BPM entero exacto. Un error de 0.24 BPM (el máximo observado) acumula UN BEAT
-# de desfase en ~4 minutos:  t_a_un_beat = 60 / ΔBPM.  Por eso hay pares que
-# arrancan alineados y "se van" a mitad de tema, aun con el ancla perfecta.
-#
-# Nota de licencia: NO se usa madmom. Sus modelos preentrenados son CC BY-NC-SA
-# (no comercial). Todo esto es librosa (ISC) + numpy, apto para uso comercial.
-# ----------------------------------------------------------------------------
-
-SR_GRID = 22050          # SR del refinamiento de tempo (más resolución que SR=11025)
-HOP_GRID = 128           # ~5.8 ms por frame
-MIXOUT_MIN_PCT = 0.70    # el MIX-OUT nunca antes del 70% del track
-RUNWAY_BARS_MIN = 16     # audio mínimo tras MIX-OUT para completar la mezcla
-TEMPO_RESID_MS = 35.0    # residuo robusto (p90) para considerar el tempo constante
-
-
-def refine_bpm(y22: np.ndarray, sr22: int, bpm_nominal: float):
-    """Refina un BPM nominal (entero) a su valor real con decimales.
-
-    Método: ajuste por mínimos cuadrados sobre los tiempos de beat detectados a
-    lo largo de TODO el track. Si los beats son t_i ≈ t0 + i*periodo, la
-    pendiente de la recta da el periodo real; el error del BPM escala con
-    1/duración, así que sobre 5-7 min la resolución baja de 0.01 BPM.
-
-    Devuelve (bpm_refinado, residuo_max_ms, n_beats) o (None, None, 0).
-    """
-    try:
-        onset_env = librosa.onset.onset_strength(y=y22, sr=sr22, hop_length=HOP_GRID)
-        # Anclar la búsqueda al nominal protegido: evita saltos de octava y de tresillo
-        _, beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr22,
-                                           hop_length=HOP_GRID, trim=False,
-                                           start_bpm=float(bpm_nominal), tightness=200)
-        t = librosa.frames_to_time(beats, sr=sr22, hop_length=HOP_GRID)
-        if len(t) < 32:
-            return None, None, len(t)
-        # Índice de beat esperado de cada detección, según el periodo nominal.
-        periodo_nom = 60.0 / float(bpm_nominal)
-        idx = np.round((t - t[0]) / periodo_nom)
-        # Descartar detecciones que no caen cerca de una línea de beat (outliers)
-        pred = t[0] + idx * periodo_nom
-        ok = np.abs(t - pred) < periodo_nom * 0.25
-        t, idx = t[ok], idx[ok]
-        if len(t) < 32:
-            return None, None, len(t)
-        # Mínimos cuadrados: t = a*idx + b  →  a = periodo real
-        A = np.vstack([idx, np.ones(len(idx))]).T
-        a, b = np.linalg.lstsq(A, t, rcond=None)[0]
-        if a <= 0:
-            return None, None, len(t)
-        bpm_real = 60.0 / a
-        # Si se fue muy lejos del nominal, no es refinamiento: es otra detección.
-        if abs(bpm_real - float(bpm_nominal)) > 1.5:
-            return None, None, len(t)
-        # Residuo ROBUSTO: percentil 90, no el máximo. Un solo beat mal
-        # detectado disparaba el máximo y clasificaba como "variable" a
-        # tracks perfectamente constantes (falso positivo medido en la prueba).
-        errs = np.abs(t - (a * idx + b)) * 1000.0
-        resid_ms = float(np.percentile(errs, 90))
-        return round(bpm_real, 3), round(resid_ms, 1), int(len(t))
-    except Exception:
-        traceback.print_exc()
-        return None, None, 0
-
-
-def clasificar_tempo(resid_ms):
-    """Tempo constante vs variable, por el residuo del ajuste lineal."""
-    if resid_ms is None:
-        return "desconocido"
-    return "constante" if resid_ms <= TEMPO_RESID_MS else "variable"
-
-
-def detect_mix_in(y22, sr22, bpm, first_beat_ms):
-    """MIX-IN musical: primer downbeat de la primera frase con kick sostenido.
-
-    ANTES (bug medido): 983/1005 tracks tenían el MIX-IN a <2 s — o sea marcaba
-    el INICIO DEL AUDIO, no un punto de entrada de mezcla. Un DJ no lanza el
-    track en el primer sample: lo lanza en la primera frase con groove estable.
-    """
-    try:
-        beat_ms = 60000.0 / float(bpm)
-        bar_ms = beat_ms * 4
-        phrase_ms = bar_ms * 4          # frase de 4 compases como unidad de entrada
-        # Energía de graves por compás (el kick)
-        S = np.abs(librosa.stft(y22, n_fft=2048, hop_length=512))
-        freqs = librosa.fft_frequencies(sr=sr22, n_fft=2048)
-        bass = S[freqs < 200, :].sum(axis=0)
-        times = librosa.frames_to_time(np.arange(len(bass)), sr=sr22, hop_length=512) * 1000.0
-        dur_ms = (len(y22) / sr22) * 1000.0
-        n_bars = int(max(0, (dur_ms - first_beat_ms) // bar_ms))
-        if n_bars < 8:
-            return None, False
-        def bar_energy(b):
-            t0 = first_beat_ms + b * bar_ms
-            m = (times >= t0) & (times < t0 + bar_ms)
-            return float(np.mean(bass[m])) if m.any() else 0.0
-        e = _norm_max(np.array([bar_energy(b) for b in range(n_bars)]))
-        umbral = 0.35 * float(np.max(e)) if np.max(e) > 0 else 0.0
-        # Primera frase donde el kick cruza el umbral y SE SOSTIENE 4 compases
-        for b in range(0, n_bars - 4):
-            if all(e[b + k] >= umbral for k in range(4)):
-                # snapear al inicio de frase
-                bar_frase = int(round(b / 4.0) * 4)
-                pos = first_beat_ms + bar_frase * bar_ms
-                djfriendly = pos > (first_beat_ms + 2 * bar_ms)  # hubo intro real
-                return int(round(pos)), bool(djfriendly)
-        return int(round(first_beat_ms)), False
-    except Exception:
-        traceback.print_exc()
-        return None, False
-
-
-def detect_mix_out(y22, sr22, bpm, first_beat_ms):
-    """MIX-OUT por SCORING GLOBAL (no voraz).
-
-    ANTES (bug encontrado en el código v5): el bucle recorría de atrás hacia
-    adelante y cortaba con `break` en la PRIMERA coincidencia. En un track con
-    un breakdown profundo temprano, ese breakdown se confundía con el final:
-    155 tracks quedaron con el MIX-OUT antes del 80% (casos extremos al 13%,
-    saliendo del track a los 46 s de 354).
-
-    AHORA: (1) se generan TODOS los candidatos, (2) se descarta lo anterior al
-    70% de la duración, (3) se exige que la caída SE SOSTENGA hasta el final
-    (que no reentre energía plena), (4) se elige por score global, no el primero.
-    """
-    try:
-        beat_ms = 60000.0 / float(bpm)
-        bar_ms = beat_ms * 4
-        S = np.abs(librosa.stft(y22, n_fft=2048, hop_length=512))
-        rms = librosa.feature.rms(S=S)[0]
-        times = librosa.frames_to_time(np.arange(len(rms)), sr=sr22, hop_length=512) * 1000.0
-        dur_ms = (len(y22) / sr22) * 1000.0
-        n_bars = int(max(0, (dur_ms - first_beat_ms) // bar_ms))
-        if n_bars < 16:
-            return None, False
-        def win(b0, b1):
-            t0 = first_beat_ms + b0 * bar_ms
-            t1 = first_beat_ms + b1 * bar_ms
-            m = (times >= t0) & (times < t1)
-            return float(np.mean(rms[m])) if m.any() else 0.0
-        e = _norm_max(np.array([win(b, b + 1) for b in range(n_bars)]))
-        bar_min = int(n_bars * MIXOUT_MIN_PCT)          # (2) piso de posición
-        bar_max = n_bars - RUNWAY_BARS_MIN              # (garantía de runway)
-        candidatos = []
-        for b in range(bar_min, max(bar_min + 1, bar_max), 4):
-            antes = float(np.mean(e[max(0, b - 4):b])) if b >= 4 else 0.0
-            despues = float(np.mean(e[b:n_bars]))       # (3) toda la cola
-            final = float(np.mean(e[max(b, n_bars - 8):n_bars]))
-            caida = antes - despues
-            sostiene = (final <= despues + 0.10)        # no reentra energía plena
-            if antes >= 0.45 and caida > 0.10 and sostiene:
-                runway_bars = n_bars - b
-                score = caida * 1.0 + min(runway_bars / 32.0, 1.0) * 0.3
-                candidatos.append((score, b))
-        if candidatos:
-            candidatos.sort(reverse=True)               # (4) el mejor, no el primero
-            b = candidatos[0][1]
-            return int(round(first_beat_ms + b * bar_ms)), True
-        # Fallback honesto: mediana medida del catálogo, respetando runway
-        b = min(int(round(n_bars * 0.87)), bar_max)
-        b = max(b, bar_min)
-        return int(round(first_beat_ms + b * bar_ms)), False
-    except Exception:
-        traceback.print_exc()
-        return None, False
-
-
-def compute_section_energy(y22, sr22, cues, dur_ms):
-    """energy_entry / energy_peak / energy_exit (1-9) a partir de los cues.
-
-    El campo `energy` global del catálogo sólo toma valores 7/8/9 (no
-    discrimina). La energía POR SECCIÓN sí (rango medido 2-8), y es la que
-    permite encadenar: la salida de un track debe casar con la entrada del
-    siguiente.
-    """
-    try:
-        rms = librosa.feature.rms(y=y22, hop_length=512)[0]
-        times = librosa.frames_to_time(np.arange(len(rms)), sr=sr22, hop_length=512) * 1000.0
-        def seg(t0, t1):
-            m = (times >= t0) & (times < t1)
-            return float(np.mean(rms[m])) if m.any() else 0.0
-        pos = {c["label"]: c["positionMs"] for c in (cues or [])}
-        mix_in = pos.get("MIX-IN", 0)
-        mix_out = pos.get("MIX-OUT", dur_ms * 0.87)
-        drop = pos.get("DROP 1", (mix_in + mix_out) / 2)
-        vals = {
-            "entry": seg(mix_in, mix_in + 30000),
-            "peak": seg(drop, drop + 30000),
-            "exit": seg(max(0, mix_out - 30000), mix_out),
-        }
-        pico = max(vals.values()) or 1.0
-        # Escala 1-9 relativa al propio track (el ranking global lo hace la app)
-        return {k: int(max(1, min(9, round(1 + 8 * (v / pico))))) for k, v in vals.items()}
-    except Exception:
-        traceback.print_exc()
-        return {}
-
-
-def sanity_check(result, dur_ms):
-    """Validación automática. Devuelve (lista_de_problemas, confianza 0-1)."""
-    problemas = []
-    cues = result.get("cue_points") or []
-    pos = {c["label"]: c["positionMs"] for c in cues}
-    # Mirar el BPM que realmente se va a usar (el refinado desde el nominal
-    # protegido), NO el que detect_grid estima por su cuenta: ese puede traer
-    # error de octava (se midió 164 en un track de 123) y se descarta igual.
-    bpm = result.get("bpm_precise") or result.get("bpm")
-    if bpm and not (100 <= float(bpm) <= 150):
-        problemas.append(f"bpm_fuera_de_rango:{bpm}")
-    mi, mo = pos.get("MIX-IN"), pos.get("MIX-OUT")
-    if mi is not None and dur_ms:
-        pct = mi / dur_ms
-        if pct > 0.15:
-            problemas.append(f"mixin_tarde:{pct:.2f}")
-    if mo is not None and dur_ms:
-        pct = mo / dur_ms
-        if pct < 0.80:
-            problemas.append(f"mixout_temprano:{pct:.2f}")
-        runway_s = (dur_ms - mo) / 1000.0
-        if runway_s < 20:
-            problemas.append(f"runway_corto:{runway_s:.0f}s")
-    if mi is not None and mo is not None and mo <= mi:
-        problemas.append("orden_invertido")
-    if result.get("tempo_stability") == "variable":
-        problemas.append("tempo_variable")
-    confianza = max(0.0, 1.0 - 0.2 * len(problemas))
-    return problemas, round(confianza, 2)
-
-
-def analyze(path: str, bpm_seed=None) -> dict:
-    y, sr = librosa.load(path, sr=SR, mono=True, duration=MAX_DURATION)
-    if y.size == 0:
-        raise RuntimeError("audio vacío")
-    # ── Rejilla de compases — metodología derivada de Rekordbox (v5) ──
-    # Reemplaza beat_track, que tomaba el PRIMER golpe detectado como
-    # ancla (podía ser el 2, 3 o 4 del compás). Medido contra 729
-    # rejillas reales de Rekordbox: 114 ms de error medio.
-    # El v5 busca el ancla solo dentro del primer beat del archivo,
-    # que es donde Rekordbox la pone en 729/729 casos.
-    try:
-        bpm, first_beat_ms = detect_grid(y, sr, seed_bpm=None)
-        if not (40 < bpm < 240):
-            bpm, first_beat_ms = None, None
-    except Exception:
-        traceback.print_exc()
-        # Respaldo: el método anterior. Nunca quedarse sin dato.
-        tempo, beats = librosa.beat.beat_track(y=y, sr=sr, trim=False)
-        beat_times = librosa.frames_to_time(beats, sr=sr)
-        # tempo puede venir como array de numpy (deprecación de float(ndarray)); tomamos el escalar.
-        tempo_val = float(np.atleast_1d(tempo)[0]) if tempo is not None and np.atleast_1d(tempo).size else 0.0
-        bpm = round(tempo_val, 2) if 40 < tempo_val < 240 else None
-        first_beat_ms = int(round(float(beat_times[0]) * 1000)) if len(beat_times) else None
-
-    peaks = bucket_reduce(y, BUCKETS, "peak")
-    rms = bucket_reduce(y, BUCKETS, "rms")
-    bands = compute_bands(y, sr, BUCKETS)
-    rms_full = librosa.feature.rms(y=y)[0]
-    energy = compute_energy(rms_full, bands)
-    key, camelot = detect_key(y, sr)
-    # Los cues NO se calculan aca: dependen del ANCLA, que se mide mas abajo
-    # (compute_anchor). Una version previa los calculaba en este punto con la
-    # rejilla vieja y despues el ancla cambiaba, dejando los cues cuantizados
-    # contra una rejilla que ya no existia. Medido sobre 40 tracks reales: solo
-    # el 8% quedaba en la grilla de frase.
-    cues = None
-    vocal_segments = detect_vocal_segments(y, sr, bpm, first_beat_ms)
-
-    out = {
-        "bpm": bpm,
-        "key": camelot,          # guardamos Camelot (como el resto de la app)
-        "first_beat_offset_ms": first_beat_ms,
-        "waveform_peaks": peaks,
-        "waveform_rms": rms,
-        "waveform_bands": bands,
-        "cue_points": cues,
-        "vocal_segments": vocal_segments,
-        "energy": energy,
-    }
-
-    # ── v7: pipeline "listo para mezclar" ────────────────────────────────────
-    # Se corre a 22050 Hz (el análisis general va a 11025, que da ~46 ms de
-    # frame — insuficiente para tempo decimal y para ubicar MIX-IN/MIX-OUT).
-    try:
-        bpm_ref = float(bpm_seed) if bpm_seed else (float(bpm) if bpm else None)
-        if bpm_ref and 40 < bpm_ref < 240:
-            y22, sr22 = librosa.load(path, sr=SR_GRID, mono=True, duration=MAX_DURATION)
-            dur_ms = (len(y22) / sr22) * 1000.0
-
-            # 1) BPM decimal (causa raíz de la deriva)
-            bpm_fino, resid_ms, n_beats = refine_bpm(y22, sr22, bpm_ref)
-            if bpm_fino:
-                out["bpm_precise"] = bpm_fino
-                out["bpm_fine"] = round(bpm_fino - round(bpm_ref), 3)
-                out["tempo_residual_ms"] = resid_ms
-                out["tempo_stability"] = clasificar_tempo(resid_ms)
-                print(f"    v7 bpm {bpm_ref} → {bpm_fino} (resid {resid_ms} ms, {n_beats} beats, {out['tempo_stability']})", flush=True)
-                bpm_grid = bpm_fino
-            else:
-                out["tempo_stability"] = "desconocido"
-                bpm_grid = bpm_ref
-
-            # ANCLA: debe ser LA MISMA que usa el mixer (first_beat_detected_ms,
-            # calculada sobre la rendition). Si se usa otra, los cues quedan
-            # cuantizados contra una rejilla distinta a la que suena. Bug real
-            # detectado en la prueba de 1 track: MIX-IN cayó a 44 ms.
-            try:
-                anc = compute_anchor(path, bpm_grid)
-                fb = float(anc["ancla_ms"])
-                out["first_beat_detected_ms"] = int(round(fb))
-                out["grid_confidence"] = anc.get("confianza")
-                print(f"    v7.2 ancla={fb:.0f} ms (residuo {anc['residuo_ms']} ms, conf {anc.get('confianza')}, kicks {anc.get('n_kicks')})", flush=True)
-            except Exception:
-                fb = float(first_beat_ms or 0)
-                print("    v7 ancla: fallback a la rejilla interna", flush=True)
-
-            # AHORA si: los cues se calculan sobre el ancla DEFINITIVA.
-            cues = detect_cues(y, sr, bpm_grid, fb)
-            out["cue_points"] = cues
-
-            # 2-3) MIX-IN/MIX-OUT v7.1: REFUTADOS en el lote de 25 (20-ago) —
-            # MIX-IN roto en tracks dinámicos, MIX-OUT empeoró el conjunto.
-            # Quedan detrás de ENABLE_MIX_V7=1 (default APAGADO). La colocación
-            # heredada de detect_cues se mantiene.
-            mi = mo = None
-            if ENABLE_MIX_V7:
-                mi, djfriendly = detect_mix_in(y22, sr22, bpm_grid, fb)
-                mo, mo_detectado = detect_mix_out(y22, sr22, bpm_grid, fb)
-                out["intro_djfriendly"] = djfriendly
-                out["mixout_detected"] = mo_detectado
-
-            # 4) v7.2 — TODOS los cues se cuantizan SIEMPRE a la rejilla nueva
-            # (ancla de ataque + BPM fino). Antes esto solo corría si MIX-IN/OUT
-            # validaban, y si no, los cues quedaban pegados a la rejilla vieja:
-            # exactamente el bug de "Oui" (8 hot cues a -47 ms de su propia
-            # rejilla) que hacía saltar los hot cues a otro lado en el mixer.
-            if cues:
-                bar_ms = (60000.0 / bpm_grid) * 4
-                beat_ms = 60000.0 / bpm_grid
-                nuevos = []
-                for c in cues:
-                    c2 = dict(c)
-                    if ENABLE_MIX_V7 and mi is not None and mo is not None and mo > mi:
-                        if c2.get("label") == "MIX-IN":
-                            c2["positionMs"] = int(mi)
-                        elif c2.get("label") == "MIX-OUT":
-                            c2["positionMs"] = int(mo)
-                    nuevos.append(c2)
-                for c2 in nuevos:
-                    # El cue A va SIEMPRE al segundo 0 del archivo (metodologia
-                    # MIK: es el punto de carga). Esta re-cuantizacion lo movia
-                    # al downbeat mas cercano (medido: 0 -> 907 ms).
-                    if int(c2.get("number", -1)) == 0:
-                        c2["positionMs"] = 0
-                        continue
-                    p = c2["positionMs"]
-                    # MIX-IN/OUT al compás; el resto de los cues al BEAT (los
-                    # hot cues intermedios pueden legítimamente caer a mitad
-                    # de compás — cuantizarlos a compás los movería de lugar).
-                    paso = bar_ms if c2.get("label") in ("MIX-IN", "MIX-OUT") else beat_ms
-                    q = fb + round((p - fb) / paso) * paso
-                    q = max(0, min(q, dur_ms - 1000))
-                    c2["positionMs"] = int(round(q))
-                # 5) Descartar cues duplicados tras cuantizar
-                vistos, limpios = set(), []
-                for c2 in sorted(nuevos, key=lambda x: x["positionMs"]):
-                    if c2["positionMs"] in vistos:
-                        continue
-                    vistos.add(c2["positionMs"])
-                    limpios.append(c2)
-                out["cue_points"] = limpios
-                cues = limpios
-
-            # 6) Energía por sección (base del arco de los sets)
-            se = compute_section_energy(y22, sr22, cues, dur_ms)
-            if se:
-                out["energy_entry"] = se["entry"]
-                out["energy_peak"] = se["peak"]
-                out["energy_exit"] = se["exit"]
-
-            # 7) Validación automática + score de confianza
-            problemas, confianza = sanity_check(out, dur_ms)
-            out["analysis_confidence"] = confianza
-            if problemas:
-                out["analysis_flags"] = problemas
-                print(f"    v7 ⚠ {', '.join(problemas)} (confianza {confianza})", flush=True)
-    except Exception:
-        traceback.print_exc()
-        print("    v7 falló (no bloquea el job)", flush=True)
-
-    return out
-
-
-# ----------------------------------------------------------------------------
-# Fase 2 — Identificación por huella acústica (Chromaprint + AcoustID)
-# Best-effort: si no hay ACOUSTID_API_KEY o falta `fpcalc`, devuelve None sin romper.
-# ----------------------------------------------------------------------------
-def fingerprint_identify(path: str):
-    """Devuelve {'artist','title'} identificando la canción por huella, o None."""
-    if not ACOUSTID_API_KEY:
-        return None
-    try:
-        proc = subprocess.run(
-            ["fpcalc", "-json", path],
-            capture_output=True, text=True, timeout=60,
-        )
-        if proc.returncode != 0 or not proc.stdout:
-            return None
-        fp = json.loads(proc.stdout)
-        fingerprint = fp.get("fingerprint")
-        duration = int(round(float(fp.get("duration", 0) or 0)))
-        if not fingerprint or duration <= 0:
-            return None
-        r = requests.get(
-            "https://api.acoustid.org/v2/lookup",
-            params={
-                "client": ACOUSTID_API_KEY,
-                "meta": "recordings",
-                "duration": duration,
-                "fingerprint": fingerprint,
-            },
-            headers={"User-Agent": "DeepMancho/1.0 ( https://deepmancho.com )"},
-            timeout=30,
-        )
-        r.raise_for_status()
-        data = r.json()
-        # Ordena por score y toma el mejor recording con artista+título.
-        results = sorted(data.get("results") or [], key=lambda x: x.get("score", 0), reverse=True)
-        for res in results:
-            for rec in (res.get("recordings") or []):
-                title = (rec.get("title") or "").strip()
-                artists = rec.get("artists") or []
-                artist = (artists[0].get("name") or "").strip() if artists else ""
-                if title and artist:
-                    return {"artist": artist, "title": title}
-        return None
-    except FileNotFoundError:
-        # `fpcalc` no instalado en la imagen → deshabilitar silenciosamente.
-        print("WARN: fpcalc no encontrado; identificación por huella deshabilitada", flush=True)
-        return None
-    except Exception:
-        return None
-
-
-# ----------------------------------------------------------------------------
-# CM1-bis — Loudness (LUFS integrado, BS.1770 vía pyloudnorm)
-# ----------------------------------------------------------------------------
-def compute_loudness_lufs(path: str):
-    """LUFS integrado del archivo. None si pyloudnorm no está o el audio falla.
-    Nunca rompe el job: la ausencia de loudness no debe frenar el análisis."""
-    try:
-        import pyloudnorm  # dependencia: pyloudnorm>=0.1 (requirements)
-    except ImportError:
-        print("WARN CM1: pyloudnorm no instalado; loudness_lufs no se calcula", flush=True)
-        return None
-    try:
-        y44, sr44 = librosa.load(path, sr=44100, mono=True, duration=MAX_DURATION)
-        if y44.size == 0:
-            return None
-        meter = pyloudnorm.Meter(sr44)
-        lufs = float(meter.integrated_loudness(y44))
-        if not np.isfinite(lufs):
-            return None
-        return round(lufs, 2)
-    except Exception:
-        traceback.print_exc()
-        return None
-
-
-# ----------------------------------------------------------------------------
-# CM2 — Ancla de rejilla de precisión (fase de beat + downbeat) — ver nota arriba
-# ----------------------------------------------------------------------------
-def _fase_por_segmento(onset: np.ndarray, times: np.ndarray, periodo_s: float, segs: int = 12):
-    """Fase circular (media ponderada por energía) del peine de beats, por segmento."""
-    n = len(onset)
-    borde = np.linspace(0, n, segs + 1).astype(int)
-    pts = []
-    for s in range(segs):
-        i0, i1 = borde[s], borde[s + 1]
-        w = onset[i0:i1]
-        if w.sum() < 1e-9:
-            continue
-        ang = 2.0 * np.pi * (times[i0:i1] % periodo_s) / periodo_s
-        z = np.sum(w * np.exp(1j * ang))
-        if abs(z) < 1e-9:
-            continue
-        pts.append((float(times[i0:i1].mean()), float(np.angle(z)), float(abs(z))))
-    return pts
-
-
-def _ajuste_lineal_fase(pts, periodo_s: float):
-    """Desenrolla la fase entre segmentos y ajusta fase(t)=a·t+b (ponderado).
-    a corrige la micro-desviación de tempo; b es la fase absoluta en t=0.
-    Devuelve (frecuencia_real_hz, fase_b, residuo_max_ms)."""
-    if len(pts) < 3:
-        raise RuntimeError("CM2: muy pocos segmentos con energía para ajustar fase")
-    T = np.array([p[0] for p in pts]); PH = np.array([p[1] for p in pts]); W = np.array([p[2] for p in pts])
-    des = PH.copy()
-    for k in range(1, len(des)):
-        while des[k] - des[k - 1] > np.pi:  des[k] -= 2 * np.pi
-        while des[k] - des[k - 1] < -np.pi: des[k] += 2 * np.pi
-    sw, st = W.sum(), (W * T).sum()
-    stt, sp, stp = (W * T * T).sum(), (W * des).sum(), (W * T * des).sum()
-    a = (sw * stp - st * sp) / (sw * stt - st * st)
-    b = (sp - a * st) / sw
-    resid_ms = float(np.max(np.abs(des - (a * T + b))) / (2 * np.pi) * periodo_s * 1000)
-    return (1.0 / periodo_s) + a / (2 * np.pi), b, resid_ms
-
-
-def compute_anchor(path: str, bpm: float):
-    """v7.2 — Ancla de rejilla anclada al ATAQUE del kick (no al pico de envolvente).
-
-    Por qué (evidencia del golden set, 21-ago): 9/24 tracks del catálogo tenían
-    el ancla corrida -77..-69 ms con rejilla y BPM perfectos. Causa: la onset
-    envelope de librosa reacciona tarde/temprano respecto del ataque perceptual
-    del bombo, que es lo que un DJ (y Rekordbox) usa como beat. Método
-    certificado en la auditoría: banda de kick 35-130 Hz (Butterworth) +
-    envolvente de Hilbert + tiempo de ataque en el cruce del 25% de la altura
-    del pico. Cambios v7.2 vs v6.1:
-      * Eventos discretos de ataque de kick (no la envolvente continua).
-      * Desambiguación del downbeat con la banda de caja/clap (1.5-5 kHz):
-        en 4x4 el snare cae en 2 y 4 — resuelve el corrimiento de 1-3 beats.
-      * grid_confidence (0-1) reportado para que la app sepa cuánto fiarse.
-    El BPM de entrada sigue siendo fuente de verdad (solo ±0.05 de grilla fina).
-    Devuelve dict(ancla_ms, bpm_real, residuo_ms, confianza, n_kicks)."""
-    from scipy.signal import butter, sosfiltfilt, hilbert, find_peaks
-
-    y, sr = librosa.load(path, sr=ANCHOR_SR, mono=True, duration=MAX_DURATION)
-    if y.size == 0:
-        raise RuntimeError("CM2: audio vacío")
-    periodo_nom = 60.0 / float(bpm)
-
-    # --- Envolvente de la banda de kick (35-130 Hz) ---
-    sos = butter(4, [35.0, 130.0], btype="band", fs=sr, output="sos")
-    yb = sosfiltfilt(sos, y.astype(np.float64))
-    env = np.abs(hilbert(yb)).astype(np.float32)
-    w_sm = max(1, int(0.005 * sr))  # suavizado ~5 ms
-    env = np.convolve(env, np.ones(w_sm, dtype=np.float32) / w_sm, mode="same")
-
-    # --- Eventos de kick: picos separados al menos ~0.45 del periodo ---
-    p99 = float(np.percentile(env, 99))
-    if p99 <= 0:
-        raise RuntimeError("CM2: sin energía de graves")
-    pk, props = find_peaks(env, distance=max(1, int(0.45 * periodo_nom * sr)),
-                           height=0.30 * p99)
-    if len(pk) < 24:
-        raise RuntimeError(f"CM2: muy pocos kicks detectados ({len(pk)})")
-
-    # --- ATAQUE de cada kick: último cruce del 25% de SU pico, hacia atrás ---
-    lim_atras = int(0.150 * sr)  # un ataque real no dura más de 150 ms
-    ataques = np.empty(len(pk)); subidas = np.empty(len(pk))
-    pesos = props["peak_heights"].astype(np.float64)
-    for i, p in enumerate(pk):
-        th = 0.25 * env[p]
-        j, lo = p, max(0, p - lim_atras)
-        while j > lo and env[j] > th:
-            j -= 1
-        ataques[i] = j / sr
-        subidas[i] = (p - j) / sr * 1000.0     # ms de ataque: el kick es seco
-
-    # --- Grilla fina de tempo (BPM protegido ±0.05): histograma plegado ---
-    NBINS = 256
-
-    def hist_plegado(ts, ws, periodo_s):
-        b = np.floor(((ts % periodo_s) / periodo_s) * NBINS).astype(int) % NBINS
-        H = np.bincount(b, weights=ws, minlength=NBINS)
-        return (np.roll(H, 1) + H + np.roll(H, -1)) / 3.0
-
-    def pico_interp(H, periodo_s):
-        k = int(np.argmax(H))
-        a, c = H[(k - 1) % NBINS], H[(k + 1) % NBINS]
-        den = (a - 2 * H[k] + c)
-        delta = 0.5 * (a - c) / den if abs(den) > 1e-12 else 0.0
-        return ((k + delta) / NBINS) * periodo_s % periodo_s
-
-    mejor = None
-    for dbpm in np.linspace(-0.05, 0.05, 21):
-        p = 60.0 / (float(bpm) + dbpm)
-        H = hist_plegado(ataques, pesos, p)
-        nitidez = float(H.max() / (H.mean() + 1e-12))
-        if mejor is None or nitidez > mejor[0]:
-            mejor = (nitidez, p, H)
-    nitidez, periodo_real, H = mejor
-    t_beat0 = pico_interp(H, periodo_real)
-
-    # NOTA (25-ago-2026): aca se probo una DESAMBIGUACION DE FASE (v7.5) que
-    # elegia entre 4 fases candidatas la de menor "residuo de inliers + 0.6 x
-    # tiempo de ataque". FUE REFUTADA con medicion sobre 80 tracks de audio real
-    # con arbitro ciego comun: cambio la fase en 23 tracks y EMPEORO 19 de ellos.
-    #   p90 <= 20 ms : 80.0% (esta version) -> 67.5% (con seleccion)
-    #   p90 <= 10 ms : 61.3% -> 48.8%
-    #   SD del offset entre canciones: 3.26 ms -> 18.69 ms (5.7x peor)
-    # Causa: cada fase candidata armaba su PROPIO conjunto de inliers, asi que
-    # podia ganar una fase con pocos golpes secos aunque representara peor al
-    # tren global. Si alguna vez se reintenta: evaluar los candidatos contra un
-    # soporte GLOBAL congelado y exigir una ventaja minima antes de abandonar
-    # el pico del histograma. Ver docs/validacion-fase-v75.md.
-
-    # --- Residuo: dispersión del pico por segmentos (solo segmentos con kicks) ---
-    SEGS = 8
-    borde = np.linspace(ataques.min(), ataques.max() + 1e-6, SEGS + 1)
-    desvios = []
-    for s in range(SEGS):
-        m = (ataques >= borde[s]) & (ataques < borde[s + 1])
-        if pesos[m].sum() < 0.02 * pesos.sum():
-            continue
-        Hs = hist_plegado(ataques[m], pesos[m], periodo_real)
-        ts = pico_interp(Hs, periodo_real)
-        d = (ts - t_beat0) % periodo_real
-        if d > periodo_real / 2:
-            d -= periodo_real
-        desvios.append(abs(d))
-    resid_ms = float(np.median(desvios) * 1000.0) if desvios else 999.0
-
-    # --- Downbeat: kicks por slot + SNARE (1.5-5 kHz) en 2 y 4 ---
-    # Solo votan COMPASES COMPLETOS: el compás truncado del arranque/final
-    # mete un kick de más en un slot y volcaba el empate 1-vs-3 para el lado
-    # equivocado (refutado con la señal sintética que arranca en el beat 3).
-    # Limitación documentada: si el patrón es simétrico (snare idéntico en 2 y
-    # 4, kicks parejos), beat 1 y beat 3 son indistinguibles desde la señal —
-    # la paridad elegida sigue siendo beat-compatible para la mezcla.
-    compas = 4.0 * periodo_real
-    t_lo = ataques.min() + compas
-    t_hi = ataques.max() - compas
-    m_full = (ataques >= t_lo) & (ataques <= t_hi)
-    at_v, pe_v = (ataques[m_full], pesos[m_full]) if m_full.sum() >= 16 else (ataques, pesos)
-    slot_k = np.floor(((at_v - t_beat0) % compas) / periodo_real).astype(int) % 4
-    kick_slot = np.array([pe_v[slot_k == k].sum() for k in range(4)])
-
-    snare_slot = np.zeros(4)
-    try:
-        sos_s = butter(4, [1500.0, 5000.0], btype="band", fs=sr, output="sos")
-        ys = sosfiltfilt(sos_s, y.astype(np.float64))
-        env_s = np.abs(ys).astype(np.float32)
-        env_s = np.convolve(env_s, np.ones(w_sm, dtype=np.float32) / w_sm, mode="same")
-        pk_s, pr_s = find_peaks(env_s, distance=max(1, int(0.45 * periodo_real * sr)),
-                                height=0.30 * float(np.percentile(env_s, 99)))
-        if len(pk_s) >= 16:
-            t_s = pk_s / sr
-            h_s = pr_s["peak_heights"]
-            m_s = (t_s >= t_lo) & (t_s <= t_hi)
-            if m_s.sum() >= 8:
-                t_s, h_s = t_s[m_s], h_s[m_s]
-            sl = np.floor(((t_s - t_beat0) % compas) / periodo_real).astype(int) % 4
-            snare_slot = np.array([h_s[sl == k].sum() for k in range(4)])
-    except Exception:
-        pass
-
-    kn = kick_slot / (kick_slot.sum() + 1e-12)
-    sn = snare_slot / (snare_slot.sum() + 1e-12)
-    if snare_slot.sum() > 0:
-        # score del candidato a downbeat k: snare fuerte en (k+1) y (k+3), kick en k
-        score = np.array([sn[(k + 1) % 4] + sn[(k + 3) % 4] + 0.5 * kn[k] for k in range(4)])
-    else:
-        score = kn.copy()
-    down = int(np.argmax(score))
-    # Empate 1-vs-3 (snare en 2y4 es simétrico ante un corrimiento de 2 beats):
-    # desempatar por la paridad cuyo downbeat cae MAS TEMPRANO en el audio.
-    # Los intros de DJ arrancan en el beat 1 en la gran mayoría del catálogo;
-    # si el track de verdad arranca en el 3, el error queda a nivel de paridad
-    # de compás (beat-compatible), nunca a nivel de beat.
-    alt = (down + 2) % 4
-    if score[down] - score[alt] < 0.05 * (score[down] + 1e-12):
-        t_ini_ = float(ataques.min())
-        def _primer_ancla(d):
-            td = (t_beat0 + d * periodo_real) % compas
-            kk = math.ceil((t_ini_ - 0.6 * periodo_real - td) / compas)
-            a = td + kk * compas
-            while a < 0:
-                a += compas
-            return a
-        if _primer_ancla(alt) < _primer_ancla(down) - 1e-6:
-            down = alt
-    t_down0 = (t_beat0 + down * periodo_real) % compas
-
-    # --- Ancla = downbeat de la rejilla del primer compás con kick ---
-    # Tolerancia de media negra: el ataque detectado del primer kick puede
-    # caer unos ms antes O después del tiempo exacto de rejilla; con una
-    # tolerancia de 1 ms un jitter de +5 ms saltaba un compás entero
-    # (refutado con la señal sintética de verdad conocida).
-    t_inicio = float(ataques.min())
-    k = math.ceil((t_inicio - 0.6 * periodo_real - t_down0) / compas)
-    ancla_s = t_down0 + k * compas
-    while ancla_s < 0:
-        ancla_s += compas
-
-    # --- Confianza de rejilla (0-1): nitidez del pico + estabilidad + soporte ---
-    conf = min(1.0, nitidez / 8.0) * max(0.0, 1.0 - min(resid_ms, 40.0) / 40.0)
-    conf *= min(1.0, len(pk) / 120.0)
-    return dict(ancla_ms=round(float(ancla_s) * 1000.0, 1),
-                bpm_real=round(60.0 / float(periodo_real), 3),
-                residuo_ms=round(float(resid_ms), 1),
-                confianza=round(float(conf), 2),
-                n_kicks=int(len(pk)))
-
-
-def rendition_url(track_id: str) -> str:
-    """URL del MISMO audio que reproduce el navegador (stream-track)."""
-    return f"{WORKER_API_URL}/stream-track?track_id={track_id}&format=aac"
-
-
-def _wrap(x: float, T: float) -> float:
-    x = x % T
-    return x - T if x > T / 2 else x
-
-
-def golden_exam():
-    """Examen del golden set. Solo LEE audio e imprime; NUNCA escribe en la base.
-    Gate: |error relativo| <= ANCHOR_TOL_MS en los 3 pares -> APROBADO."""
-    print("[CM2 EXAMEN] arrancando examen del golden set (6 tracks, solo lectura)...", flush=True)
-    resultados = {}
-    for i, (tid, title, bpm, gold) in enumerate(GOLDEN_TRACKS):
-        try:
-            url = rendition_url(tid)
-            r = requests.get(url, timeout=180)
-            r.raise_for_status()
-            tmp = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
-            tmp.write(r.content); tmp.close()
-            res = compute_anchor(tmp.name, bpm)
-            os.remove(tmp.name)
-            res["gold"] = gold; res["bpm"] = bpm
-            resultados[i] = res
-            flag = " ⚠ residuo alto" if res["residuo_ms"] > 8 else ""
-            print(f"[CM2 EXAMEN] {title}: ancla={res['ancla_ms']}ms "
-                  f"bpm_real={res['bpm_real']} residuo={res['residuo_ms']}ms{flag}", flush=True)
-        except Exception as e:
-            print(f"[CM2 EXAMEN] {title}: FALLO al analizar ({e})", flush=True)
-    aprobado = True
-    for a, b in GOLDEN_PAIRS:
-        if a not in resultados or b in (None,) or b not in resultados:
-            print(f"[CM2 EXAMEN] Par {GOLDEN_TRACKS[a][1]} × {GOLDEN_TRACKS[b][1]}: SIN DATOS", flush=True)
-            aprobado = False
-            continue
-        A, B = resultados[a], resultados[b]
-        T = 60000.0 / ((A["bpm"] + B["bpm"]) / 2.0)
-        err = _wrap((B["ancla_ms"] - A["ancla_ms"]) - (B["gold"] - A["gold"]), T)
-        ok = abs(err) <= ANCHOR_TOL_MS
-        aprobado = aprobado and ok
-        print(f"[CM2 EXAMEN] Par {GOLDEN_TRACKS[a][1]} × {GOLDEN_TRACKS[b][1]}: "
-              f"error {err:+.1f} ms {'✅' if ok else '❌'}", flush=True)
-    for tid, title, bpm in BLIND_TRACKS:
-        try:
-            r = requests.get(rendition_url(tid), timeout=180)
-            r.raise_for_status()
-            tmp = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
-            tmp.write(r.content); tmp.close()
-            res = compute_anchor(tmp.name, bpm)
-            os.remove(tmp.name)
-            print(f"[CM2 CIEGA] {title}: ancla={res['ancla_ms']}ms "
-                  f"bpm_real={res['bpm_real']} residuo={res['residuo_ms']}ms", flush=True)
-        except Exception as e:
-            print(f"[CM2 CIEGA] {title}: FALLO ({e})", flush=True)
-    print(f"[CM2 EXAMEN] RESULTADO: {'APROBADO ✅' if aprobado else 'NO APROBADO ❌'}"
-          f" (criterio ±{ANCHOR_TOL_MS} ms por par)", flush=True)
-    if aprobado and not ENABLE_ANCHOR_BACKFILL:
-        print("[CM2 EXAMEN] Para habilitar el backfill de anclas: variable "
-              "ENABLE_ANCHOR_BACKFILL=true (requiere worker-result con soporte "
-              "de first_beat_detected_ms).", flush=True)
-    return aprobado
-
-
-# ----------------------------------------------------------------------------
-# API (Edge Functions) helpers
-# ----------------------------------------------------------------------------
-def next_job():
-    """Reclama el siguiente job y devuelve (job, track, audio_url) o (None, None, None)."""
-    r = requests.post(f"{WORKER_API_URL}/worker-next", headers=HEADERS, timeout=30)
-    if r.status_code == 401:
-        raise RuntimeError("401: WORKER_SECRET incorrecto")
-    r.raise_for_status()
-    data = r.json()
-    job = data.get("job")
-    if not job:
-        return None, None, None, None
-    return job, data.get("track") or {}, data.get("audio_url"), data.get("rendition_upload")
-
-
-# ---------------------------------------------------------------------------
-# FORMATO ESTANDAR DE LA PLATAFORMA (DJCONNECT_AUDIO_STANDARD v1, 25-ago-2026)
-# MP3 (libmp3lame) CBR 192 kbps, 44.1 kHz, estereo. Documentado en
-# docs/estrategia-almacenamiento.md y en el doc 08 del Project Knowledge.
-# Por que MP3 y no AAC: el contenedor MP4 depende del atomo `moov` y ya produjo
-# archivos corruptos -> DEMUXER_ERROR_NO_SUPPORTED_STREAMS y "Media failed to
-# decode" en iOS Safari, medidos en produccion. MP3 no tiene contenedor fragil,
-# decodifica en todo el parque (Safari/PWA, Web Audio, Liquidsoap) y en CBR da
-# seek deterministico, que es lo que necesitan el beatgrid y los hot cues.
-# NUNCA aplicar loudnorm/volume aca: `loudness_lufs` se mide sobre el audio y la
-# normalizacion se aplica en REPRODUCCION. Normalizar en el archivo rompe esa
-# medicion y puede introducir clipping en los picos de graves.
-# ---------------------------------------------------------------------------
-AUDIO_STANDARD = {
-    "codec": "libmp3lame", "bitrate": "192k", "sample_rate": "44100",
-    "channels": "2", "ext": ".mp3", "mime": "audio/mpeg",
-}
-
-
-def make_rendition(src_path: str):
-    """Convierte al ESTANDAR de la plataforma (MP3 CBR 192k). Ruta o None."""
-    try:
-        out = src_path + ".stream" + AUDIO_STANDARD["ext"]
-        proc = subprocess.run(
-            ["ffmpeg", "-y", "-i", src_path,
-             "-vn",
-             "-map_metadata", "0",          # preserva titulo/artista/BPM/key
-             "-id3v2_version", "3",
-             "-write_xing", "1",            # header Xing: duracion y seek fiables
-             "-ar", AUDIO_STANDARD["sample_rate"],
-             "-ac", AUDIO_STANDARD["channels"],
-             "-c:a", AUDIO_STANDARD["codec"],
-             "-b:a", AUDIO_STANDARD["bitrate"],
-             "-f", "mp3", out],
-            capture_output=True, timeout=180,
-        )
-        if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
-            return None
-        return out
-    except Exception:
-        return None
-
-
-def upload_rendition(signed_url: str, rendition_path: str) -> bool:
-    """Sube la rendition estandar (MP3) a la URL firmada de Supabase Storage."""
-    try:
-        with open(rendition_path, "rb") as f:
-            data = f.read()
-        r = requests.put(
-            signed_url,
-            data=data,
-            headers={"content-type": AUDIO_STANDARD["mime"], "x-upsert": "true"},
-            timeout=180,
-        )
-        return r.status_code in (200, 201)
-    except Exception:
-        return False
-
-
-def download_audio(audio_url: str) -> str:
-    r = requests.get(audio_url, timeout=120)
-    r.raise_for_status()
-    ext = os.path.splitext(audio_url.split("?")[0])[1] or ".audio"
-    tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
-    tmp.write(r.content)
-    tmp.close()
-    return tmp.name
-
-
-def send_result(job_id: str, track_id: str, status: str, result: dict = None, error: str = None):
-    payload = {"job_id": job_id, "track_id": track_id, "status": status}
-    if result is not None:
-        payload["result"] = result
-    if error:
-        payload["error"] = error[:1000]
-    r = requests.post(f"{WORKER_API_URL}/worker-result", headers=HEADERS, json=payload, timeout=60)
-    r.raise_for_status()
-
-
-# ----------------------------------------------------------------------------
-# Main loop
-# ----------------------------------------------------------------------------
-def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict = None):
-    job_id = job["id"]
-    track_id = job["track_id"]
-    print(f"[job {job_id}] track {track_id} — analizando...", flush=True)
-    tmp = None
-    try:
-        if not audio_url:
-            send_result(job_id, track_id, "error", error="track sin audio")
-            return
-        tmp = download_audio(audio_url)
-        result = analyze(tmp, bpm_seed=track.get("bpm"))
-        # CM1-bis: loudness restaurado (la v5 lo habia perdido — regresion detectada 18-ago)
-        lufs = compute_loudness_lufs(tmp)
-        if lufs is not None:
-            result["loudness_lufs"] = lufs
-        # CM2 (solo con ENABLE_ANCHOR_BACKFILL=true y examen aprobado): ancla de
-        # precision sobre la RENDITION (lo que oye el DJ), nunca sobre el master.
-        # Escribe SOLO first_beat_detected_ms; jamas first_beat_offset_ms ni _source.
-        if ENABLE_ANCHOR_BACKFILL:
-            try:
-                bpm_ref = track.get("bpm") or result.get("bpm")
-                if bpm_ref and 40 < float(bpm_ref) < 240:
-                    rr = requests.get(rendition_url(track_id), timeout=180)
-                    rr.raise_for_status()
-                    rtmp = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
-                    rtmp.write(rr.content); rtmp.close()
-                    anc = compute_anchor(rtmp.name, float(bpm_ref))
-                    os.remove(rtmp.name)
-                    if anc["residuo_ms"] <= 8:
-                        result["first_beat_detected_ms"] = int(round(anc["ancla_ms"]))
-                        print(f"[job {job_id}] CM2 ancla={anc['ancla_ms']}ms residuo={anc['residuo_ms']}ms", flush=True)
-                    else:
-                        print(f"[job {job_id}] CM2 residuo alto ({anc['residuo_ms']}ms) — ancla NO escrita", flush=True)
-            except Exception as e:
-                print(f"[job {job_id}] CM2 fallo (no bloquea el job): {e}", flush=True)
-        # Rendition: si la cancion no tiene version reproducible (ej. AIFF),
-        # conviertela al ESTANDAR (MP3 CBR 192k) y subila via la URL firmada.
-        # El backend debe fijar `stream_mp3_asset_path` con ese path; el campo
-        # `stream_asset_path` (AAC) queda LEGACY y no se escribe mas.
-        if rendition_upload and rendition_upload.get("url") and rendition_upload.get("path"):
-            rend = make_rendition(tmp)
-            if rend:
-                if upload_rendition(rendition_upload["url"], rend):
-                    result["rendition_path"] = rendition_upload["path"]
-                    print(f"[job {job_id}] rendition subida: {rendition_upload['path']}", flush=True)
-                else:
-                    print(f"[job {job_id}] WARN: no se pudo subir la rendition", flush=True)
-                try:
-                    os.remove(rend)
-                except Exception:
-                    pass
-        # respetar bpm/key de tags: el backend solo los usa si el track no los tenía
-        result["bpm"] = result.get("bpm")  # enviar siempre el BPM preciso (con decimales)
-        result["key"] = result.get("key") if not track.get("key") else None
-        # Fase 2 — identificar por huella SOLO si el track no trae artista/título.
-        # El backend (worker-result) escribe estos campos únicamente si están vacíos.
-        if not (track.get("artist") and track.get("title")):
-            ident = fingerprint_identify(tmp)
-            if ident:
-                result["identified_artist"] = ident["artist"]
-                result["identified_title"] = ident["title"]
-                print(f"[job {job_id}] identificado: {ident['artist']} — {ident['title']}", flush=True)
-        send_result(job_id, track_id, "done", result=result)
-        n_cues = len(result.get("cue_points") or [])
-        print(f"[job {job_id}] OK — cues={n_cues} energy={result['energy']}", flush=True)
-    except Exception as e:
-        traceback.print_exc()
-        try:
-            send_result(job_id, track_id, "error", error=str(e))
-        except Exception:
-            pass
-        print(f"[job {job_id}] FALLO: {e}", flush=True)
-    finally:
-        if tmp and os.path.exists(tmp):
-            try:
-                os.remove(tmp)
-            except Exception:
-                pass
-
-
-# ============================================================================
-# v7 — RENDERIZADOR DE SETS PRE-MEZCLADOS (offline)
-# ============================================================================
-# Un set tiene FINAL, a diferencia de la radio 24/7. Por eso NO necesita
-# Icecast ni VPS de streaming: se mezcla UNA vez offline y queda como archivo.
-# Ventaja: calidad de mezcla sin apuro, y reproduce perfecto en segundo plano
-# y con el telefono bloqueado (que es justo el techo del modelo client-side).
-#
-# Metodologia aplicada (skills del proyecto + investigacion):
-#   * Transiciones sobre los CUE POINTS reales (MIX-OUT saliente / MIX-IN entrante)
-#   * Crossfade EQUAL-POWER: 0.707 en el medio, NO 0.5 -> sin hueco de volumen
-#   * BASS-SWAP: el entrante entra sin graves, el saliente los cede -> sin dos
-#     kicks peleando (cancelacion de fase = "barro")
-#   * Solape alineado a limite de compas
-#   * Time-stretch solo si dBPM <= 6%; mas alla NO se fuerza
-#   * Normalizacion a -14 LUFS con techo de true peak
-# ----------------------------------------------------------------------------
-
-def _set_api(action, payload=None):
-    url = f"{WORKER_API_URL}/set-render?action={action}"
-    r = requests.post(url, headers={"x-worker-secret": WORKER_SECRET,
-                                    "Content-Type": "application/json"},
-                      json=payload or {}, timeout=120)
     r.raise_for_status()
     return r.json()
 
 
-def _decode_pcm(path, sr=SET_SR):
-    """Decodifica a float32 estereo -> array (n, 2)."""
-    out = subprocess.run(
-        ["ffmpeg", "-v", "error", "-i", path, "-f", "f32le", "-acodec", "pcm_f32le",
-         "-ar", str(sr), "-ac", "2", "-"], capture_output=True, check=True).stdout
-    return np.frombuffer(out, dtype=np.float32).reshape(-1, 2).copy()
+def report(job_id: str, ok: bool, stems=None, patterns=None, error: str | None = None):
+    body = {"job_id": job_id, "ok": ok, "stems": stems or {}, "patterns": patterns or {}, "error": error}
+    r = requests.post(f"{API}/stems-result", headers=HEADERS, json=body, timeout=120)
+    if not r.ok:
+        log("stems-result respondió", r.status_code, r.text[:300])
+    r.raise_for_status()
 
 
-def _stretch(path, ratio, tmpdir):
-    """Time-stretch preservando el tono. Cae a atempo si no hay rubberband."""
-    if abs(ratio - 1.0) < 1e-4:
-        return path
-    dst = os.path.join(tmpdir, f"st_{abs(hash((path, ratio)))}.wav")
-    for filtro in (f"rubberband=tempo={ratio:.6f}", f"atempo={ratio:.6f}"):
-        try:
-            subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", path, "-af", filtro,
-                            "-ar", str(SET_SR), "-ac", "2", dst],
-                           capture_output=True, check=True)
-            return dst
-        except subprocess.CalledProcessError:
-            continue
-    return path
-
-
-def _low_shelf(x, fc, gain_db):
-    """Low-shelf biquad (RBJ). gain_db<0 recorta graves."""
-    from scipy.signal import lfilter
-    A = 10 ** (gain_db / 40.0)
-    w0 = 2 * np.pi * fc / SET_SR
-    alpha = np.sin(w0) / 2 * np.sqrt((A + 1 / A) * (1 / 0.707 - 1) + 2)
-    cw, sq = np.cos(w0), 2 * np.sqrt(A) * alpha
-    b = np.array([A * ((A + 1) - (A - 1) * cw + sq),
-                  2 * A * ((A - 1) - (A + 1) * cw),
-                  A * ((A + 1) - (A - 1) * cw - sq)])
-    a0 = (A + 1) + (A - 1) * cw + sq
-    a = np.array([1.0, (-2 * ((A - 1) + (A + 1) * cw)) / a0,
-                  ((A + 1) + (A - 1) * cw - sq) / a0])
-    b = b / a0
-    y = np.empty_like(x)
-    for ch in range(x.shape[1]):
-        y[:, ch] = lfilter(b, a, x[:, ch])
-    return y
-
-
-def _bass_ramp(x, entrando: bool):
-    """Bass-swap progresivo entre version filtrada y plena."""
-    filt = _low_shelf(x, BASS_HZ, -24.0)
-    t = np.linspace(0.0 if entrando else 1.0, 1.0 if entrando else 0.0, len(x))[:, None]
-    return (filt * (1 - t) + x * t).astype(np.float32)
-
-
-def _cue(cues, label, default=None):
-    for c in cues or []:
-        if (c.get("label") or "").upper() == label:
-            return float(c["positionMs"])
-    return default
-
-
-def render_set(job, tracks, upload_url, result_path):
-    """Mezcla el set completo y lo sube. Devuelve (duracion_s, tracklist)."""
-    tmpdir = tempfile.mkdtemp(prefix="dm_set_")
-    salida = np.zeros((0, 2), dtype=np.float32)
-    tracklist, bpm_set, fin_ant, fase_ant = [], None, 0, 0.0
-
-    for i, tr in enumerate(tracks):
-        titulo = tr.get("title") or "?"
-        print(f"  [{i+1}/{len(tracks)}] {titulo}", flush=True)
-        r = requests.get(tr["audio_url"], timeout=300)
+def download(url: str, dest: Path):
+    with requests.get(url, stream=True, timeout=300) as r:
         r.raise_for_status()
-        p = os.path.join(tmpdir, f"{i}.audio")
-        with open(p, "wb") as f:
-            f.write(r.content)
+        size = 0
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(1 << 20):
+                size += len(chunk)
+                if size > MAX_MB * (1 << 20):
+                    raise RuntimeError(f"archivo mayor a {MAX_MB} MB")
+                f.write(chunk)
+    return dest
 
-        bpm_tr = float(tr.get("bpm") or 0) + float(tr.get("bpm_fine") or 0)
-        if not bpm_tr:
-            print("    sin BPM, se omite", flush=True)
-            continue
 
-        if bpm_set is None:
-            bpm_set, ratio = bpm_tr, 1.0
-        else:
-            ratio = bpm_set / bpm_tr
-            desvio = abs(ratio - 1.0) * 100
-            if desvio > MAX_STRETCH_PCT:
-                print(f"    dBPM {desvio:.1f}% > {MAX_STRETCH_PCT}% — sin estirar", flush=True)
-                ratio = 1.0
-            elif desvio > 0.05:
-                p = _stretch(p, 1.0 / ratio, tmpdir)
+def upload(target, path: Path, content_type="audio/mpeg"):
+    """`target` es el objeto {path, url, token} que entrega stems-next (o una URL simple)."""
+    url = target["url"] if isinstance(target, dict) else target
+    headers = {"Content-Type": content_type, "x-upsert": "true"}
+    if isinstance(target, dict) and target.get("token") and "token=" not in url:
+        headers["Authorization"] = f"Bearer {target['token']}"
+    with open(path, "rb") as f:
+        r = requests.put(url, data=f, headers=headers, timeout=600)
+    if not r.ok:
+        raise RuntimeError(f"subida falló {r.status_code}: {r.text[:200]}")
 
-        audio = _decode_pcm(p)
-        factor = ratio if ratio != 1.0 else 1.0
-        cues = tr.get("cue_points") or []
-        dur_ms = len(audio) / SET_SR * 1000.0
-        anchor_ms = float(tr.get("first_beat_offset_ms") or 0) * factor
-        mix_in = (_cue(cues, "MIX-IN", 0.0) or 0.0) * factor
-        mix_out = _cue(cues, "MIX-OUT")
-        mix_out = dur_ms * 0.90 if mix_out is None else mix_out * factor
 
-        beat_ms = 60000.0 / bpm_set
-        compas_ms = beat_ms * 4
-        audio = audio[int(mix_in / 1000.0 * SET_SR):]
-        fase = (mix_in - anchor_ms) % compas_ms
+# ----------------------------------------------------------------------------- audio
+def ffprobe_duration(path: Path) -> float:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    return float(out or 0)
 
-        if len(salida) == 0:
-            salida = audio
-            tracklist.append({"position": 1, "start_seconds": 0, **_tl(tr)})
-            fin_ant = int((mix_out - mix_in) / 1000.0 * SET_SR)
-            fase_ant = fase
-            continue
 
-        disp_ms = min(mix_out - mix_in, fin_ant / SET_SR * 1000.0)
-        bars = XFADE_BARS
-        while bars > MIN_XFADE_BARS and bars * compas_ms > disp_ms * 0.5:
-            bars -= 4
-        n = int(min(bars * compas_ms, max(disp_ms, 0) * 0.5) / 1000.0 * SET_SR)
-        n = max(1, min(n, len(audio), len(salida)))
+def to_wav_mono(path: Path, sr: int = 22050) -> tuple[np.ndarray, int]:
+    """Decodifica con ffmpeg a float32 mono (sin depender de librosa.load/audioread)."""
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(path), "-ac", "1", "-ar", str(sr), "-f", "f32le", "-"],
+        capture_output=True, check=True,
+    ).stdout
+    return np.frombuffer(raw, dtype=np.float32), sr
 
-        offset = int((((fase - fase_ant) % compas_ms) / 1000.0) * SET_SR)
-        ini = max(0, min(fin_ant - n + offset, len(salida) - n))
 
-        t = np.linspace(0, np.pi / 2, n)[:, None]
-        fo, fi = np.cos(t).astype(np.float32), np.sin(t).astype(np.float32)
-        cola = _bass_ramp(salida[ini:ini + n], entrando=False)
-        cabeza = _bass_ramp(audio[:n], entrando=True)
-        mezcla = cola * fo + cabeza * fi
-        salida = np.vstack([salida[:ini], mezcla, audio[n:]])
+def run_demucs(src: Path, outdir: Path, model: str = MODEL) -> dict[str, Path]:
+    cmd = [
+        sys.executable, "-m", "demucs", "-n", model, "-d", "cpu",
+        "--segment", SEGMENT, "-j", JOBS, "--overlap", OVERLAP, "--mp3", "--mp3-bitrate", "192", "-o", str(outdir), str(src),
+    ]
+    log("demucs:", " ".join(cmd[2:]))
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "")[-1500:]
+        raise RuntimeError(f"demucs salió con {proc.returncode}: {tail}")
+    # OJO: demucs guarda en <salida>/<modelo>/<nombre>/ — hay que usar el
+    # modelo que se le pasó, no el de por defecto. (Bug de la v1.9.)
+    base = outdir / model / src.stem
+    stems = {p.stem: p for p in base.glob("*.mp3")}
+    if not stems:
+        encontrado = [str(p.relative_to(outdir)) for p in outdir.rglob("*.mp3")][:8]
+        raise RuntimeError(
+            f"demucs no produjo stems en {base.relative_to(outdir)}"
+            + (f"; sí hay: {encontrado}" if encontrado else "")
+        )
+    return stems
 
-        tracklist.append({"position": i + 1, "start_seconds": int(ini / SET_SR), **_tl(tr)})
-        print(f"    transicion {bars} compases en {ini/SET_SR/60:.1f} min", flush=True)
-        fin_ant = len(salida) - max(0, len(audio) - int((mix_out - mix_in) / 1000.0 * SET_SR))
-        fase_ant = fase
 
-    # Masterizado: loudness parejo + techo de true peak
+def lufs_of(path: Path) -> float | None:
+    """Loudness integrada con el filtro de ffmpeg (sin pyloudnorm)."""
     try:
-        import pyloudnorm as pyln
-        lufs = pyln.Meter(SET_SR).integrated_loudness(salida.mean(axis=1))
-        if np.isfinite(lufs):
-            salida = salida * (10 ** ((SET_TARGET_LUFS - lufs) / 20.0))
-            print(f"  loudness {lufs:.1f} -> {SET_TARGET_LUFS} LUFS", flush=True)
+        out = subprocess.run(
+            ["ffmpeg", "-v", "info", "-i", str(path), "-af", "ebur128=peak=none", "-f", "null", "-"],
+            capture_output=True, text=True,
+        ).stderr
+        for line in reversed(out.splitlines()):
+            if "I:" in line and "LUFS" in line:
+                return float(line.split("I:")[1].split("LUFS")[0].strip())
     except Exception:
         pass
-    pico = float(np.max(np.abs(salida))) or 1.0
-    techo = 10 ** (-1.0 / 20.0)
-    if pico > techo:
-        salida = salida * (techo / pico)
-
-    wav = os.path.join(tmpdir, "set.wav")
-    import wave
-    with wave.open(wav, "wb") as w:
-        w.setnchannels(2); w.setsampwidth(2); w.setframerate(SET_SR)
-        w.writeframes((np.clip(salida, -1, 1) * 32767).astype(np.int16).tobytes())
-    mp3 = os.path.join(tmpdir, "set.mp3")
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", wav,
-                    "-c:a", "libmp3lame", "-b:a", "256k", mp3], check=True)
-
-    with open(mp3, "rb") as f:
-        up = requests.put(upload_url, data=f, headers={"Content-Type": "audio/mpeg"}, timeout=900)
-    up.raise_for_status()
-    dur = len(salida) / SET_SR
-    print(f"  subido: {result_path} — {dur/60:.1f} min", flush=True)
-    return dur, tracklist
+    return None
 
 
-def _tl(tr):
-    return {"track_id": tr.get("id") or tr.get("track_id"),
-            "title": tr.get("title"), "artist": tr.get("artist"),
-            "label": tr.get("label")}
+# ----------------------------------------------------------------------------- patrones
+def beat_grid(bpm: float, anchor_ms: float):
+    ms_per_beat = 60000.0 / bpm
+    def to_beat(t_sec: float) -> float:
+        return (t_sec * 1000.0 - anchor_ms) / ms_per_beat
+    return ms_per_beat, to_beat
 
 
-def poll_set_render():
-    """Busca un job de render de set y lo procesa. Devuelve True si hizo algo."""
+def midi_notes(path: Path, to_beat, lo: int, hi: int, max_notes=4000):
+    """Basic Pitch → notas en beats desde el ancla, cuantizadas a 1/4 de beat."""
+    from basic_pitch.inference import predict
+    from basic_pitch import ICASSP_2022_MODEL_PATH
+    _, _, events = predict(str(path), ICASSP_2022_MODEL_PATH,
+                           onset_threshold=0.5, frame_threshold=0.3, minimum_note_length=80)
+    notes = []
+    for start, end, pitch, amp, _bends in events:
+        if not (lo <= pitch <= hi):
+            continue
+        b = round(to_beat(start) * STEP_DIV) / STEP_DIV
+        d = max(0.25, round((end - start) / (60.0 / BPM_GLOBAL[0]) * STEP_DIV) / STEP_DIV)
+        if b < 0:
+            continue
+        notes.append({"b": round(b, 3), "d": round(d, 3), "n": int(pitch), "v": round(float(amp), 3)})
+    notes.sort(key=lambda x: (x["b"], x["n"]))
+    return notes[:max_notes]
+
+
+BPM_GLOBAL = [126.0]  # se fija por job; evita pasar bpm por todos lados
+
+
+def refine_anchor(kick_times, bpm: float, anchor_s: float) -> float:
+    """Ajusta el ancla al pulso real del bombo.
+
+    La rejilla se arma desde `anchor_s`. Si esa ancla está mal (o no viene,
+    como en los temas generados, donde llega NULL y se asume 0), TODO sale
+    corrido: el riff empieza en el paso equivocado, el patrón reusado entra a
+    destiempo y el vaivén se mide mal.
+
+    Como el bombo de club cae en el pulso, se mide cuánto se desvía cada golpe
+    respecto de la rejilla y se corre el ancla esa cantidad. Es estimación de
+    fase de toda la vida, hecha sobre el instrumento más confiable.
+    """
+    if len(kick_times) < 8:
+        return anchor_s
+    beat = 60.0 / bpm
+    # Desvío de cada golpe respecto del pulso más cercano, en fracción de pulso.
+    fases = ((np.asarray(kick_times) - anchor_s) / beat) % 1.0
+    # Media circular: los desvíos viven en un círculo (0.99 y 0.01 están juntos).
+    ang = 2 * np.pi * fases
+    media = np.arctan2(np.sin(ang).mean(), np.cos(ang).mean()) / (2 * np.pi)
+    if media < 0:
+        media += 1.0
+    if media > 0.5:
+        media -= 1.0            # corregir hacia atrás si está más cerca por ese lado
+    corr = media * beat
+    # Cuánto de acuerdo están los golpes entre sí (0 = dispersos, 1 = clavados).
+    fuerza = float(np.hypot(np.sin(ang).mean(), np.cos(ang).mean()))
+    if fuerza < 0.5 or abs(corr) < 0.005:
+        return anchor_s          # sin consenso o ya está bien: no tocar
+    log(f"ancla corregida {corr*1000:+.0f} ms (acuerdo {fuerza:.2f})")
+    return anchor_s + corr
+
+
+def drum_grid(path: Path, bpm: float, anchor_ms: float, duration: float):
+    """Rejilla kick/snare/hat por semicorchea a partir de picos de energía por banda."""
+    import librosa
+    y, sr = to_wav_mono(path, 22050)
+    if y.size < sr:
+        return {"steps_per_bar": 16, "bars": 0, "kick": [], "snare": [], "hat": []}
+    hop = 256
+    S = np.abs(librosa.stft(y, n_fft=2048, hop_length=hop)) ** 2
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
+
+    def band_onsets(f_lo, f_hi, delta):
+        band = S[(freqs >= f_lo) & (freqs < f_hi)].sum(axis=0)
+        env = librosa.onset.onset_strength(S=librosa.power_to_db(band[None, :] + 1e-9), sr=sr, hop_length=hop)
+        peaks = librosa.util.peak_pick(env, pre_max=3, post_max=3, pre_avg=10, post_avg=10, delta=delta, wait=2)
+        return librosa.frames_to_time(peaks, sr=sr, hop_length=hop)
+
+    kick_t = band_onsets(30, 150, 0.6)
+    snare_t = band_onsets(150, 2500, 0.5)
+    hat_t = band_onsets(5000, 11000, 0.4)
+
+    # BOMBO LIMPIO: el bajo se cuela en la banda de graves. Un bombo real trae
+    # un transitorio ("clic") en 2–6 kHz que el bajo no tiene. Se exige ese
+    # clic y, además, un solo golpe por corchea (el más fuerte).
+    if len(kick_t):
+        click = S[(freqs >= 2000) & (freqs < 6000)].sum(axis=0)
+        low = S[(freqs >= 30) & (freqs < 150)].sum(axis=0)
+        fr = lambda t: min(len(low) - 1, int(t * sr / hop))
+        click_med = np.median(click[click > 0]) if np.any(click > 0) else 0.0
+        kept = []
+        for t in kick_t:
+            i = fr(t)
+            has_click = click[i] > 1.5 * click_med
+            if has_click:
+                kept.append((t, low[i]))
+        # un bombo por corchea: si dos caen en la misma corchea, queda el más fuerte
+        eighth = 60.0 / bpm / 2.0
+        by_slot = {}
+        for t, energy in kept:
+            slot = int(round(t / eighth))
+            if slot not in by_slot or energy > by_slot[slot][1]:
+                by_slot[slot] = (t, energy)
+        kick_t = np.array(sorted(t for t, _ in by_slot.values()))
+
+    # El ancla manda sobre TODO lo que viene después: corregirla acá, con el
+    # bombo ya limpio, antes de armar la rejilla.
+    anchor_ms = refine_anchor(kick_t, bpm, anchor_ms / 1000.0) * 1000.0
+
+    # La banda de medios recoge el cuerpo del bombo: un "golpe de caja" que
+    # coincide (±25 ms) con un bombo y no tiene más energía en 1.5–4 kHz que
+    # el bombo en su banda, es bombo colado. Se descarta.
+    if len(kick_t) and len(snare_t):
+        hi = S[(freqs >= 1500) & (freqs < 4000)].sum(axis=0)
+        lo = S[(freqs >= 30) & (freqs < 150)].sum(axis=0)
+        fr = lambda t: min(len(hi) - 1, int(t * sr / hop))
+        keep = []
+        for t in snare_t:
+            near = np.abs(kick_t - t).min() < 0.025
+            if near and hi[fr(t)] < 0.35 * lo[fr(t)]:
+                continue
+            keep.append(t)
+        snare_t = np.array(keep)
+
+    ms_per_beat, to_beat = beat_grid(bpm, anchor_ms)
+    steps_per_bar = 16
+    total_beats = max(0.0, to_beat(duration))
+    bars = int(math.ceil(total_beats / 4))
+    bars = min(bars, 512)
+
+    def grid_for(times):
+        g = [[0] * steps_per_bar for _ in range(bars)]
+        for t in times:
+            step = int(round(to_beat(float(t)) * STEP_DIV))
+            if step < 0:
+                continue
+            bar, pos = divmod(step, steps_per_bar)
+            if bar < bars:
+                g[bar][pos] = 1
+        return g
+
+    return {"steps_per_bar": steps_per_bar, "bars": bars,
+            "kick": grid_for(kick_t), "snare": grid_for(snare_t), "hat": grid_for(hat_t)}
+
+
+_TEMPLATES = None
+def chord_templates():
+    global _TEMPLATES
+    if _TEMPLATES is None:
+        names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+        t = []
+        for root in range(12):
+            maj = np.zeros(12); maj[[root, (root + 4) % 12, (root + 7) % 12]] = 1
+            mi = np.zeros(12); mi[[root, (root + 3) % 12, (root + 7) % 12]] = 1
+            t.append((names[root], maj)); t.append((names[root] + "m", mi))
+        _TEMPLATES = t
+    return _TEMPLATES
+
+
+def chords_per_bar(paths: list[Path], bpm: float, anchor_ms: float, bars: int):
+    import librosa
+    ys = []
+    for p in paths:
+        y, sr = to_wav_mono(p, 22050)
+        ys.append(y)
+    if not ys or bars == 0:
+        return []
+    n = min(len(y) for y in ys)
+    y = np.sum([y[:n] for y in ys], axis=0) / len(ys)
+    sr = 22050
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=512)
+    ms_per_beat = 60000.0 / bpm
+    out = []
+    for bar in range(bars):
+        t0 = (anchor_ms + bar * 4 * ms_per_beat) / 1000.0
+        t1 = t0 + 4 * ms_per_beat / 1000.0
+        f0, f1 = librosa.time_to_frames([t0, t1], sr=sr, hop_length=512)
+        if f0 < 0 or f1 <= f0 or f0 >= chroma.shape[1]:
+            continue
+        v = chroma[:, f0:min(f1, chroma.shape[1])].mean(axis=1)
+        if v.sum() <= 0:
+            continue
+        v = v / (np.linalg.norm(v) + 1e-9)
+        best, score = None, -1.0
+        for name, tmpl in chord_templates():
+            s = float(v @ (tmpl / np.linalg.norm(tmpl)))
+            if s > score:
+                best, score = name, s
+        out.append({"bar": bar, "chord": best, "conf": round(score, 3)})
+    return out
+
+
+def stem_stats(stems: dict[str, Path], bass_notes, grid):
+    st = {}
+    for name, p in stems.items():
+        y, _ = to_wav_mono(p, 11025)
+        st[f"rms_{name}"] = round(float(np.sqrt(np.mean(y ** 2)) if y.size else 0.0), 5)
+    if bass_notes:
+        ns = [n["n"] for n in bass_notes]
+        st["bass_range"] = [min(ns), max(ns)]
+        st["bass_notes"] = len(bass_notes)
+    if grid.get("bars"):
+        for k in ("kick", "snare", "hat"):
+            st[f"{k}_density"] = round(sum(map(sum, grid[k])) / (grid["bars"] * 16), 3)
+    return st
+
+
+# ----------------------------------------------------------------------------- job
+# ───────────────────────── PERFIL DE SONIDO (para clonar) ────────────────────
+# Mide, sobre cada stem, lo que un productor ajusta para reconstruir el sonido
+# con su propio instrumento: afinación, cola, brillo, clic, sidechain. NO copia
+# audio: devuelve números. Con esos números el Estudio arma un preset y lo
+# valida A/B contra el stem original.
+
+def _env_db(y, sr, hop=256):
+    frames = np.lib.stride_tricks.sliding_window_view(y, hop)[::hop]
+    rms = np.sqrt((frames ** 2).mean(axis=1) + 1e-12)
+    return 20 * np.log10(rms + 1e-9)
+
+
+def _decay_ms(seg, sr, drop_db=20.0):
+    """Tiempo hasta que la envolvente cae `drop_db` por debajo del pico."""
+    if len(seg) < 64:
+        return 0.0
+    env = _env_db(seg, sr)
+    if not len(env):
+        return 0.0
+    peak_i = int(np.argmax(env))
+    thr = env[peak_i] - drop_db
+    below = np.where(env[peak_i:] < thr)[0]
+    frames = (below[0] if len(below) else len(env) - peak_i)
+    return round(frames * 256 / sr * 1000.0, 1)
+
+
+def _highpass(seg, sr, fc):
+    """Pasa-altos de un polo: para medir hats sin el cuerpo del bombo."""
+    a = np.exp(-2 * np.pi * fc / sr)
+    out = np.zeros_like(seg); prev_x = 0.0; prev_y = 0.0
+    for i, x in enumerate(seg):
+        prev_y = a * (prev_y + x - prev_x); prev_x = x; out[i] = prev_y
+    return out
+
+
+def _snap_to_peak(y, sr, t, window=0.03):
+    """La rejilla da el tiempo teórico; el golpe real puede estar unos ms antes
+    o después. Devuelve el instante del pico de energía en esa ventana."""
+    a = int(max(0, (t - window) * sr)); b = int(min(len(y), (t + window) * sr))
+    if b - a < 32:
+        return t
+    return a / sr + int(np.argmax(np.abs(y[a:b]))) / sr
+
+
+def _centroid_hz(seg, sr):
+    if len(seg) < 512:
+        return 0.0
+    spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg))))
+    freqs = np.fft.rfftfreq(len(seg), 1 / sr)
+    tot = spec.sum()
+    return round(float((spec * freqs).sum() / tot), 1) if tot > 0 else 0.0
+
+
+def _band_ratio(seg, sr, lo, hi):
+    if len(seg) < 64:
+        return 0.0
+    n = max(2048, len(seg))  # relleno con ceros: los tramos cortos (clic) también se miden
+    spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg)), n=n)) ** 2
+    freqs = np.fft.rfftfreq(n, 1 / sr)
+    tot = spec.sum()
+    return round(float(spec[(freqs >= lo) & (freqs < hi)].sum() / tot), 3) if tot > 0 else 0.0
+
+
+def _cutoff_hz(seg, sr, pct=0.9):
+    """Frecuencia bajo la cual está el `pct` de la energía (proxy del corte de filtro)."""
+    if len(seg) < 1024:
+        return 0.0
+    spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg)))) ** 2
+    freqs = np.fft.rfftfreq(len(seg), 1 / sr)
+    cum = np.cumsum(spec) / (spec.sum() + 1e-12)
+    return round(float(freqs[int(np.searchsorted(cum, pct))]), 1)
+
+
+def _dominant_hz(seg, sr, lo=30, hi=200):
+    if len(seg) < 1024:
+        return 0.0
+    spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg))))
+    freqs = np.fft.rfftfreq(len(seg), 1 / sr)
+    m = (freqs >= lo) & (freqs < hi)
+    return round(float(freqs[m][int(np.argmax(spec[m]))]), 1) if m.any() else 0.0
+
+
+def _hits(y, sr, onsets_s, pre=0.0, post=0.4, max_n=40, snap=True):
+    """Trozos de audio alrededor de cada golpe, alineados al ataque real."""
+    out = []
+    for t in onsets_s[:max_n]:
+        tt = _snap_to_peak(y, sr, t) if snap else t
+        a = int(max(0, (tt - pre) * sr)); b = int(min(len(y), (tt + post) * sr))
+        if b - a > 256:
+            out.append(y[a:b])
+    return out
+
+
+def sound_profile(stems: dict, grid: dict, bpm: float, anchor_ms: float) -> dict:
+    """Un perfil por rol con los parámetros que hacen falta para clonarlo."""
+    prof = {}
     try:
-        data = _set_api("next")
-    except Exception as e:
-        print(f"[set-render] no disponible: {e}", flush=True)
-        return False
-    job = data.get("job")
-    if not job:
-        return False
-    print(f"[set-render] job {job['id']} — {job.get('title')}", flush=True)
+        beat = 60.0 / bpm
+        anchor = anchor_ms / 1000.0
+        if "drums" in stems:
+            y, sr = to_wav_mono(stems["drums"], 22050)
+            spb = grid.get("steps_per_bar", 16)
+            if not (grid.get("kick") or grid.get("hat")):
+                log("rejilla de batería vacía: no se puede medir el perfil de percusión")
+            def times_of(row_name):
+                ts = []
+                rows = grid.get(row_name) or []
+                for bi, row in enumerate(rows):
+                    for s, v in enumerate(row):
+                        if v:
+                            ts.append(anchor + bi * 4 * beat + s * (4 * beat / spb))
+                return ts
+            kick_hits = _hits(y, sr, times_of("kick"), post=0.5)
+            if kick_hits:
+                prof["kick"] = {
+                    "tune_hz": float(np.median([_dominant_hz(h, sr) for h in kick_hits])),
+                    "decay_ms": float(np.median([_decay_ms(h, sr) for h in kick_hits])),
+                    "click_ratio": float(np.median([_band_ratio(h[: int(0.012 * sr)], sr, 2000, 6000) for h in kick_hits])),
+                    "sub_ratio": float(np.median([_band_ratio(h, sr, 30, 80) for h in kick_hits])),
+                }
+            hat_hits = _hits(y, sr, times_of("hat"), post=0.25)
+            if hat_hits:
+                # Los hats se miden SOBRE LA BANDA ALTA: en la pista de batería
+                # completa manda el bombo y el brillo sale falseado hacia abajo.
+                hp = [_highpass(h, sr, 3000) for h in hat_hits]
+                prof["hats"] = {
+                    "centroid_hz": float(np.median([_centroid_hz(h, sr) for h in hp])),
+                    "decay_ms": float(np.median([_decay_ms(h, sr, 15.0) for h in hp])),
+                }
+            snare_hits = _hits(y, sr, times_of("snare"), post=0.3)
+            if snare_hits:
+                prof["clap"] = {
+                    "centroid_hz": float(np.median([_centroid_hz(h, sr) for h in snare_hits])),
+                    "decay_ms": float(np.median([_decay_ms(h, sr) for h in snare_hits])),
+                }
+        if "bass" in stems:
+            yb, sr = to_wav_mono(stems["bass"], 22050)
+            mid = yb[len(yb) // 3: 2 * len(yb) // 3]
+            seg = mid[: sr * 8] if len(mid) > sr * 8 else mid
+            bass = {
+                "cutoff_hz": _cutoff_hz(seg, sr),
+                "centroid_hz": _centroid_hz(seg, sr),
+                "harmonic_ratio": _band_ratio(seg, sr, 200, 2000),
+                "sub_ratio": _band_ratio(seg, sr, 30, 90),
+            }
+            # Sidechain: cuánto cae el bajo justo después de cada bombo.
+            kicks = []
+            if "drums" in stems and grid.get("kick"):
+                spb = grid.get("steps_per_bar", 16)
+                for bi, row in enumerate(grid["kick"]):
+                    for s, v in enumerate(row):
+                        if v:
+                            kicks.append(anchor + bi * 4 * beat + s * (4 * beat / spb))
+            if kicks:
+                env = _env_db(yb, sr)
+                fr = lambda t: min(len(env) - 1, int(t * sr / 256))
+                # Nivel de referencia del bajo cuando SÍ está sonando.
+                active = env[env > (np.percentile(env, 60) - 12)]
+                floor_db = float(np.percentile(active, 20)) if len(active) else -60.0
+                dips = []
+                for t in kicks[:200]:
+                    justo = env[fr(t + 0.02)]     # apenas pega el bombo: el bajo está agachado
+                    luego = env[fr(t + 0.18)]     # ya se recuperó
+                    # Solo cuenta si el bajo está tocando en ese compás.
+                    if luego > floor_db and np.isfinite(justo) and np.isfinite(luego):
+                        dips.append(justo - luego)
+                if len(dips) >= 8:
+                    bass["sidechain_db"] = round(float(np.median(dips)), 1)
+                    bass["sidechain_muestras"] = len(dips)
+            prof["bass"] = bass
+        if "other" in stems:
+            yo, sr = to_wav_mono(stems["other"], 22050)
+            mid = yo[len(yo) // 3: 2 * len(yo) // 3]
+            seg = mid[: sr * 8] if len(mid) > sr * 8 else mid
+            env = _env_db(seg, sr)
+            # Ataque medio: pads suben lento, stabs suben rápido.
+            rises = []
+            for i in range(1, len(env)):
+                if env[i] - env[i - 1] > 6:
+                    j = i
+                    while j < len(env) - 1 and env[j + 1] > env[j]:
+                        j += 1
+                    rises.append((j - i + 1) * 256 / sr * 1000.0)
+            prof["other"] = {
+                "centroid_hz": _centroid_hz(seg, sr),
+                "cutoff_hz": _cutoff_hz(seg, sr),
+                "attack_ms": round(float(np.median(rises)), 1) if rises else 0.0,
+                "character": "stab" if rises and np.median(rises) < 40 else "pad",
+            }
+        if "vocals" in stems:
+            yv, sr = to_wav_mono(stems["vocals"], 22050)
+            prof["vocals"] = {"centroid_hz": _centroid_hz(yv[len(yv)//3: len(yv)//3 + sr*8], sr)}
+    except Exception as e:  # noqa: BLE001
+        log("perfil de sonido incompleto:", repr(e))
+    for k, v in prof.items():
+        prof[k] = {kk: (round(float(vv), 3) if isinstance(vv, (int, float, np.floating)) else vv) for kk, vv in v.items()}
+    return prof
+
+
+# ─────────────────────── PAQUETES LISTOS PARA USAR ───────────────────────
+# El DJ no quiere 1.156 notas: quiere BLOQUES. "El riff del drop, 2 compases,
+# aparece 43 veces". Acá la canción se corta sola en pedazos usables, cada uno
+# con lo que hace falta para arrastrarlo a un tema.
+
+def _notes_in(notes, start_beat, end_beat):
+    """Notas de un tramo, con el tiempo llevado a cero."""
+    out = []
+    for n in notes:
+        if start_beat <= n["b"] < end_beat:
+            m = dict(n)
+            m["b"] = round(n["b"] - start_beat, 3)
+            out.append(m)
+    return out
+
+
+def _huella(notas, rejilla=0.25):
+    """Firma de un bloque: posiciones y alturas.
+
+    Las posiciones se redondean a la SEMICORCHEA, no al centésimo de tiempo.
+    Con dos decimales, una nota corrida un milisegundo hacía que el mismo riff
+    contara como dos bloques distintos, y en música real eso pasa siempre.
+    La fuerza no entra en la firma: el mismo riff tocado más fuerte es el mismo
+    riff.
+    """
+    return "|".join(sorted(f'{round(n["b"] / rejilla) * rejilla:.2f}:{n["n"]}' for n in notas))
+
+
+def _similitud(a: set, b: set) -> float:
+    """Cuánto se parecen dos compases: notas en común sobre notas totales."""
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def bloques_de(notes, total_bars, largos=(1, 2, 4), minimo=3, tope=4,
+               rejilla=0.25, parecido=0.7):
+    """Los bloques que valen la pena de una parte, ordenados por repetición.
+
+    IMPORTANTE: se agrupa por PARECIDO, no por coincidencia exacta.
+
+    Medido sobre canciones reales: exigiendo repetición idéntica, el mejor
+    bloque de bajo de un tech house cubría el 3 % de la canción. No era un
+    problema de detección: un bajo real nunca se repite exactamente igual —
+    cambia una nota fantasma, se corre un golpe, varía la fuerza. Con un
+    umbral de parecido del 70 %, el riff se reconoce como lo que es.
+
+    De cada grupo se guarda el compás MÁS REPRESENTATIVO (el que más se parece
+    a todos los demás del grupo), no el primero: así el bloque que se lleva el
+    DJ es la versión típica del riff, no una variación de entrada.
+    """
+    if not notes or total_bars <= 0:
+        return []
+    notes = [dict(n, b=round(round(n["b"] / rejilla) * rejilla, 3)) for n in notes]
+    salida = []
+    for bars in largos:
+        candidatos = []
+        for bar in range(0, total_bars - bars + 1, bars):
+            trozo = _notes_in(notes, bar * 4, (bar + bars) * 4)
+            if len(trozo) < minimo:
+                continue
+            firma = {(round(n["b"], 2), n["n"]) for n in trozo}
+            candidatos.append((bar, trozo, firma))
+        usados, grupos = set(), []
+        for i, (bar_i, trozo_i, firma_i) in enumerate(candidatos):
+            if i in usados:
+                continue
+            grupo = [(bar_i, trozo_i, firma_i)]
+            usados.add(i)
+            for j in range(i + 1, len(candidatos)):
+                if j in usados:
+                    continue
+                if _similitud(firma_i, candidatos[j][2]) >= parecido:
+                    grupo.append(candidatos[j])
+                    usados.add(j)
+            if len(grupo) >= 2:
+                grupos.append(grupo)
+        for grupo in grupos:
+            # El más representativo: el que más se parece al resto del grupo.
+            mejor, mejor_puntaje = grupo[0], -1.0
+            for cand in grupo:
+                puntaje = sum(_similitud(cand[2], otro[2]) for otro in grupo)
+                if puntaje > mejor_puntaje:
+                    mejor, mejor_puntaje = cand, puntaje
+            bar, trozo, _ = mejor
+            salida.append({
+                "bars": bars,
+                "desde_compas": bar + 1,
+                "repite": len(grupo),
+                "aparece_en": sorted(b + 1 for b, _, _ in grupo)[:12],
+                "cubre": round(min(1.0, len(grupo) * bars / max(1, total_bars)), 3),
+                "notas": trozo,
+            })
+    salida.sort(key=lambda x: (-x["cubre"], x["bars"]))
+    return salida[:tope]
+
+
+def bloque_bateria(grid, tope=3):
+    """Lo mismo para la batería: no son notas, es una rejilla de 16 pasos."""
+    filas = ("kick", "snare", "hat")
+    if not any(grid.get(f) for f in filas):
+        return []
+    compases = max(len(grid.get(f) or []) for f in filas)
+    grupos = {}
+    for i in range(compases):
+        patron = {}
+        for f in filas:
+            fila = grid.get(f) or []
+            patron[f] = fila[i] if i < len(fila) else [0] * 16
+        if not any(sum(v) for v in patron.values()):
+            continue
+        h = "|".join("".join(str(x) for x in patron[f]) for f in filas)
+        grupos.setdefault(h, []).append((i, patron))
+    salida = []
+    for h, apar in grupos.items():
+        if len(apar) < 2:
+            continue
+        i, patron = apar[0]
+        salida.append({
+            "bars": 1, "desde_compas": i + 1, "repite": len(apar),
+            "aparece_en": [x + 1 for x, _ in apar[:12]],
+            "cubre": round(min(1.0, len(apar) / max(1, compases)), 3),
+            "rejilla": patron,
+        })
+    salida.sort(key=lambda x: -x["repite"])
+    return salida[:tope]
+
+
+def mapa_arreglo(stems, bpm, anchor_ms, duration):
+    """En qué compás entra y sale cada instrumento: la receta de la canción."""
+    beat = 60.0 / bpm
+    compas = 4 * beat
+    total = max(1, int((duration - anchor_ms / 1000.0) / compas))
+    mapa = {}
+    for nombre, path in stems.items():
+        try:
+            y, sr = to_wav_mono(path, 22050)
+        except Exception as e:  # noqa: BLE001
+            log("mapa: no se pudo leer", nombre, repr(e))
+            continue
+        niveles = []
+        for i in range(total):
+            a = int((anchor_ms / 1000.0 + i * compas) * sr)
+            b = min(len(y), int(a + compas * sr))
+            niveles.append(float(np.sqrt((y[a:b] ** 2).mean() + 1e-12)) if b > a else 0.0)
+        pico = max(niveles) if niveles else 0.0
+        if pico <= 1e-6:
+            continue
+        # Umbral RELATIVO a su propio pico: un pad bajo también cuenta como que suena.
+        umbral = pico * 0.12
+        tramos, ini = [], None
+        for i, n in enumerate(niveles):
+            on = n > umbral
+            if on and ini is None:
+                ini = i
+            elif not on and ini is not None:
+                if i - ini >= 4:          # menos de 4 compases no es una entrada
+                    tramos.append({"desde": ini + 1, "hasta": i})
+                ini = None
+        if ini is not None:
+            tramos.append({"desde": ini + 1, "hasta": len(niveles)})
+        mapa[nombre] = {"tramos": tramos, "energia": [round(n / pico, 3) for n in niveles]}
+    return {"compases": total, "instrumentos": mapa}
+
+
+# ──────────────────────── CALIDAD DE CADA PISTA SEPARADA ────────────────────────
+# Una pista separada nunca sale perfecta: al piano se le cuela algo de batería,
+# a la voz algo de sintes. Acá se mide CUÁNTO, para que la pantalla lo diga en
+# una palabra ("limpio", "con algo de batería", "mezclado con batería") en vez
+# de dejar que el DJ lo descubra escuchando.
+#
+# Método: envolvente de energía de cada pista, y correlación entre pares. Si la
+# envolvente del piano sube y baja al ritmo de la batería, hay filtración.
+
+def _envolvente(y, sr, ventana_ms=20):
+    """Envolvente normalizada y nivel crudo. El nivel crudo se guarda ANTES de
+    normalizar: el silencio normalizado parece señal, y eso engañaba."""
+    n = max(1, int(sr * ventana_ms / 1000))
+    total = len(y) // n
+    if total < 4:
+        return np.zeros(4), 0.0
+    e = np.sqrt((y[: total * n].reshape(total, n) ** 2).mean(axis=1) + 1e-12)
+    # Se devuelve el PICO (una batería es fuerte pero suena poco tiempo: con el
+    # promedio parecía débil) y cuánto FLUCTÚA (std/media): un piano sostenido
+    # con un poquito de batería encima coincide en el ritmo, pero casi no se
+    # mueve, y eso es lo que distingue "un poco" de "mucho".
+    fluct = float(e.std() / (e.mean() + 1e-9))
+    return e / (e.max() + 1e-9), float(e.max()), fluct
+
+
+def calidad_pistas(stems: dict) -> dict:
+    """Para cada pista: qué tan limpia salió y de quién trae filtración.
+
+    La filtración va del FUERTE al DÉBIL: si el piano sube y baja al ritmo de
+    la batería y la batería es más fuerte, el piano trae batería, no al revés.
+    Sin esa regla la correlación (que es simétrica) acusaba a los dos.
+    """
+    envs, niveles, fluct = {}, {}, {}
+    for nombre, path in stems.items():
+        try:
+            y, sr = to_wav_mono(path, 22050)
+            envs[nombre], niveles[nombre], fluct[nombre] = _envolvente(y, sr)
+        except Exception as e:  # noqa: BLE001
+            log("calidad: no se pudo leer", nombre, repr(e))
+    salida = {}
+    for a, ea in envs.items():
+        if niveles[a] < 1e-3:
+            salida[a] = {"estado": "vacia", "de": None, "correlacion": 0.0}
+            continue
+        peor, peor_c = None, 0.0
+        for b, eb in envs.items():
+            if a == b or niveles[b] <= niveles[a] * 1.2:
+                continue                       # solo puede contaminarme alguien más fuerte
+            m = min(len(ea), len(eb))
+            if m < 8:
+                continue
+            x, y_ = ea[:m] - ea[:m].mean(), eb[:m] - eb[:m].mean()
+            den = float(np.sqrt((x ** 2).sum() * (y_ ** 2).sum())) + 1e-9
+            c = float((x * y_).sum() / den)
+            # La filtración real es "coincide en el ritmo" × "cuánto se mueve".
+            c = c * min(1.0, fluct[a])
+            if c > peor_c:
+                peor, peor_c = b, c
+        estado = "limpia" if peor_c < 0.25 else ("con_algo" if peor_c < 0.6 else "mezclada")
+        salida[a] = {"estado": estado, "de": peor if estado != "limpia" else None,
+                     "correlacion": round(peor_c, 3)}
+    return salida
+
+
+# ───────────────────── NOTAS SUELTAS PARA CLONAR EL INSTRUMENTO ─────────────────────
+# El clon por parámetros no funcionó (cuatro números no reconstruyen un piano).
+# Lo que sí funciona es lo que hacen los samplers de verdad: tomar NOTAS REALES
+# del instrumento, una por altura, y tocar cualquier cosa nueva estirándolas.
+#
+# Acá se buscan, en la transcripción, las notas que suenan SOLAS (sin otra
+# encima ni pegada) y se elige la más limpia por altura. El recorte del audio
+# y el sampler se arman en el cliente con estos tiempos.
+
+def notas_sueltas(seq, bpm, anchor_ms, margen_beats=0.5, minimo_dur=0.2, tope_por_altura=1):
+    """Por altura MIDI: la nota más aislada y larga, con su instante en segundos."""
+    if not seq:
+        return {}
+    beat = 60.0 / bpm
+    notas = sorted(seq, key=lambda n: n["b"])
+    elegidas = {}
+    for i, n in enumerate(notas):
+        if n["d"] < minimo_dur:
+            continue
+        ini, fin = n["b"], n["b"] + n["d"]
+        sola = True
+        for m in notas[max(0, i - 12): i + 12]:
+            if m is n:
+                continue
+            mi, mf = m["b"], m["b"] + m["d"]
+            # Otra nota que se solape o quede a menos de medio tiempo: no está sola.
+            if mi < fin + margen_beats and mf > ini - margen_beats:
+                sola = False
+                break
+        if not sola:
+            continue
+        altura = int(n["n"])
+        cand = {
+            "n": altura,
+            "t": round(anchor_ms / 1000.0 + ini * beat, 3),
+            "dur": round(n["d"] * beat, 3),
+            "v": n.get("v", 0.5),
+        }
+        actual = elegidas.get(altura)
+        # Se prefiere la más larga; a igual largo, la más fuerte.
+        if actual is None or (cand["dur"], cand["v"]) > (actual["dur"], actual["v"]):
+            elegidas[altura] = cand
+    return elegidas
+
+
+def resumen_sampler(por_altura: dict) -> dict:
+    """Cuántas alturas hay y qué tan cubierto queda el teclado, para decidir
+    si el instrumento se puede clonar bien o solo a medias."""
+    if not por_altura:
+        return {"alturas": 0, "rango": None, "huecos_max": None, "clonable": "no"}
+    alturas = sorted(por_altura)
+    huecos = max((b - a for a, b in zip(alturas, alturas[1:])), default=0)
+    # Con una nota real cada 3 semitonos o menos, el estirado no se nota.
+    clonable = "bien" if huecos <= 3 and len(alturas) >= 5 else ("a_medias" if len(alturas) >= 3 else "no")
+    return {"alturas": len(alturas), "rango": [alturas[0], alturas[-1]],
+            "huecos_max": huecos, "clonable": clonable}
+
+
+def process(job: dict):
+    job_id = job["job_id"]
+    # bpm_fine NO es el tempo: es una corrección de milésimas sobre bpm.
+    # Usarlo como tempo absoluto daba 0.001 BPM y toda la rejilla salía vacía.
+    bpm = float(job.get("bpm") or 0) + float(job.get("bpm_fine") or 0)
+    if not (60.0 <= bpm <= 200.0):
+        raise RuntimeError(
+            f"tempo fuera de rango ({bpm:.3f} BPM): sin tempo no hay compases ni patrones. "
+            "Revisar bpm/bpm_fine de la canción."
+        )
+    BPM_GLOBAL[0] = bpm
+    anchor_ms = float(job.get("first_beat_offset_ms") or 0)
+    work = Path(tempfile.mkdtemp(prefix="stems-"))
     try:
-        dur, tracklist = render_set(job, data.get("tracks") or [],
-                                    data.get("upload_url"), data.get("result_path"))
-        _set_api("result", {"job_id": job["id"], "result_path": data.get("result_path"),
-                            "duration_sec": int(dur), "tracklist": tracklist})
-        print(f"[set-render] OK — set creado SIN publicar (revisar antes de publicar)", flush=True)
-    except Exception as e:
+        src = download(job["audio_url"], work / "input.mp3")
+        duration = float(job.get("duration_seconds") or ffprobe_duration(src))
+        log(f"[{job_id[:8]}] {duration:.0f}s @ {bpm:.2f} bpm, ancla {anchor_ms:.0f} ms")
+
+        # El trabajo puede pedir otro modelo: htdemucs_6s separa piano y
+        # guitarra en pistas propias (a cambio de algo menos de limpieza).
+        model = str(job.get("model") or MODEL)
+        if model not in ("htdemucs", "htdemucs_ft", "htdemucs_6s", "mdx_extra"):
+            model = MODEL
+        stems = run_demucs(src, work / "out", model)
+        uploads = job.get("uploads", {})
+        stems_out = {}
+        for name, p in stems.items():
+            if name in uploads:
+                target = uploads[name]
+                upload(target, p)
+                stored_path = target["path"] if isinstance(target, dict) else None
+                stems_out[name] = {"path": stored_path, "duration_seconds": round(ffprobe_duration(p), 2), "lufs": lufs_of(p)}
+                log(f"  subido {name} -> {stored_path}")
+
+        _, to_beat = beat_grid(bpm, anchor_ms)
+        bass_midi = midi_notes(stems["bass"], to_beat, 24, 60) if "bass" in stems else []
+        melody_src = [s for s in ("piano", "other", "guitar") if s in stems]
+        melody_midi = midi_notes(stems[melody_src[0]], to_beat, 48, 96) if melody_src else []
+
+        # PARTES COMPLETAS POR INSTRUMENTO
+        # No alcanza con "el riff": el DJ quiere todo lo que toca cada
+        # instrumento en la canción entera, para editarlo y reusarlo. Basic
+        # Pitch es polifónico, así que un piano o unos pads salen con sus
+        # acordes reales, no con una etiqueta por compás.
+        parts = {}
+        RANGES = {          # rango de notas MIDI razonable por instrumento
+            "piano": (36, 96), "guitar": (40, 88), "other": (36, 96),
+            "vocals": (48, 84), "bass": (24, 60),
+        }
+        for name, (lo, hi) in RANGES.items():
+            if name not in stems:
+                continue
+            if name == "bass":
+                parts["bass"] = bass_midi          # ya transcrito
+                continue
+            try:
+                seq = midi_notes(stems[name], to_beat, lo, hi, max_notes=6000)
+                if seq:
+                    parts[name] = seq
+                    log(f"[{job_id[:8]}] parte {name}: {len(seq)} notas")
+            except Exception as e:  # noqa: BLE001
+                log(f"[{job_id[:8]}] no se pudo transcribir {name}:", repr(e))
+        grid = drum_grid(stems["drums"], bpm, anchor_ms, duration) if "drums" in stems else \
+            {"steps_per_bar": 16, "bars": 0, "kick": [], "snare": [], "hat": []}
+        chords = chords_per_bar([stems[s] for s in ("bass", "other", "piano") if s in stems], bpm, anchor_ms, grid["bars"])
+        stats = stem_stats(stems, bass_midi, grid)
+
+        profile = sound_profile(stems, grid, bpm, anchor_ms)
+        # PAQUETES: lo que el DJ realmente usa, ya cortado y ordenado.
+        total_bars = int(grid.get("bars") or 0) or 1
+        blocks = {}
+        try:
+            for nombre, seq in parts.items():
+                b = bloques_de(seq, total_bars)
+                if b:
+                    blocks[nombre] = b
+            bat = bloque_bateria(grid)
+            if bat:
+                blocks["drums"] = bat
+        except Exception as e:  # noqa: BLE001
+            log(f"[{job_id[:8]}] no se pudieron armar los bloques:", repr(e))
+        log(f"[{job_id[:8]}] bloques: " + (", ".join(f"{k} {len(v)}" for k, v in blocks.items()) or "ninguno"))
+
+        # La variable se llama `duration` (v1.12 usaba `dur` y rompía el análisis).
+        # Y si el mapa falla, NO se pierde todo el trabajo: se reporta sin él.
+        try:
+            arreglo = mapa_arreglo(stems, bpm, anchor_ms, duration)
+            log(f"[{job_id[:8]}] arreglo: {len(arreglo['instrumentos'])} instrumentos en {arreglo['compases']} compases")
+        except Exception as e:  # noqa: BLE001
+            log(f"[{job_id[:8]}] no se pudo armar el mapa de arreglo:", repr(e))
+            arreglo = None
+
+        try:
+            calidad = calidad_pistas(stems)
+            log(f"[{job_id[:8]}] calidad: " + ", ".join(f"{k} {v['estado']}" + (f"(de {v['de']})" if v['de'] else "") for k, v in calidad.items()))
+        except Exception as e:  # noqa: BLE001
+            log(f"[{job_id[:8]}] no se pudo medir la calidad:", repr(e))
+            calidad = None
+
+        # NOTAS SUELTAS por instrumento melódico: la materia prima del clon.
+        sampler = {}
+        try:
+            for nombre, seq in parts.items():
+                if nombre in ("vocals",):          # una voz no se clona por notas
+                    continue
+                por_altura = notas_sueltas(seq, bpm, anchor_ms)
+                if por_altura:
+                    sampler[nombre] = {"notas": por_altura, **resumen_sampler(por_altura)}
+            log(f"[{job_id[:8]}] sampler: " + (", ".join(f"{k} {v['alturas']} alturas ({v['clonable']})" for k, v in sampler.items()) or "ninguno"))
+        except Exception as e:  # noqa: BLE001
+            log(f"[{job_id[:8]}] no se pudieron buscar notas sueltas:", repr(e))
+
+        patterns = {"bass_midi": bass_midi, "melody_midi": melody_midi, "drum_grid": grid,
+                    "chords": chords, "stats": stats, "model": model, "sound_profile": profile,
+                    "parts": parts, "blocks": blocks, "arrangement_map": arreglo,
+                    "stem_quality": calidad, "sampler": sampler}
+        report(job_id, True, stems_out, patterns)
+        log(f"[{job_id[:8]}] listo: {len(stems_out)} stems, {len(bass_midi)} notas de bajo, {grid['bars']} compases")
+    except Exception as e:  # noqa: BLE001
+        log(f"[{job_id[:8]}] FALLÓ:", repr(e))
         traceback.print_exc()
         try:
-            _set_api("fail", {"job_id": job["id"], "error": str(e)[:2000]})
+            report(job_id, False, error=str(e)[:500])
         except Exception:
-            pass
-    return True
+            traceback.print_exc()
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+CURRENT_JOB = {"id": None}
+
+
+def requeue(job_id: str):
+    """Devuelve a la cola un trabajo que este proceso no va a terminar."""
+    try:
+        requests.post(f"{API}/stems-result", headers=HEADERS,
+                      json={"job_id": job_id, "ok": False, "error": "requeue:shutdown"}, timeout=15)
+        log(f"[{job_id[:8]}] devuelto a la cola por apagado")
+    except Exception as e:  # noqa: BLE001
+        log("no se pudo devolver el trabajo:", repr(e))
+
+
+def _on_shutdown(signum, _frame):
+    log(f"señal {signum}: apagando")
+    if CURRENT_JOB["id"]:
+        requeue(CURRENT_JOB["id"])
+    sys.exit(0)
 
 
 def main():
-    print("DeepMancho worker iniciado (v7.4.2: HOT CUES metodologia MIK sobre el ancla DEFINITIVA (A en cero, grilla de 8 compases, energia 1-10) + rendition MP3 192k). Esperando jobs...", flush=True)
-    if ENABLE_SET_RENDER:
-        print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
-    if GOLDEN_EXAM:
-        try:
-            golden_exam()
-        except Exception:
-            traceback.print_exc()
-            print("[CM2 EXAMEN] el examen fallo pero el worker sigue normal", flush=True)
-    idle = 0
+    signal.signal(signal.SIGTERM, _on_shutdown)
+    signal.signal(signal.SIGINT, _on_shutdown)
+    log(f"stems_worker v{VERSION} listo · modelo {MODEL} · segmento {SEGMENT}s · jobs {JOBS} · overlap {OVERLAP} · hilos {os.environ.get('OMP_NUM_THREADS')} · sondeo cada {POLL}s")
     while True:
         try:
-            job, track, audio_url, rendition_upload = next_job()
-        except Exception as e:
-            print(f"next_job error: {e}", flush=True)
-            time.sleep(POLL_INTERVAL)
-            continue
-        if job:
-            idle = 0
-            process_job(job, track, audio_url, rendition_upload)
-        else:
-            # Sin jobs de analisis: aprovechar para renderizar sets si hay cola.
-            # El analisis tiene prioridad (un track sin analizar bloquea mas que
-            # un set sin renderizar).
-            if ENABLE_SET_RENDER and poll_set_render():
-                idle = 0
+            job = claim()
+            if job:
+                CURRENT_JOB["id"] = job["job_id"]
+                try:
+                    process(job)
+                finally:
+                    CURRENT_JOB["id"] = None
                 continue
-            idle += 1
-            if idle % 12 == 1:
-                print("sin jobs pendientes...", flush=True)
-            time.sleep(POLL_INTERVAL)
+        except Exception as e:  # noqa: BLE001
+            log("error en el sondeo:", repr(e))
+        time.sleep(POLL)
 
 
 if __name__ == "__main__":
