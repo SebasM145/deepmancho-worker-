@@ -56,7 +56,7 @@ os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.17"
+VERSION = "1.18"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -783,8 +783,17 @@ def calidad_pistas(stems: dict) -> dict:
             continue
         peor, peor_c = None, 0.0
         for b, eb in envs.items():
-            if a == b or niveles[b] <= niveles[a] * 1.2:
-                continue                       # solo puede contaminarme alguien más fuerte
+            if a == b:
+                continue
+            # Antes se descartaba a quien no fuera 1,2× más fuerte, y eso dejaba
+            # casi todas las comparaciones sin hacer: la etiqueta decía "limpia"
+            # sin haber medido nada (correlación 0 exacto). Ahora se compara
+            # contra TODAS y se pesa por cuánto más fuerte es la otra: quien
+            # apenas supera pesa poco, quien es mucho más fuerte pesa entero.
+            rel = niveles[b] / (niveles[a] + 1e-9)
+            peso = min(1.0, max(0.0, (rel - 0.8) / 1.2))
+            if peso <= 0:
+                continue
             m = min(len(ea), len(eb))
             if m < 8:
                 continue
@@ -792,7 +801,7 @@ def calidad_pistas(stems: dict) -> dict:
             den = float(np.sqrt((x ** 2).sum() * (y_ ** 2).sum())) + 1e-9
             c = float((x * y_).sum() / den)
             # La filtración real es "coincide en el ritmo" × "cuánto se mueve".
-            c = c * min(1.0, fluct[a])
+            c = c * min(1.0, fluct[a]) * peso
             if c > peor_c:
                 peor, peor_c = b, c
         estado = "limpia" if peor_c < 0.25 else ("con_algo" if peor_c < 0.6 else "mezclada")
@@ -853,8 +862,17 @@ def resumen_sampler(por_altura: dict) -> dict:
         return {"alturas": 0, "rango": None, "huecos_max": None, "clonable": "no"}
     alturas = sorted(por_altura)
     huecos = max((b - a for a, b in zip(alturas, alturas[1:])), default=0)
-    # Con una nota real cada 3 semitonos o menos, el estirado no se nota.
-    clonable = "bien" if huecos <= 3 and len(alturas) >= 5 else ("a_medias" if len(alturas) >= 3 else "no")
+    # Calibrado con canciones reales: el piano de Trapped tiene 22 alturas y
+    # daba "a medias" porque el umbral exigía una nota cada 3 semitonos. En
+    # música real las notas no vienen cromáticas, y estirar 5 o 6 semitonos
+    # sobre una nota real no se distingue. Lo que importa de verdad es CUÁNTAS
+    # alturas hay; el hueco máximo solo descalifica si es enorme.
+    if len(alturas) >= 12 and huecos <= 7:
+        clonable = "bien"
+    elif len(alturas) >= 5 and huecos <= 12:
+        clonable = "a_medias"
+    else:
+        clonable = "no"
     return {"alturas": len(alturas), "rango": [alturas[0], alturas[-1]],
             "huecos_max": huecos, "clonable": clonable}
 
