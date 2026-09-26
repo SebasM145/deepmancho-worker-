@@ -1050,14 +1050,14 @@ def ventanas_candidatas(rangos: list[dict], total: int, largo: int = LOOP_COMPAS
     """Compases de inicio (múltiplos de 8 + 1) donde la pista suena TODA la ventana."""
     presente = [False] * (total + 2)
     for r in rangos or []:
+        if r.get("from") is None or r.get("to") is None:
+            continue
         for b in range(max(1, int(r["from"])), min(total, int(r["to"])) + 1):
             presente[b] = True
     out: list[int] = []
     for desde in range(1, total - largo + 2, largo):
-        if all(presente[desde:desde + largo]) and all(abs(desde - d) >= separacion for d in out):
+        if all(presente[desde:desde + largo]):
             out.append(desde)
-            if len(out) >= tope:
-                break
     return out
 
 
@@ -1093,8 +1093,12 @@ def controlar_loop(y, sr: int, bpm: float, phase_ms: float, desde: int, stem: st
     if min(rms_c) < 0.1 * med:
         return False, {**qc, "motivo": "hueco: la pista se apaga más de un compás"}
     tiempo = int(compas / 4)
-    ini, fin = _rms(seg[:tiempo]), _rms(seg[-tiempo:])
-    qc["empalme"] = round(max(ini, fin) / max(min(ini, fin), 1e-9), 2)
+    # Refutado en producción (Deep House: 11 de 12 rechazados): comparar el primer tiempo con el último
+    # castiga silencios y rellenos normales. Lo correcto: ¿al repetirse, arranca como sigue el tema original?
+    ini = _rms(seg[:tiempo])
+    sigue = y[b:b + tiempo] if b + tiempo <= len(y) else seg[-tiempo:]
+    ref = _rms(sigue)
+    qc["empalme"] = round(max(ini, ref) / max(min(ini, ref), 1e-9), 2)
     if qc["empalme"] > EMPALME_MAX:
         return False, {**qc, "motivo": f"empalme desparejo ({qc['empalme']})"}
     if stem == "drums":
@@ -1121,7 +1125,8 @@ ROL_DE_STEM = {"bass": "bajo", "drums": "bateria"}
 
 def cortar_loops(track: dict, lanes: dict, energia: dict, calidad: dict, audio: dict) -> tuple[list[dict], dict]:
     """Todos los loops aprobados de un tema. `audio` = {stem: (y, sr)}. Devuelve (loops, rechazos)."""
-    bpm, fase, total = float(track["bpm"]), float(track["phase_ms"]), int(track["bars"])
+    bpm, fase = float(track["bpm"]), float(track["phase_ms"])
+    total = int(track.get("bars") or 0) or max([int(r.get("to") or 0) for rs in (lanes or {}).values() for r in (rs or [])] + [len(v or []) for v in (energia or {}).values()] + [0])
     ok_calidad = lambda s: ((calidad or {}).get(s) or {}).get("estado") in ("limpia", "con_algo")
     nivel = [sum((energia.get(k) or [0] * total)[i] if i < len(energia.get(k) or []) else 0 for k in ("drums", "bass"))
              for i in range(total)]
@@ -1134,7 +1139,10 @@ def cortar_loops(track: dict, lanes: dict, energia: dict, calidad: dict, audio: 
         if not ok_calidad(stem):
             rechazos["pista no limpia"] = rechazos.get("pista no limpia", 0) + 1
             continue
+        aceptados = []
         for desde in ventanas_candidatas(lanes.get(stem), total):
+            if len(aceptados) >= TOPE_POR_ROL or any(abs(desde - d) < SEPARACION_MIN for d in aceptados):
+                continue
             ok, qc = controlar_loop(y, sr, bpm, fase, desde, stem)
             if not ok:
                 rechazos[qc["motivo"].split(" (")[0]] = rechazos.get(qc["motivo"].split(" (")[0], 0) + 1
@@ -1148,6 +1156,7 @@ def cortar_loops(track: dict, lanes: dict, energia: dict, calidad: dict, audio: 
                 rol = "melodia"
             else:
                 rol = "acordes"
+            aceptados.append(desde)
             loops.append({"stem": stem, "role": rol, "from_bar": desde, "bars": LOOP_COMPASES, "qc": qc})
     return loops, rechazos
 
