@@ -1099,6 +1099,21 @@ def golpes_de_bombo_s(y, sr: int, corte_hz: float = 150.0) -> list[float]:
     return golpes
 
 
+def fase_medida_ms(y_bateria, sr: int, bpm: float) -> float | None:
+    """La fase REAL de la rejilla, medida en los bombos de la pista de batería (media circular).
+    Encontrado en producción: la fase del análisis del tema completo no coincide exacto con los bombos
+    de la pista separada (casi todas las ventanas de batería salían "corridas")."""
+    ks = golpes_de_bombo_s(y_bateria, sr)
+    if len(ks) < 16:
+        return None
+    beat = 60.0 / bpm
+    ang = np.array([2 * np.pi * ((t % beat) / beat) for t in ks])
+    fase = float(np.angle(np.mean(np.exp(1j * ang)))) / (2 * np.pi) * beat * 1000.0
+    if fase < 0:
+        fase += beat * 1000.0
+    return fase - beat * 1000.0 if fase > beat * 500.0 else fase
+
+
 def controlar_loop(y, sr: int, bpm: float, phase_ms: float, desde: int, stem: str,
                    largo: int = LOOP_COMPASES) -> tuple[bool, dict]:
     """Control del loop: huecos, empalme, alineación (batería) y nivel. Devuelve (aprobado, qc)."""
@@ -1145,7 +1160,9 @@ ROL_DE_STEM = {"bass": "bajo", "drums": "bateria"}
 
 def cortar_loops(track: dict, lanes: dict, energia: dict, calidad: dict, audio: dict) -> tuple[list[dict], dict]:
     """Todos los loops aprobados de un tema. `audio` = {stem: (y, sr)}. Devuelve (loops, rechazos)."""
-    bpm, fase = float(track["bpm"]), float(track["phase_ms"])
+    bpm, fase_dada = float(track["bpm"]), float(track["phase_ms"])
+    fm = fase_medida_ms(audio["drums"][0], audio["drums"][1], bpm) if "drums" in audio else None
+    fase = fm if fm is not None else fase_dada
     total = int(track.get("bars") or 0) or max([int(r.get("to") or 0) for rs in (lanes or {}).values() for r in (rs or [])] + [len(v or []) for v in (energia or {}).values()] + [0])
     ok_calidad = lambda s: ((calidad or {}).get(s) or {}).get("estado") in ("limpia", "con_algo")
     nivel = [sum((energia.get(k) or [0] * total)[i] if i < len(energia.get(k) or []) else 0 for k in ("drums", "bass"))
@@ -1176,6 +1193,8 @@ def cortar_loops(track: dict, lanes: dict, energia: dict, calidad: dict, audio: 
                 rol = "melodia"
             else:
                 rol = "acordes"
+            qc["fase_dada_ms"] = round(fase_dada, 2)
+            qc["fase_medida_ms"] = round(fase, 2) if fm is not None else None
             aceptados.append(desde)
             loops.append({"stem": stem, "role": rol, "from_bar": desde, "bars": LOOP_COMPASES, "qc": qc})
     return loops, rechazos
