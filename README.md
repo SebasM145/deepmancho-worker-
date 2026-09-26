@@ -1,34 +1,37 @@
-Servicio de stems y patrones — deepmancho-worker- / stems
-Tres archivos al repo SebasM145/deepmancho-worker- (rama main), junto a grid_verifier.py:
-stems_worker.py
-Dockerfile.stems
-requirements-stems.txt
-Crear el servicio en Railway (una vez)
-Proyecto DeepManchoWorker → New Service → GitHub repo deepmancho-worker-. Settings del servicio:
-Ajuste	Valor
-Nombre	stems-worker
-Dockerfile path	Dockerfile.stems
-Watch paths	stems_worker.py, Dockerfile.stems, requirements-stems.txt
-Start command	python -u stems_worker.py
-Replicas	1 (subir a 2–3 solo si la cola crece)
-Memoria	mínimo 4 GB (Demucs en CPU); con htdemucs (4 stems) alcanza con 3 GB
-Variables (Settings → Variables):
-Variable	Valor
-WORKER_API_URL	la misma del worker (https://<proyecto>.supabase.co/functions/v1)
-WORKER_SECRET	referencia al del worker: ${{deepmancho-worker-.WORKER_SECRET}}
-POLL_INTERVAL_SECONDS	15
-STEMS_MODEL	htdemucs_6s (voz, batería, bajo, resto, piano, guitarra) o htdemucs (4 stems, más rápido)
-DEMUCS_SEGMENT	8 (bajar a 6 si se queda sin memoria)
-MAX_TRACK_MB	60
-Qué esperar
-Una canción de 6 min tarda 5–10 min en CPU con 6 stems; 3–6 con 4 stems.
-El primer arranque no descarga modelos: vienen en la imagen.
-Log por job: duración, bpm, ancla → stems subidos → notas de bajo, compases, acordes.
-Si un job falla, se reporta a stems-result con ok=false y el error; no se reintenta solo.
-Cómo verificar que funciona
-En la app, "Separar en pistas" sobre una canción propia.
-Logs del servicio: debe verse demucs: -n htdemucs_6s ..., luego subido vocals … y listo: 6 stems, N notas de bajo, M compases.
-En la base: select stem, duration_seconds, lufs from track_stems where track_id='…' y select jsonb_array_length(bass_midi), (drum_grid->>'bars')::int from track_patterns where track_id='…'.
-Qué NO hace a propósito
-No escribe en music_tracks, ni en cues, ni en rejilla. No compite con worker.py.
-No descarga los stems a ningún lado público: solo los sube al bucket privado con la URL firmada que le entrega stems-next.
+# DeepMancho · Workers de audio (Railway)
+
+Servicios de procesamiento de audio de **DJConnect / DeepMancho**. Corren en Railway (proyecto `DeepManchoWorker`) y se comunican con la plataforma **solo** a través de las funciones del servidor (`WORKER_API_URL` + `WORKER_SECRET`). No tienen acceso directo a la base.
+
+## Qué corre dónde
+| Servicio Railway | Archivo | Dockerfile | Se redespliega solo si cambia |
+|---|---|---|---|
+| `stems-worker` | `stems_worker.py` | `Dockerfile.stems` | `stems_worker.py`, `Dockerfile.stems`, `requirements-stems.txt` |
+| `deepmancho-worker-` | `worker.py` (+ `grid_detect.py`) | `Dockerfile` | `worker.py`, `grid_detect.py`, `Dockerfile`, `requirements.txt` |
+| `grid-verifier` | `grid_verifier.py` | `Dockerfile.verifier` | `grid_verifier.py`, `Dockerfile.verifier` |
+
+Cambiar este README, el CHANGELOG o las pruebas **no redespliega nada**.
+
+## Flujo de trabajos
+1. La plataforma encola (`stem_jobs`, análisis, verificación de rejilla).
+2. El worker pide trabajo (`stems-next`, `worker-next`, `grid-verify-next`) cada `POLL_INTERVAL_SECONDS`.
+3. Procesa (Demucs, análisis, mediciones) y entrega (`stems-result`, `worker-result`, `grid-verify-result`).
+4. La plataforma guarda y muestra. El worker **nunca** escribe directo en la base.
+
+## Variables (solo nombres; los valores están en Railway)
+`WORKER_API_URL`, `WORKER_SECRET`, `STEMS_MODEL`, `DEMUCS_SEGMENT`, `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `TORCH_THREADS`, `MAX_TRACK_MB`, `POLL_INTERVAL_SECONDS`, `RAILWAY_DOCKERFILE_PATH`.
+Valores de referencia: `OMP_NUM_THREADS=5`, `DEMUCS_JOBS=4`, `DEMUCS_OVERLAP=0.15`, `DEMUCS_SEGMENT=7`. **No usar `NO_CACHE`**: hace lentísimos los despliegues.
+
+## Reglas aprendidas (no romper)
+- **El archivo se llama exacto `stems_worker.py`** (y `worker.py`). Subirlo como `stems_worker (1).py` hace que Railway siga corriendo la versión vieja.
+- **El tempo es `bpm + bpm_fine`**: `bpm_fine` es la corrección fina, no un tempo aparte.
+- **Los hats se miden con pasa-altos > 3 kHz.**
+- **El clasificador confunde palmas con hat abierto** (10 de 13 temas): no usar palmas/hats de `drum_grid` como dato medido hasta corregirlo.
+- **`bpm_source` / `key_source` en `metadata` o `manual` no se sobrescriben** con el análisis.
+- Toda versión nueva sube `VERSION` y se anota en el CHANGELOG.
+
+## Desplegar una versión
+1. Cambiar el código y subir `VERSION`.
+2. Correr las pruebas locales (`pytest`).
+3. Anotar en `CHANGELOG.md`.
+4. Subir a `main`: Railway redespliega **solo** el servicio cuyo archivo cambió.
+5. Verificar en los registros de Railway y en la plataforma (la cola avanza).
