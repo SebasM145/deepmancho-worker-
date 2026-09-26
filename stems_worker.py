@@ -56,7 +56,7 @@ os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.18"
+VERSION = "1.19"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -1026,6 +1026,173 @@ def _on_shutdown(signum, _frame):
     sys.exit(0)
 
 
+# ============================================================ CORTE DE LOOPS (v1.19)
+# Corta ventanas de 8 compases de cada pista separada, ALINEADAS a la fase medida,
+# con control: sin huecos, bombo en la rejilla (batería), empalme sin salto y nivel medido.
+LOOP_COMPASES = 8
+TOPE_POR_ROL = 4
+SEPARACION_MIN = 16          # compases entre ventanas de una misma pista
+TOLERANCIA_ALINEACION_MS = 10.0
+EMPALME_MAX = 1.5
+
+
+def compas_s(bpm: float) -> float:
+    return 240.0 / bpm
+
+
+def muestra_de_compas(bar: int, bpm: float, phase_ms: float, sr: int) -> int:
+    """Primera muestra del compás `bar` (1-based) según la rejilla medida."""
+    return int(round(((bar - 1) * compas_s(bpm) + phase_ms / 1000.0) * sr))
+
+
+def ventanas_candidatas(rangos: list[dict], total: int, largo: int = LOOP_COMPASES,
+                        tope: int = TOPE_POR_ROL, separacion: int = SEPARACION_MIN) -> list[int]:
+    """Compases de inicio (múltiplos de 8 + 1) donde la pista suena TODA la ventana."""
+    presente = [False] * (total + 2)
+    for r in rangos or []:
+        for b in range(max(1, int(r["from"])), min(total, int(r["to"])) + 1):
+            presente[b] = True
+    out: list[int] = []
+    for desde in range(1, total - largo + 2, largo):
+        if all(presente[desde:desde + largo]) and all(abs(desde - d) >= separacion for d in out):
+            out.append(desde)
+            if len(out) >= tope:
+                break
+    return out
+
+
+def _rms(seg) -> float:
+    return float(np.sqrt(np.mean(np.square(seg), dtype=np.float64) + 1e-12)) if len(seg) else 0.0
+
+
+def onsets_s(y, sr: int, hop: int = 32) -> list[float]:
+    """Golpes por flujo espectral (numpy puro): ventana de 256 muestras y paso de 32 (~1,5 ms a 22 kHz).
+    Ventana chica a propósito: con 512 el detector marcaba los golpes ~7 ms tarde (visto en la prueba)."""
+    n = 256
+    if len(y) < n * 2:
+        return []
+    frames = np.lib.stride_tricks.sliding_window_view(y, n)[::hop] * np.hanning(n)
+    mag = np.abs(np.fft.rfft(frames, axis=1))
+    flujo = np.maximum(np.diff(mag, axis=0), 0).sum(axis=1)
+    umbral = np.median(flujo) + 2.5 * np.std(flujo)
+    picos = np.where((flujo[1:-1] > umbral) & (flujo[1:-1] >= flujo[:-2]) & (flujo[1:-1] > flujo[2:]))[0] + 1
+    return [float((p * hop + n / 2) / sr) for p in picos]
+
+
+def controlar_loop(y, sr: int, bpm: float, phase_ms: float, desde: int, stem: str,
+                   largo: int = LOOP_COMPASES) -> tuple[bool, dict]:
+    """Control del loop: huecos, empalme, alineación (batería) y nivel. Devuelve (aprobado, qc)."""
+    a, b = muestra_de_compas(desde, bpm, phase_ms, sr), muestra_de_compas(desde + largo, bpm, phase_ms, sr)
+    if a < 0 or b > len(y):
+        return False, {"motivo": "fuera del audio"}
+    seg, compas = y[a:b], (b - a) / largo
+    rms_c = [_rms(seg[int(i * compas):int((i + 1) * compas)]) for i in range(largo)]
+    med = float(np.median(rms_c)) or 1e-9
+    qc = {"rms_compases": [round(v, 5) for v in rms_c], "nivel_db": round(20 * math.log10(_rms(seg) + 1e-12), 1),
+          "duracion_error_ms": 0.0, "fase_ms": round(phase_ms, 2)}
+    if min(rms_c) < 0.1 * med:
+        return False, {**qc, "motivo": "hueco: la pista se apaga más de un compás"}
+    tiempo = int(compas / 4)
+    ini, fin = _rms(seg[:tiempo]), _rms(seg[-tiempo:])
+    qc["empalme"] = round(max(ini, fin) / max(min(ini, fin), 1e-9), 2)
+    if qc["empalme"] > EMPALME_MAX:
+        return False, {**qc, "motivo": f"empalme desparejo ({qc['empalme']})"}
+    if stem == "drums":
+        beat = 60.0 / bpm
+        desvios = []
+        for t in onsets_s(seg, sr):
+            d = (t % beat)
+            desvios.append(min(d, beat - d) * 1000.0)
+        if len(desvios) < largo * 2:
+            return False, {**qc, "motivo": "pocos golpes para verificar la rejilla"}
+        qc["alineacion_ms"] = round(float(np.median(desvios)), 2)
+        if qc["alineacion_ms"] > TOLERANCIA_ALINEACION_MS:
+            return False, {**qc, "motivo": f"bombo corrido ({qc['alineacion_ms']} ms)"}
+    return True, qc
+
+
+def densidad_notas(y, sr: int, bpm: float, phase_ms: float, desde: int, largo: int = LOOP_COMPASES) -> float:
+    a, b = muestra_de_compas(desde, bpm, phase_ms, sr), muestra_de_compas(desde + largo, bpm, phase_ms, sr)
+    return len(onsets_s(y[max(0, a):b], sr)) / largo
+
+
+ROL_DE_STEM = {"bass": "bajo", "drums": "bateria"}
+
+
+def cortar_loops(track: dict, lanes: dict, energia: dict, calidad: dict, audio: dict) -> tuple[list[dict], dict]:
+    """Todos los loops aprobados de un tema. `audio` = {stem: (y, sr)}. Devuelve (loops, rechazos)."""
+    bpm, fase, total = float(track["bpm"]), float(track["phase_ms"]), int(track["bars"])
+    ok_calidad = lambda s: ((calidad or {}).get(s) or {}).get("estado") in ("limpia", "con_algo")
+    nivel = [sum((energia.get(k) or [0] * total)[i] if i < len(energia.get(k) or []) else 0 for k in ("drums", "bass"))
+             for i in range(total)]
+    alto = float(np.median([v for v in nivel if v > 0.05])) if any(v > 0.05 for v in nivel) else 0.5
+    loops, rechazos = [], {}
+    armonicos = [s for s in ("other", "piano", "guitar") if s in audio and ok_calidad(s)]
+    melodia = max(armonicos, key=lambda s: sum(densidad_notas(audio[s][0], audio[s][1], bpm, fase, d)
+                                               for d in ventanas_candidatas(lanes.get(s), total)[:2]), default=None)
+    for stem, (y, sr) in audio.items():
+        if not ok_calidad(stem):
+            rechazos["pista no limpia"] = rechazos.get("pista no limpia", 0) + 1
+            continue
+        for desde in ventanas_candidatas(lanes.get(stem), total):
+            ok, qc = controlar_loop(y, sr, bpm, fase, desde, stem)
+            if not ok:
+                rechazos[qc["motivo"].split(" (")[0]] = rechazos.get(qc["motivo"].split(" (")[0], 0) + 1
+                continue
+            energia_media = float(np.mean(nivel[desde - 1:desde + LOOP_COMPASES - 1]))
+            if stem in ROL_DE_STEM:
+                rol = ROL_DE_STEM[stem]
+            elif stem == "other" and energia_media < 0.5 * alto:
+                rol = "atmosfera"
+            elif stem == melodia and densidad_notas(y, sr, bpm, fase, desde) >= 2:
+                rol = "melodia"
+            else:
+                rol = "acordes"
+            loops.append({"stem": stem, "role": rol, "from_bar": desde, "bars": LOOP_COMPASES, "qc": qc})
+    return loops, rechazos
+
+
+def claim_loops():
+    """Pide un trabajo de corte de loops (loops-next). None si no hay."""
+    r = requests.post(f"{API}/loops-next", headers=HEADERS, json={}, timeout=60)
+    r.raise_for_status()
+    d = r.json()
+    return d if d.get("job") else None
+
+
+def report_loops(job_id: str, ok: bool, loops=None, error: str | None = None):
+    body = {"job_id": job_id, "ok": ok, "loops": loops or []}
+    if error:
+        body["error"] = error[:500]
+    r = requests.post(f"{API}/loops-result", headers=HEADERS, json=body, timeout=120)
+    r.raise_for_status()
+    return r.json()
+
+
+def process_loops(d: dict):
+    """Descarga las pistas del tema, corta sus loops con control y los entrega."""
+    jid = d["job"]["id"]
+    tmp = Path(tempfile.mkdtemp(prefix="loops_"))
+    try:
+        audio = {}
+        for stem, url in (d.get("stems") or {}).items():
+            dest = tmp / f"{stem}.audio"
+            download(url, dest)
+            audio[stem] = to_wav_mono(dest, 22050)
+        loops, rechazos = cortar_loops(d["track"], d.get("lanes") or {}, d.get("energy") or {}, d.get("stem_quality") or {}, audio)
+        res = report_loops(jid, True, loops)
+        log(f"[{jid[:8]}] loops {d['track'].get('genre')}: {len(loops)} aprobados · rechazos {rechazos} · {res}")
+    except Exception as e:  # noqa: BLE001
+        log(f"[{jid[:8]}] corte de loops falló:", repr(e))
+        traceback.print_exc()
+        try:
+            report_loops(jid, False, error=repr(e))
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     signal.signal(signal.SIGTERM, _on_shutdown)
     signal.signal(signal.SIGINT, _on_shutdown)
@@ -1039,6 +1206,11 @@ def main():
                     process(job)
                 finally:
                     CURRENT_JOB["id"] = None
+                continue
+            # Sin separaciones pendientes: cortar loops (la separación siempre tiene prioridad).
+            lj = claim_loops()
+            if lj:
+                process_loops(lj)
                 continue
         except Exception as e:  # noqa: BLE001
             log("error en el sondeo:", repr(e))
