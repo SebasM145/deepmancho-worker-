@@ -1079,6 +1079,26 @@ def onsets_s(y, sr: int, hop: int = 32) -> list[float]:
     return [float((p * hop + n / 2) / sr) for p in picos]
 
 
+def golpes_de_bombo_s(y, sr: int, corte_hz: float = 150.0) -> list[float]:
+    """Solo el bombo: pasa-bajos por FFT (< 150 Hz) y picos de la envolvente.
+    Encontrado en producción: con todos los golpes, los hats en contratiempo se leían como "bombo corrido"."""
+    if len(y) < sr // 10:
+        return []
+    Y = np.fft.rfft(y); f = np.fft.rfftfreq(len(y), 1 / sr); Y[f > corte_hz] = 0
+    graves = np.fft.irfft(Y, n=len(y))
+    ventana = max(1, int(sr * 0.004))
+    env = np.convolve(np.abs(graves), np.ones(ventana) / ventana, mode="same")
+    subida = np.maximum(np.diff(env, prepend=env[0]), 0)
+    umbral = 0.3 * float(np.max(subida)) if len(subida) else 0
+    minimo = int(sr * 0.2)                                  # dos bombos no caen a menos de 200 ms
+    golpes, ultimo = [], -minimo
+    for i in np.where(subida > umbral)[0]:
+        if i - ultimo >= minimo:
+            fin = min(len(env), i + int(sr * 0.03))
+            golpes.append(float(i / sr)); ultimo = i
+    return golpes
+
+
 def controlar_loop(y, sr: int, bpm: float, phase_ms: float, desde: int, stem: str,
                    largo: int = LOOP_COMPASES) -> tuple[bool, dict]:
     """Control del loop: huecos, empalme, alineación (batería) y nivel. Devuelve (aprobado, qc)."""
@@ -1104,11 +1124,11 @@ def controlar_loop(y, sr: int, bpm: float, phase_ms: float, desde: int, stem: st
     if stem == "drums":
         beat = 60.0 / bpm
         desvios = []
-        for t in onsets_s(seg, sr):
+        for t in golpes_de_bombo_s(seg, sr):
             d = (t % beat)
             desvios.append(min(d, beat - d) * 1000.0)
         if len(desvios) < largo * 2:
-            return False, {**qc, "motivo": "pocos golpes para verificar la rejilla"}
+            return False, {**qc, "motivo": "pocos bombos para verificar la rejilla"}
         qc["alineacion_ms"] = round(float(np.median(desvios)), 2)
         if qc["alineacion_ms"] > TOLERANCIA_ALINEACION_MS:
             return False, {**qc, "motivo": f"bombo corrido ({qc['alineacion_ms']} ms)"}
