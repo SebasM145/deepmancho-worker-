@@ -56,7 +56,7 @@ os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.20"
+VERSION = "1.20.1"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -1292,8 +1292,13 @@ def main():
                     process(job)
                 finally:
                     CURRENT_JOB["id"] = None
+                # v1.20.1: intercalar un corte de loops (~10 s) después de cada separación (~3 min),
+                # para que la tonalidad y los loops no esperen horas detrás de una fila larga.
+                lj = claim_loops()
+                if lj:
+                    process_loops(lj)
                 continue
-            # Sin separaciones pendientes: cortar loops (la separación siempre tiene prioridad).
+            # Sin separaciones pendientes: cortar loops.
             lj = claim_loops()
             if lj:
                 process_loops(lj)
