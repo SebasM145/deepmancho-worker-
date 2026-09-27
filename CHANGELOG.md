@@ -1,5 +1,12 @@
 # Historial de versiones · stems_worker.py
 
+## 1.22 (27-sep-2026) — MOTOR DE RENDER
+- El tema completo desde su ficha (`render-next` / `render-result`): colocación por compás con la fase medida, estéreo o paneo, entrada gradual, paneo móvil, tiro de eco, limpieza de graves, respiro con el bombo (80 ms) y un bus de sala.
+- Máster de club: sonoridad objetivo (−9 por defecto) con limitador por bloques y techo −1 dBFS; LUFS reales medidos con ffmpeg (`lufs_of`); WAV 24 bits + MP3 320 kbps subidos a URLs firmadas.
+- Prioridad: el render va primero (un DJ lo espera en pantalla), después la separación y el corte de loops.
+
+## 1.21 — afinación medida en cents; tonalidad con esa referencia
+
 ## 1.20 (27-sep-2026)
 - Tonalidad medida en cada loop no percusivo (Krumhansl-Schmuckler sobre croma, numpy puro) → `qc.key_detectada` y `qc.key_conf`.
 - Se considera VERIFICADA solo con `key_conf >= 0.1`. Los bajos con raíz y quinta (sin tercera) son ambiguos por naturaleza: la tonalidad del tema se decide con acordes y melodía.

@@ -56,7 +56,7 @@ os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.21"
+VERSION = "1.22"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -1313,12 +1313,212 @@ def process_loops(d: dict):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ============================================================ MOTOR DE RENDER (v1.22): la canción completa desde su ficha
+# Numpy puro. Estéreo a 44,1 kHz. Todo se ubica por compás con la fase medida (M10).
+SR_RENDER = 44100
+
+def compas_a_muestra(compas: float, bpm: float, fase_ms: float = 0.0, sr: int = SR_RENDER) -> int:
+    return int(round(((compas - 1) * 240.0 / bpm + fase_ms / 1000.0) * sr))
+
+def rampa_db(n: int, puntos: list, bpm: float, desde_compas: float, sr: int = SR_RENDER):
+    """Automatización de volumen: puntos [(compas, db)], interpolados en dB, como ganancia lineal por muestra."""
+    if not puntos:
+        return np.ones(n, dtype=np.float32)
+    xs = np.array([compas_a_muestra(c, bpm, 0, sr) - compas_a_muestra(desde_compas, bpm, 0, sr) for c, _ in puntos], dtype=np.float64)
+    ys = np.array([d for _, d in puntos], dtype=np.float64)
+    db = np.interp(np.arange(n), xs, ys)
+    return (10 ** (db / 20)).astype(np.float32)
+
+def paneo(mono, pos):
+    """Paneo de potencia constante; `pos` es un número (−1…1) o un arreglo por muestra (paneo móvil)."""
+    p = np.clip(np.asarray(pos, dtype=np.float32), -1, 1)
+    ang = (p + 1) * np.pi / 4
+    return np.stack([mono * np.cos(ang), mono * np.sin(ang)])
+
+def lfo_paneo(n: int, frecuencia_hz: float, profundidad: float, sr: int = SR_RENDER):
+    return (profundidad * np.sin(2 * np.pi * frecuencia_hz * np.arange(n) / sr)).astype(np.float32)
+
+def tiro_de_eco(stereo, desde_muestra: int, tiempo_ms: float, repeticiones: int, sr: int = SR_RENDER, caida: float = 0.5):
+    """Eco a tempo SOLO desde `desde_muestra` (la última palabra): cada repetición más baja y un poco más oscura."""
+    d = int(round(tiempo_ms / 1000 * sr)); fuente = np.zeros_like(stereo); fuente[:, desde_muestra:] = stereo[:, desde_muestra:]
+    extra = d * repeticiones; out = np.zeros((2, stereo.shape[1] + extra), dtype=np.float32); out[:, :stereo.shape[1]] += stereo
+    g = 1.0
+    for k in range(1, repeticiones + 1):
+        g *= caida; eco = fuente.copy()
+        eco[:, 1:] = 0.6 * eco[:, 1:] + 0.4 * eco[:, :-1]            # un poco más oscuro en cada vuelta
+        out[:, k * d:k * d + stereo.shape[1]] += g * eco
+    return out
+
+def mezclar(pistas: list, bpm: float, compases_total: int, fase_ms: float = 0.0, sr: int = SR_RENDER):
+    """pistas: [{audio (mono float32), desde_compas, ganancia_db, paneo (float) | lfo {frecuencia_hz, profundidad}, rampa [(compas, db)], eco {desde_seg, tiempo_ms, repeticiones}}]"""
+    total = compas_a_muestra(compases_total + 1, bpm, fase_ms, sr) + sr * 4
+    mix = np.zeros((2, total), dtype=np.float32)
+    for p in pistas:
+        a = np.asarray(p["audio"], dtype=np.float32) * np.float32(10 ** (p.get("ganancia_db", 0) / 20))
+        a = a * rampa_db(len(a), p.get("rampa", []), bpm, p["desde_compas"], sr)
+        pos = lfo_paneo(len(a), p["lfo"]["frecuencia_hz"], p["lfo"]["profundidad"], sr) if p.get("lfo") else p.get("paneo", 0.0)
+        st = paneo(a, pos)
+        if p.get("eco"):
+            st = tiro_de_eco(st, int(p["eco"]["desde_seg"] * sr), p["eco"]["tiempo_ms"], p["eco"]["repeticiones"], sr)
+        i = compas_a_muestra(p["desde_compas"], bpm, fase_ms, sr); j = min(total, i + st.shape[1])
+        mix[:, i:j] += st[:, :j - i]
+    return mix
+
+def masterizar(mix, techo_db: float = -1.0):
+    """Máster simple y seguro: nunca supera el techo (pico −1 dBFS por defecto)."""
+    pico = float(np.max(np.abs(mix))) or 1.0
+    techo = 10 ** (techo_db / 20)
+    return (mix * (techo / pico)).astype(np.float32) if pico > techo else mix
+
+def limpiar_graves(mono, corte_hz: float, sr: int = SR_RENDER):
+    """Pasa-altos por FFT con transición suave de media octava (sin fase rara: se aplica a la señal entera)."""
+    if not corte_hz:
+        return mono
+    X = np.fft.rfft(mono); f = np.fft.rfftfreq(len(mono), 1 / sr)
+    m = np.clip(np.log2(np.maximum(f, 1e-9) / (corte_hz / 1.414)) / 0.5, 0, 1)   # 0 abajo, 1 media octava arriba
+    return np.fft.irfft(X * m, n=len(mono)).astype(np.float32)
+
+def respuesta_sala(segundos: float = 1.8, sr: int = SR_RENDER, semilla: int = 7):
+    """Sala estéreo (ruido que decae), con semilla fija: el mismo espacio en la escucha y en la exportación."""
+    n = int(segundos * sr); t = np.arange(n) / sr; rs = np.random.RandomState(semilla)
+    env = np.exp(-6.9 * t / segundos)
+    return np.stack([rs.randn(n) * env, rs.randn(n) * env]).astype(np.float32) * 0.02
+
+def convolucion(stereo, ir):
+    n = stereo.shape[1] + ir.shape[1] - 1; N = 1 << (n - 1).bit_length()
+    return np.stack([np.fft.irfft(np.fft.rfft(stereo[c], N) * np.fft.rfft(ir[c], N), N)[:n] for c in range(2)]).astype(np.float32)
+
+def respiro(n: int, bpm: float, fase_ms: float, profundidad_db: float = 4.0, liberacion_ms: float = 80.0, sr: int = SR_RENDER):
+    """El "bombeo": en cada tiempo (donde cae el bombo) baja `profundidad_db` y se recupera antes del contratiempo
+    (constante de 80 ms: a medio tiempo queda a menos de 0,2 dB; con 150 ms seguía casi 1 dB abajo)."""
+    beat = 60.0 / bpm * sr; pos = (np.arange(n) - fase_ms / 1000 * sr) % beat
+    baja = 1 - 10 ** (-profundidad_db / 20)
+    return (1 - baja * np.exp(-pos / (liberacion_ms / 1000 * sr))).astype(np.float32)
+
+def sonoridad_aprox_db(stereo) -> float:
+    """Aproximación de LUFS por RMS (en producción se usa la medición real del worker, `lufs_of`)."""
+    return 20 * math.log10(float(np.sqrt(np.mean(stereo.astype(np.float64) ** 2))) + 1e-12) - 0.691 + 3.0
+
+def limitador(stereo, techo_db: float = -1.0, bloque: int = 64, liberacion_bloques: int = 40):
+    """Limitador por bloques con anticipación de un bloque y liberación suave: sube la energía sin pasar el techo."""
+    techo = 10 ** (techo_db / 20); n = stereo.shape[1]; nb = -(-n // bloque)
+    pad = np.zeros((2, nb * bloque), dtype=np.float32); pad[:, :n] = stereo
+    picos = np.abs(pad).reshape(2, nb, bloque).max(axis=(0, 2))
+    g = np.minimum(1.0, techo / np.maximum(picos, 1e-9))
+    g = np.minimum(g, np.concatenate([g[1:], [1.0]]))                              # anticipación: baja un bloque antes
+    k = 1.0 / liberacion_bloques; suave = np.empty_like(g); actual = 1.0
+    for i in range(nb):
+        actual = g[i] if g[i] < actual else actual + (g[i] - actual) * k           # ataque inmediato, liberación suave
+        suave[i] = actual
+    ganancia = np.repeat(suave, bloque)[:n].astype(np.float32)
+    return np.clip(stereo * ganancia, -techo, techo)
+
+def master_club(mix, objetivo_db: float = -9.0, techo_db: float = -1.0):
+    """Lleva la mezcla a la sonoridad de club y la limita: nunca pasa el techo."""
+    sube = objetivo_db - sonoridad_aprox_db(mix)
+    return limitador(mix * np.float32(10 ** (sube / 20)), techo_db)
+
+def mezclar_ficha(pistas: list, bpm: float, compases_total: int, fase_ms: float = 0.0, sr: int = SR_RENDER):
+    """Mezcla completa desde la ficha: estéreo o paneo, limpieza de graves, respiro con el bombo y envío al espacio
+    (un solo bus de sala para todo el tema). `audio` es mono (n,) o estéreo (2, n)."""
+    total = compas_a_muestra(compases_total + 1, bpm, fase_ms, sr) + sr * 4
+    mix = np.zeros((2, total), dtype=np.float32); sala = np.zeros((2, total), dtype=np.float32); hay_sala = False
+    for p in pistas:
+        a = np.asarray(p["audio"], dtype=np.float32)
+        estereo = a.ndim == 2 and not p.get("lfo") and p.get("paneo") in (None, 0, 0.0)
+        mono = a if a.ndim == 1 else a.mean(axis=0)
+        if estereo:
+            st = np.stack([limpiar_graves(c, p.get("limpiar_graves_hz"), sr) for c in a]) if p.get("limpiar_graves_hz") else a.copy()
+        else:
+            m = limpiar_graves(mono, p.get("limpiar_graves_hz"), sr) if p.get("limpiar_graves_hz") else mono
+            pos = lfo_paneo(len(m), p["lfo"]["frecuencia_hz"], p["lfo"]["profundidad"], sr) if p.get("lfo") else (p.get("paneo") or 0.0)
+            st = paneo(m, pos)
+        n = st.shape[1]
+        g = np.float32(10 ** (p.get("ganancia_db", 0) / 20)) * rampa_db(n, p.get("rampa", []), bpm, p["desde_compas"], sr)
+        if p.get("respiro"):
+            i0 = compas_a_muestra(p["desde_compas"], bpm, fase_ms, sr)
+            g = g * respiro(i0 + n, bpm, fase_ms, sr=sr)[i0:]
+        st = st * g
+        if p.get("eco"):
+            st = tiro_de_eco(st, int(p["eco"]["desde_seg"] * sr), p["eco"]["tiempo_ms"], p["eco"]["repeticiones"], sr)
+        i = compas_a_muestra(p["desde_compas"], bpm, fase_ms, sr); j = min(total, i + st.shape[1])
+        mix[:, i:j] += st[:, :j - i]
+        if p.get("espacio_db") is not None:
+            sala[:, i:j] += st[:, :j - i] * np.float32(10 ** (p["espacio_db"] / 20)); hay_sala = True
+    if hay_sala:
+        mix += convolucion(sala, respuesta_sala(sr=sr))[:, :total]
+    return mix
+
+
+def to_wav_estereo(path: Path, sr: int = SR_RENDER) -> "np.ndarray":
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-ac", "2", "-ar", str(sr), "-f", "f32le", "-"],
+                         capture_output=True, check=True).stdout
+    return np.frombuffer(raw, dtype=np.float32).reshape(-1, 2).T.copy()
+
+
+def claim_render():
+    r = requests.post(f"{API}/render-next", headers=HEADERS, json={}, timeout=60)
+    r.raise_for_status(); d = r.json()
+    return d if d.get("job") else None
+
+
+def report_render(job_id: str, ok: bool, medidas=None, error: str | None = None):
+    body = {"job_id": job_id, "ok": ok, **({"medidas": medidas} if medidas else {}), **({"error": error[:900]} if error else {})}
+    requests.post(f"{API}/render-result", headers=HEADERS, json=body, timeout=60).raise_for_status()
+
+
+def codificar(stereo, dest: Path, formato: str):
+    args = ["-c:a", "pcm_s24le"] if formato == "wav" else ["-c:a", "libmp3lame", "-b:a", "320k"]
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "f32le", "-ar", str(SR_RENDER), "-ac", "2", "-i", "-", *args, str(dest)],
+                   input=np.ascontiguousarray(stereo.T).astype(np.float32).tobytes(), check=True)
+
+
+def subir(url: str, path: Path, tipo: str):
+    with open(path, "rb") as f:
+        r = requests.put(url, data=f, headers={"Content-Type": tipo, "x-upsert": "true"}, timeout=600)
+    r.raise_for_status()
+
+
+def process_render(d: dict):
+    """El tema completo desde su ficha: bajar, mezclar, masterizar, medir, codificar y subir."""
+    jid = d["job"]["id"]; fi = d["ficha"]; tmp = Path(tempfile.mkdtemp(prefix="render_"))
+    try:
+        pistas = []
+        for p in fi["pistas"]:
+            src = tmp / f"{p['clave']}.src"; download(d["urls"][p["clave"]], src)
+            audio = to_wav_estereo(src) if p.get("estereo") else to_wav_mono(src, SR_RENDER)[0]
+            pistas.append({**p, "audio": audio})
+        mix = mezclar_ficha(pistas, float(fi["bpm"]), int(fi["compases"]), float(fi.get("fase_ms") or 0))
+        m = fi.get("master") or {}
+        master = master_club(mix, float(m.get("objetivo_db", -9)), float(m.get("techo_db", -1)))
+        wav, mp3 = tmp / "tema.wav", tmp / "tema.mp3"
+        codificar(master, wav, "wav"); codificar(master, mp3, "mp3")
+        medidas = {"lufs": lufs_of(wav), "pico_db": round(20 * math.log10(float(np.abs(master).max()) + 1e-12), 2),
+                   "duracion_s": round(master.shape[1] / SR_RENDER, 2)}
+        subir(d["subir"]["wav"], wav, "audio/wav"); subir(d["subir"]["mp3"], mp3, "audio/mpeg")
+        report_render(jid, True, medidas)
+        log(f"[{jid[:8]}] render listo · {len(pistas)} pistas · {medidas}")
+    except Exception as e:  # noqa: BLE001
+        log(f"[{jid[:8]}] render falló:", repr(e)); traceback.print_exc()
+        try:
+            report_render(jid, False, error=repr(e))
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     signal.signal(signal.SIGTERM, _on_shutdown)
     signal.signal(signal.SIGINT, _on_shutdown)
     log(f"stems_worker v{VERSION} listo · modelo {MODEL} · segmento {SEGMENT}s · jobs {JOBS} · overlap {OVERLAP} · hilos {os.environ.get('OMP_NUM_THREADS')} · sondeo cada {POLL}s")
     while True:
         try:
+            # v1.22: el render primero (un DJ lo está esperando en pantalla).
+            rj = claim_render()
+            if rj:
+                process_render(rj)
+                continue
             job = claim()
             if job:
                 CURRENT_JOB["id"] = job["job_id"]
