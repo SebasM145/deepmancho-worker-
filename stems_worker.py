@@ -56,7 +56,7 @@ os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.19"
+VERSION = "1.20"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -1026,6 +1026,41 @@ def _on_shutdown(signum, _frame):
     sys.exit(0)
 
 
+# ============================================================ TONALIDAD (v1.20): Krumhansl-Schmuckler sobre croma, numpy puro
+_KS_MAYOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+_KS_MENOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+# Camelot por clase de altura (0 = do): menores (A) y mayores (B)
+_CAMELOT_MENOR = {9: "8A", 4: "9A", 11: "10A", 6: "11A", 1: "12A", 8: "1A", 3: "2A", 10: "3A", 5: "4A", 0: "5A", 7: "6A", 2: "7A"}
+_CAMELOT_MAYOR = {0: "8B", 7: "9B", 2: "10B", 9: "11B", 4: "12B", 11: "1B", 6: "2B", 1: "3B", 8: "4B", 3: "5B", 10: "6B", 5: "7B"}
+
+
+def croma(y, sr: int, n: int = 8192, hop: int = 4096) -> "np.ndarray":
+    """Energía por clase de altura (12), entre 55 Hz y 2 kHz."""
+    if len(y) < n:
+        return np.zeros(12)
+    frames = np.lib.stride_tricks.sliding_window_view(y, n)[::hop] * np.hanning(n)
+    mag = np.abs(np.fft.rfft(frames, axis=1)).sum(axis=0)
+    f = np.fft.rfftfreq(n, 1 / sr)
+    ok = (f >= 55) & (f <= 2000)
+    pc = (np.round(12 * np.log2(f[ok] / 440.0)).astype(int) + 9) % 12
+    c = np.zeros(12)
+    np.add.at(c, pc, mag[ok])
+    return c / (c.sum() + 1e-12)
+
+
+def tonalidad_de(y, sr: int) -> tuple[str | None, float]:
+    """(Camelot, confianza 0–1). Confianza = diferencia entre la mejor y la segunda correlación."""
+    c = croma(y, sr)
+    if not c.any():
+        return None, 0.0
+    puntajes = []
+    for t in range(12):
+        puntajes.append((float(np.corrcoef(c, np.roll(_KS_MAYOR, t))[0, 1]), _CAMELOT_MAYOR[t]))
+        puntajes.append((float(np.corrcoef(c, np.roll(_KS_MENOR, t))[0, 1]), _CAMELOT_MENOR[t]))
+    puntajes.sort(reverse=True)
+    return puntajes[0][1], round(max(0.0, puntajes[0][0] - puntajes[1][0]), 3)
+
+
 # ============================================================ CORTE DE LOOPS (v1.19)
 # Corta ventanas de 8 compases de cada pista separada, ALINEADAS a la fase medida,
 # con control: sin huecos, bombo en la rejilla (batería), empalme sin salto y nivel medido.
@@ -1193,6 +1228,9 @@ def cortar_loops(track: dict, lanes: dict, energia: dict, calidad: dict, audio: 
                 rol = "melodia"
             else:
                 rol = "acordes"
+            if stem != "drums":                                   # v1.20: tonalidad medida en el propio loop
+                a0, b0 = muestra_de_compas(desde, bpm, fase, sr), muestra_de_compas(desde + LOOP_COMPASES, bpm, fase, sr)
+                qc["key_detectada"], qc["key_conf"] = tonalidad_de(y[max(0, a0):b0], sr)
             qc["fase_dada_ms"] = round(fase_dada, 2)
             qc["fase_medida_ms"] = round(fase, 2) if fm is not None else None
             aceptados.append(desde)
