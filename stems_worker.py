@@ -56,7 +56,7 @@ os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.22"
+VERSION = "1.22.1"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -1490,9 +1490,17 @@ def process_render(d: dict):
             pistas.append({**p, "audio": audio})
         mix = mezclar_ficha(pistas, float(fi["bpm"]), int(fi["compases"]), float(fi.get("fase_ms") or 0))
         m = fi.get("master") or {}
-        master = master_club(mix, float(m.get("objetivo_db", -9)), float(m.get("techo_db", -1)))
+        objetivo, techo = float(m.get("objetivo_db", -9)), float(m.get("techo_db", -1))
+        master = master_club(mix, objetivo, techo)
         wav, mp3 = tmp / "tema.wav", tmp / "tema.mp3"
-        codificar(master, wav, "wav"); codificar(master, mp3, "mp3")
+        # v1.22.1: la sonoridad se corrige con la MEDICIÓN REAL (ffmpeg, EBU R128), no con la aproximación.
+        # Primer render real: la aproximación dejó −13,6 LUFS con objetivo −9 (los graves pesan distinto).
+        for _ in range(3):
+            codificar(master, wav, "wav"); real = lufs_of(wav)
+            if real is None or abs(real - objetivo) <= 0.5:
+                break
+            master = limitador(master * np.float32(10 ** ((objetivo - real) / 20)), techo)
+        codificar(master, mp3, "mp3")
         medidas = {"lufs": lufs_of(wav), "pico_db": round(20 * math.log10(float(np.abs(master).max()) + 1e-12), 2),
                    "duracion_s": round(master.shape[1] / SR_RENDER, 2)}
         subir(d["subir"]["wav"], wav, "audio/wav"); subir(d["subir"]["mp3"], mp3, "audio/mpeg")
