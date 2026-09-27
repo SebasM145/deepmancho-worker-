@@ -56,7 +56,7 @@ os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.20.1"
+VERSION = "1.21"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -1034,23 +1034,55 @@ _CAMELOT_MENOR = {9: "8A", 4: "9A", 11: "10A", 6: "11A", 1: "12A", 8: "1A", 3: "
 _CAMELOT_MAYOR = {0: "8B", 7: "9B", 2: "10B", 9: "11B", 4: "12B", 11: "1B", 6: "2B", 1: "3B", 8: "4B", 3: "5B", 10: "6B", 5: "7B"}
 
 
-def croma(y, sr: int, n: int = 8192, hop: int = 4096) -> "np.ndarray":
-    """Energía por clase de altura (12), entre 55 Hz y 2 kHz."""
+def afinacion_cents(y, sr: int, n: int = 16384) -> float | None:
+    """v1.21: afinación real en cents (−50..+50) respecto de La = 440 Hz: media circular (período 100 cents)
+    del desvío de los picos espectrales más fuertes, con interpolación parabólica."""
+    if len(y) < n:
+        return None
+    frames = np.lib.stride_tricks.sliding_window_view(y, n)[::n] * np.hanning(n)
+    mag = np.abs(np.fft.rfft(frames, axis=1)).sum(axis=0)
+    f = np.fft.rfftfreq(n, 1 / sr)
+    lo, hi = np.searchsorted(f, 80), np.searchsorted(f, 2000)
+    m = mag[lo:hi]
+    picos = np.where((m[1:-1] > m[:-2]) & (m[1:-1] >= m[2:]))[0] + 1
+    if len(picos) < 3:
+        return None
+    picos = picos[np.argsort(m[picos])[-40:]]
+    lm = np.log(m + 1e-12)
+    ang, pesos = [], []
+    for k in picos:
+        a, b, c = lm[k - 1], lm[k], lm[k + 1]
+        d = 0.5 * (a - c) / (a - 2 * b + c) if (a - 2 * b + c) != 0 else 0.0
+        fp = f[lo + k] + d * (f[1] - f[0])
+        if fp <= 0:
+            continue
+        dev = 1200 * np.log2(fp / 440.0)
+        ang.append(2 * np.pi * (dev % 100) / 100); pesos.append(m[k])
+    if not ang:
+        return None
+    z = np.sum(np.array(pesos) * np.exp(1j * np.array(ang)))
+    cents = float(np.angle(z)) / (2 * np.pi) * 100
+    return round(cents - 100 if cents > 50 else (cents + 100 if cents < -50 else cents), 1)
+
+
+def croma(y, sr: int, n: int = 8192, hop: int = 4096, ref_hz: float = 440.0) -> "np.ndarray":
+    """Energía por clase de altura (12), entre 55 Hz y 2 kHz, con la afinación de referencia medida."""
     if len(y) < n:
         return np.zeros(12)
     frames = np.lib.stride_tricks.sliding_window_view(y, n)[::hop] * np.hanning(n)
     mag = np.abs(np.fft.rfft(frames, axis=1)).sum(axis=0)
     f = np.fft.rfftfreq(n, 1 / sr)
     ok = (f >= 55) & (f <= 2000)
-    pc = (np.round(12 * np.log2(f[ok] / 440.0)).astype(int) + 9) % 12
+    pc = (np.round(12 * np.log2(f[ok] / ref_hz)).astype(int) + 9) % 12
     c = np.zeros(12)
     np.add.at(c, pc, mag[ok])
     return c / (c.sum() + 1e-12)
 
 
-def tonalidad_de(y, sr: int) -> tuple[str | None, float]:
-    """(Camelot, confianza 0–1). Confianza = diferencia entre la mejor y la segunda correlación."""
-    c = croma(y, sr)
+def tonalidad_de(y, sr: int, cents: float | None = None) -> tuple[str | None, float]:
+    """(Camelot, confianza 0–1). Confianza = diferencia entre la mejor y la segunda correlación.
+    Con `cents`, el croma usa la afinación real (La = 440·2^(cents/1200)) y no cae en la nota vecina."""
+    c = croma(y, sr, ref_hz=440.0 * 2 ** ((cents or 0) / 1200))
     if not c.any():
         return None, 0.0
     puntajes = []
@@ -1230,7 +1262,9 @@ def cortar_loops(track: dict, lanes: dict, energia: dict, calidad: dict, audio: 
                 rol = "acordes"
             if stem != "drums":                                   # v1.20: tonalidad medida en el propio loop
                 a0, b0 = muestra_de_compas(desde, bpm, fase, sr), muestra_de_compas(desde + LOOP_COMPASES, bpm, fase, sr)
-                qc["key_detectada"], qc["key_conf"] = tonalidad_de(y[max(0, a0):b0], sr)
+                seg0 = y[max(0, a0):b0]
+                qc["afinacion_cents"] = afinacion_cents(seg0, sr)                       # v1.21
+                qc["key_detectada"], qc["key_conf"] = tonalidad_de(seg0, sr, qc["afinacion_cents"])
             qc["fase_dada_ms"] = round(fase_dada, 2)
             qc["fase_medida_ms"] = round(fase, 2) if fm is not None else None
             aceptados.append(desde)
