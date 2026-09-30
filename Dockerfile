@@ -6,6 +6,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg libsndfile1 libchromaprint-tools \
     && rm -rf /var/lib/apt/lists/*
 
+# Menos arenas de malloc = menos fragmentacion: la RAM ociosa por replica bajaba
+# poco solo con malloc_trim (v7.5.1).
+ENV MALLOC_ARENA_MAX=2
+
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
