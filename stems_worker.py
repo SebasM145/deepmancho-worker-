@@ -23,6 +23,11 @@ Variables de entorno (Railway):
   STEMS_MODEL           default htdemucs_6s (alternativa más liviana: htdemucs)
   DEMUCS_SEGMENT        default 8 (segundos; menos = menos RAM, más lento)
   MAX_TRACK_MB          default 60
+  STEMS_ENGINE          default demucs. "hibrido" activa el motor híbrido (v1.23, APAGADO por defecto)
+  HIBRIDO_DIR           dónde quedan código y pesos del híbrido (default $TORCH_HOME/hibrido)
+  HIBRIDO_OTHER         resto (default) | scnet
+  HIBRIDO_LOTE          trozos por pasada del híbrido (default 1; más = más RAM)
+  HIBRIDO_SOLAPES       solapes del híbrido (vacío = 2 en voz y 2 en SCNet)
 """
 from __future__ import annotations
 
@@ -56,7 +61,7 @@ os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.22.2"
+VERSION = "1.23.0"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -145,6 +150,306 @@ def run_demucs(src: Path, outdir: Path, model: str = MODEL) -> dict[str, Path]:
             + (f"; sí hay: {encontrado}" if encontrado else "")
         )
     return stems
+
+
+# ============================================================ MOTOR HÍBRIDO (v1.23) — APAGADO POR DEFECTO
+# Para la comparación A/B contra Demucs. Solo se usa si el trabajo trae
+# model == "hibrido" o si STEMS_ENGINE=hibrido. Si no, TODO sigue igual (demucs).
+#
+#   voz / instrumental : Mel-Band RoFormer de Kimberley Jensen (MIT)
+#   batería y bajo     : SCNet-XL de ZFTurbo (MIT), corrido sobre el instrumental
+#   piano y guitarra   : htdemucs_6s (MIT), corrido sobre el instrumental
+#   other              : lo que queda (instrumental − batería − bajo − piano − guitarra),
+#                        así la suma de las 6 pistas vuelve a dar la mezcla. Con
+#                        HIBRIDO_OTHER=scnet se usa el "other" de SCNet − piano − guitarra.
+#
+# El código de los modelos (4 archivos de ZFTurbo/Music-Source-Separation-Training,
+# MIT) y los pesos se bajan la primera vez a HIBRIDO_DIR, fijados por commit y sha256.
+DEMUCS_MODELOS = ("htdemucs", "htdemucs_ft", "htdemucs_6s", "mdx_extra")
+MOTOR_DEFECTO = "demucs"
+HIBRIDO_VERSION = "hibrido-1"
+MSST_COMMIT = "84b1eac0887756b4f1a9d7a1ff49105939749ed2"
+MSST_CODIGO = {  # archivo del repo → sha256
+    "models/bs_roformer/attend.py": "c7abbc40a3fd20ff7f6001fa9f8ee9ad5df6452272712a5e719b8f8468bf2223",
+    "models/bs_roformer/mel_band_roformer.py": "3b4a57ab268933900172e05fb76dd9e8acc1eb770c745d583a4e42b94b79ec15",
+    "models/scnet/scnet.py": "a024c6a6b3e5eda6da29f052076772c277183dc273f144b4feca1c565030e1ed",
+    "models/scnet/separation.py": "4fdda9982003b795c3b5d964f998ca0bc416d7c232b813706a6088b16a1a1639",
+}
+HIBRIDO_PESOS = {  # archivo → (url, bytes, sha256)
+    "MelBandRoformer.ckpt": (
+        "https://huggingface.co/KimberleyJSN/melbandroformer/resolve/main/MelBandRoformer.ckpt",
+        913106900, "87201f4d31afb5bc79993230fc49446918425574db48c01c405e44f365c7559e"),
+    "model_scnet_ep_54_sdr_9.8051.ckpt": (
+        "https://github.com/ZFTurbo/Music-Source-Separation-Training/releases/download/v1.0.13/model_scnet_ep_54_sdr_9.8051.ckpt",
+        216189106, "fd889cc1d97619ccac59280ecc859c190cd3cc1b1557fbe3a19b1610bb67e410"),
+}
+# Configuración de cada modelo, copiada de sus YAML oficiales (sin depender de yaml/ml_collections).
+MEL_KIM = {
+    "dim": 384, "depth": 6, "stereo": True, "num_stems": 1, "time_transformer_depth": 1,
+    "freq_transformer_depth": 1, "num_bands": 60, "dim_head": 64, "heads": 8, "attn_dropout": 0,
+    "ff_dropout": 0, "flash_attn": True, "dim_freqs_in": 1025, "sample_rate": 44100,
+    "stft_n_fft": 2048, "stft_hop_length": 441, "stft_win_length": 2048, "stft_normalized": False,
+    "mask_estimator_depth": 2, "multi_stft_resolution_loss_weight": 1.0,
+    "multi_stft_resolutions_window_sizes": (4096, 2048, 1024, 512, 256),
+    "multi_stft_hop_size": 147, "multi_stft_normalized": False,
+}
+MEL_KIM_TROZO, MEL_KIM_SOLAPES = 352800, 2       # 8 s, como config_vocals_mel_band_roformer_kj.yaml
+SCNET_XL = {
+    "sources": ["drums", "bass", "other", "vocals"], "audio_channels": 2, "dims": [4, 64, 128, 256],
+    "nfft": 4096, "hop_size": 1024, "win_size": 4096, "normalized": True,
+    "band_SR": [0.230, 0.370, 0.400], "band_stride": [1, 4, 16], "band_kernel": [3, 4, 16],
+    "conv_depths": [3, 2, 1], "compress": 4, "conv_kernel": 3, "num_dplayer": 8, "expand": 1,
+}
+# El YAML usa 4 solapes; en CPU SCNet-XL tarda ~1,1× tiempo real por trozo (medido en un M4),
+# así que por defecto 2 (la mitad de tiempo). HIBRIDO_SOLAPES=4 para la calidad del YAML.
+SCNET_XL_TROZO, SCNET_XL_SOLAPES = 485100, 2     # 11 s, como config_musdb18_scnet_xl.yaml
+SR_SEPARACION = 44100
+
+
+def elegir_motor(job: dict | None = None) -> str:
+    """Qué motor separa este trabajo: "hibrido" solo si el trabajo lo pide
+    (model == "hibrido") o si STEMS_ENGINE=hibrido. En cualquier otro caso, "demucs".
+    Se lee el entorno en cada llamada (no al importar) para poder probarlo."""
+    pedido = str((job or {}).get("model") or "").strip().lower()
+    if pedido == "hibrido":
+        return "hibrido"
+    if os.environ.get("STEMS_ENGINE", MOTOR_DEFECTO).strip().lower() == "hibrido":
+        return "hibrido"
+    return MOTOR_DEFECTO
+
+
+def modelo_demucs(job: dict | None = None) -> str:
+    """El modelo de Demucs pedido por el trabajo, si es uno conocido; si no, STEMS_MODEL."""
+    model = str((job or {}).get("model") or MODEL)
+    return model if model in DEMUCS_MODELOS else MODEL
+
+
+def _version_de(paquete: str) -> str:
+    try:
+        from importlib.metadata import version
+        return version(paquete)
+    except Exception:  # noqa: BLE001
+        return "?"
+
+
+def hibrido_dir() -> Path:
+    base = os.environ.get("HIBRIDO_DIR") or str(Path(os.environ.get("TORCH_HOME") or Path.home() / ".cache" / "torch") / "hibrido")
+    return Path(base)
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for bloque in iter(lambda: f.read(1 << 20), b""):
+            h.update(bloque)
+    return h.hexdigest()
+
+
+def _bajar(url: str, dest: Path, sha: str, timeout: int = 600):
+    """Descarga con archivo temporal y verificación de sha256 (no deja archivos a medias)."""
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    with requests.get(url, stream=True, timeout=timeout) as r:
+        r.raise_for_status()
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(1 << 20):
+                f.write(chunk)
+    real = _sha256(tmp)
+    if real != sha:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"sha256 distinto para {dest.name}: {real[:12]}… (esperado {sha[:12]}…)")
+    tmp.replace(dest)
+
+
+def asegurar_hibrido(verificar: bool = False) -> Path:
+    """Deja en HIBRIDO_DIR el código de los modelos y los pesos. Idempotente.
+    Con verificar=True recalcula el sha256 de lo que ya está (lento: ~1,1 GB)."""
+    base = hibrido_dir()
+    codigo = base / "msst"
+    for rel, sha in MSST_CODIGO.items():
+        dest = codigo / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if not dest.exists() or (verificar and _sha256(dest) != sha):
+            _bajar(f"https://raw.githubusercontent.com/ZFTurbo/Music-Source-Separation-Training/{MSST_COMMIT}/{rel}", dest, sha, 60)
+    # Paquetes vacíos a propósito: el __init__ original de bs_roformer importa
+    # otros modelos con más dependencias que no hacen falta.
+    for pkg in ("models", "models/bs_roformer", "models/scnet"):
+        (codigo / pkg / "__init__.py").touch()
+    for nombre, (url, tam, sha) in HIBRIDO_PESOS.items():
+        dest = base / nombre
+        if dest.exists() and dest.stat().st_size == tam and not (verificar and _sha256(dest) != sha):
+            continue
+        log(f"híbrido: bajando {nombre} ({tam / 1e6:.0f} MB)")
+        _bajar(url, dest, sha)
+    return base
+
+
+def _leer_estereo(path: Path, sr: int = SR_SEPARACION) -> np.ndarray:
+    """(2, T) float32 con ffmpeg."""
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(path), "-ac", "2", "-ar", str(sr), "-f", "f32le", "-"],
+        capture_output=True, check=True,
+    ).stdout
+    return np.frombuffer(raw, dtype=np.float32).reshape(-1, 2).T.copy()
+
+
+def _escribir_audio(audio: np.ndarray, dest: Path, sr: int = SR_SEPARACION):
+    """(C, T) → mp3 192 kbps (igual que demucs --mp3) o wav float según la extensión.
+    Recorte como demucs (clip_mode rescale): si pasa de 1, se baja esa pista entera."""
+    pico = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if pico > 1.0:
+        audio = audio / (1.01 * pico)
+    fmt = ["-c:a", "libmp3lame", "-b:a", "192k"] if dest.suffix == ".mp3" else ["-c:a", "pcm_f32le"]
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "f32le", "-ar", str(sr), "-ac", str(audio.shape[0]), "-i", "-", *fmt, str(dest)],
+        input=np.ascontiguousarray(audio.T, dtype=np.float32).tobytes(), check=True,
+    )
+
+
+def separar_por_trozos(modelo, mezcla, trozo: int, solapes: int, lote: int = 1):
+    """Inferencia por trozos con solape y fundido lineal (como `demix` de ZFTurbo, modo
+    genérico, pero la ventana de cada trozo se decide por trozo y no por lote).
+    mezcla: tensor (C, T). Devuelve (fuentes, C, T)."""
+    import torch
+    import torch.nn.functional as F
+    largo = mezcla.shape[-1]
+    paso = max(1, trozo // max(1, solapes))
+    borde = trozo - paso
+    fundido = min(trozo // 10, borde)          # sin solape no hay fundido (si no, quedan ceros en las uniones)
+    x = mezcla
+    if largo > 2 * borde and borde > 0:
+        x = F.pad(x[None], (borde, borde), mode="reflect")[0]
+    total = x.shape[-1]
+    base = torch.ones(trozo)
+    if fundido > 0:
+        base[:fundido] = torch.linspace(0, 1, fundido)
+        base[-fundido:] = torch.linspace(1, 0, fundido)
+    resultado, cuenta = None, torch.zeros(total)
+    inicios = list(range(0, total, paso))
+    with torch.inference_mode():
+        for k in range(0, len(inicios), lote):
+            grupo = inicios[k:k + lote]
+            partes = []
+            for s in grupo:
+                p = x[:, s:s + trozo]
+                n = p.shape[-1]
+                modo = "reflect" if n > trozo // 2 else "constant"
+                partes.append(F.pad(p[None], (0, trozo - n), mode=modo)[0] if n < trozo else p)
+            y = modelo(torch.stack(partes)).float()
+            if y.dim() == 3:                       # un solo stem: (B, C, T) → (B, 1, C, T)
+                y = y[:, None]
+            if resultado is None:
+                resultado = torch.zeros((y.shape[1],) + tuple(x.shape))
+            for j, s in enumerate(grupo):
+                n = min(trozo, total - s)
+                w = base.clone()
+                if s == 0:
+                    w[:fundido] = 1
+                if s + paso >= total:
+                    w[-fundido:] = 1
+                resultado[..., s:s + n] += y[j, ..., :n] * w[:n]
+                cuenta[s:s + n] += w[:n]
+    resultado = resultado / cuenta.clamp_min(1e-8)
+    if total != largo:
+        resultado = resultado[..., borde:borde + largo]
+    return resultado
+
+
+def _cargar_pesos(modelo, path: Path):
+    import torch
+    estado = torch.load(str(path), map_location="cpu", weights_only=True)
+    for clave in ("state", "state_dict", "model"):
+        if isinstance(estado, dict) and clave in estado and isinstance(estado[clave], dict):
+            estado = estado[clave]
+    estado = {k[7:] if k.startswith("module.") else k: v for k, v in estado.items()}
+    modelo.load_state_dict(estado)
+    return modelo.eval()
+
+
+def separar_hibrido(src: Path, outdir: Path, ext: str = ".mp3") -> dict[str, Path]:
+    """Motor híbrido. Mismas pistas y mismos nombres que htdemucs_6s:
+    vocals, drums, bass, other, piano, guitar. Devuelve {pista: archivo}."""
+    import gc
+    import torch
+    torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS") or "6"))
+    base = asegurar_hibrido()
+    if str(base / "msst") not in sys.path:
+        sys.path.insert(0, str(base / "msst"))
+    lote = max(1, int(os.environ.get("HIBRIDO_LOTE", "1")))
+    solape = os.environ.get("HIBRIDO_SOLAPES")          # vacío = el de cada modelo
+    mezcla = torch.from_numpy(_leer_estereo(src))
+    t0 = time.time()
+
+    # 1) Voz con Mel-Band RoFormer (Kim). Instrumental = mezcla − voz.
+    from models.bs_roformer.mel_band_roformer import MelBandRoformer
+    m = _cargar_pesos(MelBandRoformer(**MEL_KIM), base / "MelBandRoformer.ckpt")
+    voz = separar_por_trozos(m, mezcla, MEL_KIM_TROZO, int(solape or MEL_KIM_SOLAPES), lote)[0]
+    del m; gc.collect()
+    inst = mezcla - voz
+    log(f"híbrido: voz lista en {time.time() - t0:.0f}s")
+
+    # 2) Batería y bajo con SCNet-XL sobre el instrumental.
+    from models.scnet.scnet import SCNet
+    m = _cargar_pesos(SCNet(**SCNET_XL), base / "model_scnet_ep_54_sdr_9.8051.ckpt")
+    sc = separar_por_trozos(m, inst, SCNET_XL_TROZO, int(solape or SCNET_XL_SOLAPES), lote)
+    del m; gc.collect()
+    fuentes = SCNET_XL["sources"]
+    bat, bajo, otro_sc = sc[fuentes.index("drums")], sc[fuentes.index("bass")], sc[fuentes.index("other")]
+    log(f"híbrido: batería y bajo listos en {time.time() - t0:.0f}s")
+
+    # 3) Piano y guitarra con htdemucs_6s sobre el instrumental (mismos parámetros que el CLI).
+    from demucs.apply import apply_model
+    from demucs.pretrained import get_model
+    dm = get_model("htdemucs_6s")
+    dm.eval()
+    ref = inst.mean(0)
+    media, desvio = ref.mean(), ref.std() + 1e-8
+    with torch.inference_mode():
+        d = apply_model(dm, ((inst - media) / desvio)[None], shifts=1, split=True, overlap=float(OVERLAP),
+                        segment=float(SEGMENT), num_workers=0, progress=False)[0] * desvio + media
+    piano, guitarra = d[dm.sources.index("piano")], d[dm.sources.index("guitar")]
+    del dm, d; gc.collect()
+    log(f"híbrido: piano y guitarra listos en {time.time() - t0:.0f}s")
+
+    # 4) other: lo que queda (la suma vuelve a dar la mezcla) o el de SCNet.
+    if os.environ.get("HIBRIDO_OTHER", "resto").strip().lower() == "scnet":
+        otro = otro_sc - piano - guitarra
+    else:
+        otro = inst - bat - bajo - piano - guitarra
+    pistas = {"vocals": voz, "drums": bat, "bass": bajo, "other": otro, "piano": piano, "guitar": guitarra}
+    outdir.mkdir(parents=True, exist_ok=True)
+    salida = {}
+    for nombre, audio in pistas.items():
+        dest = outdir / f"{nombre}{ext}"
+        _escribir_audio(audio.numpy(), dest)
+        salida[nombre] = dest
+    return salida
+
+
+def info_motor(motor: str, model: str) -> dict:
+    if motor == "hibrido":
+        return {"engine": "hibrido", "model": "hibrido",
+                "engine_version": f"{HIBRIDO_VERSION} · MelBandRoformer-Kim + SCNet-XL(v1.0.13) + htdemucs_6s(piano,guitar)"
+                                  f" · msst {MSST_COMMIT[:7]} · demucs {_version_de('demucs')} · other={os.environ.get('HIBRIDO_OTHER', 'resto')}"}
+    return {"engine": "demucs", "model": model, "engine_version": f"demucs {_version_de('demucs')} · {model}"}
+
+
+def separar(src: Path, outdir: Path, job: dict | None = None) -> tuple[dict[str, Path], dict]:
+    """Punto único de separación. Por defecto Demucs, igual que siempre.
+    Si el híbrido falla (descarga, memoria…), se separa con Demucs y se deja anotado."""
+    motor = elegir_motor(job)
+    if motor == "hibrido":
+        try:
+            return separar_hibrido(src, outdir / "hibrido"), info_motor("hibrido", "hibrido")
+        except Exception as e:  # noqa: BLE001
+            log("híbrido falló, sigo con demucs:", repr(e))
+            traceback.print_exc()
+            model = modelo_demucs(None)
+            info = info_motor("demucs", model)
+            info["engine_fallback"] = f"hibrido falló: {repr(e)[:200]}"
+            return run_demucs(src, outdir, model), info
+    model = modelo_demucs(job)
+    return run_demucs(src, outdir, model), info_motor("demucs", model)
 
 
 def lufs_of(path: Path) -> float | None:
@@ -897,10 +1202,10 @@ def process(job: dict):
 
         # El trabajo puede pedir otro modelo: htdemucs_6s separa piano y
         # guitarra en pistas propias (a cambio de algo menos de limpieza).
-        model = str(job.get("model") or MODEL)
-        if model not in ("htdemucs", "htdemucs_ft", "htdemucs_6s", "mdx_extra"):
-            model = MODEL
-        stems = run_demucs(src, work / "out", model)
+        # v1.23: el motor híbrido existe pero está APAGADO por defecto (ver elegir_motor).
+        stems, motor = separar(src, work / "out", job)
+        model = motor["model"]
+        log(f"[{job_id[:8]}] motor: {motor['engine_version']}" + (f" ({motor['engine_fallback']})" if motor.get("engine_fallback") else ""))
         uploads = job.get("uploads", {})
         stems_out = {}
         for name, p in stems.items():
@@ -992,7 +1297,10 @@ def process(job: dict):
         patterns = {"bass_midi": bass_midi, "melody_midi": melody_midi, "drum_grid": grid,
                     "chords": chords, "stats": stats, "model": model, "sound_profile": profile,
                     "parts": parts, "blocks": blocks, "arrangement_map": arreglo,
-                    "stem_quality": calidad, "sampler": sampler}
+                    "stem_quality": calidad, "sampler": sampler,
+                    "engine": motor["engine"], "engine_version": motor["engine_version"]}
+        if motor.get("engine_fallback"):
+            patterns["engine_fallback"] = motor["engine_fallback"]
         report(job_id, True, stems_out, patterns)
         log(f"[{job_id[:8]}] listo: {len(stems_out)} stems, {len(bass_midi)} notas de bajo, {grid['bars']} compases")
     except Exception as e:  # noqa: BLE001
@@ -1524,7 +1832,7 @@ def process_render(d: dict):
 def main():
     signal.signal(signal.SIGTERM, _on_shutdown)
     signal.signal(signal.SIGINT, _on_shutdown)
-    log(f"stems_worker v{VERSION} listo · modelo {MODEL} · segmento {SEGMENT}s · jobs {JOBS} · overlap {OVERLAP} · hilos {os.environ.get('OMP_NUM_THREADS')} · sondeo cada {POLL}s")
+    log(f"stems_worker v{VERSION} listo · motor {elegir_motor()} · modelo {MODEL} · segmento {SEGMENT}s · jobs {JOBS} · overlap {OVERLAP} · hilos {os.environ.get('OMP_NUM_THREADS')} · sondeo cada {POLL}s")
     while True:
         try:
             # v1.22: el render primero (un DJ lo está esperando en pantalla).

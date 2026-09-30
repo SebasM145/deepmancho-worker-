@@ -6,3 +6,8 @@ onnxruntime>=1.17
 librosa>=0.10.2
 numpy<2
 requests>=2.31
+# v1.23 motor híbrido (APAGADO por defecto): código de Mel-Band RoFormer y SCNet (ZFTurbo, MIT)
+einops==0.8.1
+rotary-embedding-torch==0.3.5
+beartype==0.14.1
+packaging>=23

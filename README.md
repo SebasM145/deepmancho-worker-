@@ -9,7 +9,7 @@ Servicios de procesamiento de audio de **DJConnect / DeepMancho**. Corren en Rai
 | `deepmancho-worker-` | `worker.py` (+ `grid_detect.py`) | `Dockerfile` | `worker.py`, `grid_detect.py`, `Dockerfile`, `requirements.txt` |
 | `grid-verifier` | `grid_verifier.py` | `Dockerfile.verifier` | `grid_verifier.py`, `Dockerfile.verifier` |
 
-Cambiar este README, el CHANGELOG o las pruebas **no redespliega nada**.
+Cambiar este README, el CHANGELOG, las pruebas o `banco_separacion.py` **no redespliega nada**.
 
 ## Flujo de trabajos
 1. La plataforma encola (`stem_jobs`, análisis, verificación de rejilla).
@@ -18,7 +18,7 @@ Cambiar este README, el CHANGELOG o las pruebas **no redespliega nada**.
 4. La plataforma guarda y muestra. El worker **nunca** escribe directo en la base.
 
 ## Variables (solo nombres; los valores están en Railway)
-`WORKER_API_URL`, `WORKER_SECRET`, `STEMS_MODEL`, `DEMUCS_SEGMENT`, `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `TORCH_THREADS`, `MAX_TRACK_MB`, `POLL_INTERVAL_SECONDS`, `RAILWAY_DOCKERFILE_PATH`.
+`WORKER_API_URL`, `WORKER_SECRET`, `STEMS_MODEL`, `STEMS_ENGINE` (sin definir = demucs; `hibrido` activa el motor híbrido de la v1.23), `HIBRIDO_DIR`, `HIBRIDO_OTHER`, `HIBRIDO_LOTE`, `HIBRIDO_SOLAPES`, `DEMUCS_SEGMENT`, `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `TORCH_THREADS`, `MAX_TRACK_MB`, `POLL_INTERVAL_SECONDS`, `RAILWAY_DOCKERFILE_PATH`.
 Valores de referencia: `OMP_NUM_THREADS=5`, `DEMUCS_JOBS=4`, `DEMUCS_OVERLAP=0.15`, `DEMUCS_SEGMENT=7`. **No usar `NO_CACHE`**: hace lentísimos los despliegues.
 
 ## Reglas aprendidas (no romper)
@@ -35,3 +35,11 @@ Valores de referencia: `OMP_NUM_THREADS=5`, `DEMUCS_JOBS=4`, `DEMUCS_OVERLAP=0.1
 3. Anotar en `CHANGELOG.md`.
 4. Subir a `main`: Railway redespliega **solo** el servicio cuyo archivo cambió.
 5. Verificar en los registros de Railway y en la plataforma (la cola avanza).
+
+## Banco A/B de separación (local, no se despliega)
+`banco_separacion.py` separa los mismos temas con `demucs` y `hibrido` y los compara con las medidas del worker.
+```
+pip install -r requirements-stems.txt
+python banco_separacion.py temas/*.mp3 --salida banco --tempos tempos.csv   # tempos.csv: archivo,bpm,ancla_ms (opcional)
+```
+Deja `resultados.csv`, `resumen.txt`, las pistas por motor y `escucha_ciega/<tema>/A|B` (la clave está en `clave_ciega.json`: escuchar antes de abrirla).
