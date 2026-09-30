@@ -11,12 +11,14 @@ import worker  # noqa: E402
 
 
 class Respuesta:
-    def __init__(self, tipo="audio/mp4"):
+    def __init__(self, tipo="audio/mp4", status_code=200):
         self.headers = {"content-type": tipo}
         self.content = b"audio"
+        self.status_code = status_code
 
     def raise_for_status(self):
-        pass
+        if self.status_code >= 400:
+            raise worker.requests.HTTPError(str(self.status_code))
 
 
 def test_descarga_manda_el_secreto(monkeypatch):
@@ -42,6 +44,29 @@ def test_extension_segun_content_type(monkeypatch):
     ruta = worker.descargar_rendicion("abc")
     os.remove(ruta)
     assert ruta.endswith(".mp3")
+
+
+def test_si_falta_el_m4a_pide_el_mp3(monkeypatch):
+    pedidos = []
+
+    def get(url, headers=None, timeout=None):
+        pedidos.append(url)
+        return Respuesta("application/json", 502) if url.endswith("aac") else Respuesta("audio/mpeg")
+
+    monkeypatch.setattr(worker.requests, "get", get)
+    ruta = worker.descargar_rendicion("abc")
+    os.remove(ruta)
+    assert [u.rsplit("=", 1)[1] for u in pedidos] == ["aac", "mp3"]
+    assert ruta.endswith(".mp3")
+
+
+def test_no_autorizado_no_reintenta(monkeypatch):
+    pedidos = []
+    monkeypatch.setattr(worker.requests, "get",
+                        lambda url, **k: pedidos.append(url) or Respuesta("application/json", 401))
+    with pytest.raises(worker.requests.HTTPError):
+        worker.descargar_rendicion("abc")
+    assert len(pedidos) == 1
 
 
 def test_temporal_se_borra_si_el_ancla_falla(monkeypatch):

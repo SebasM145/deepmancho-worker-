@@ -1320,16 +1320,21 @@ def compute_anchor(path: str, bpm: float):
                 n_kicks=int(len(pk)))
 
 
-def rendition_url(track_id: str) -> str:
+def rendition_url(track_id: str, formato: str = "aac") -> str:
     """URL del MISMO audio que reproduce el navegador (stream-track)."""
-    return f"{WORKER_API_URL}/stream-track?track_id={track_id}&format=aac"
+    return f"{WORKER_API_URL}/stream-track?track_id={track_id}&format={formato}"
 
 
 def descargar_rendicion(track_id: str) -> str:
     """Baja la rendition de stream-track a un temporal y devuelve su ruta.
     Manda x-worker-secret: sin el, stream-track responde 401 (antes 404) y CM2
-    fallaba en cada tema. La extension sale del content-type real (m4a o mp3)."""
-    r = requests.get(rendition_url(track_id), headers={"x-worker-secret": WORKER_SECRET}, timeout=180)
+    fallaba en cada tema. La extension sale del content-type real (m4a o mp3).
+    Si el m4a legado no esta en el Storage (stream-track da 502, issue #35 de la
+    plataforma), pide la otra rendicion del mismo tema: el MP3."""
+    cab = {"x-worker-secret": WORKER_SECRET}
+    r = requests.get(rendition_url(track_id), headers=cab, timeout=180)
+    if r.status_code >= 500:
+        r = requests.get(rendition_url(track_id, "mp3"), headers=cab, timeout=180)
     r.raise_for_status()
     suf = ".m4a" if "mp4" in r.headers.get("content-type", "") else ".mp3"
     tmp = tempfile.NamedTemporaryFile(suffix=suf, delete=False)
