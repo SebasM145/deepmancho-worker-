@@ -56,7 +56,7 @@ os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.22.2"
+VERSION = "1.22.3"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -127,7 +127,10 @@ def to_wav_mono(path: Path, sr: int = 22050) -> tuple[np.ndarray, int]:
 def run_demucs(src: Path, outdir: Path, model: str = MODEL) -> dict[str, Path]:
     cmd = [
         sys.executable, "-m", "demucs", "-n", model, "-d", "cpu",
-        "--segment", SEGMENT, "-j", JOBS, "--overlap", OVERLAP, "--mp3", "--mp3-bitrate", "192", "-o", str(outdir), str(src),
+        # WAV y no --mp3: el MP3 de demucs (lameenc) no guarda el retardo del codificador y las pistas
+        # llegaban ~25 ms (1105 muestras) tarde respecto de la mezcla. Se codifican con ffmpeg, la misma
+        # cadena que la mezcla, así cualquier reproductor las trata igual (1.23.1).
+        "--segment", SEGMENT, "-j", JOBS, "--overlap", OVERLAP, "-o", str(outdir), str(src),
     ]
     log("demucs:", " ".join(cmd[2:]))
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -137,6 +140,13 @@ def run_demucs(src: Path, outdir: Path, model: str = MODEL) -> dict[str, Path]:
     # OJO: demucs guarda en <salida>/<modelo>/<nombre>/ — hay que usar el
     # modelo que se le pasó, no el de por defecto. (Bug de la v1.9.)
     base = outdir / model / src.stem
+    for wav in base.glob("*.wav"):
+        mp3 = wav.with_suffix(".mp3")
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-i", str(wav), "-c:a", "libmp3lame", "-b:a", "192k", "-ar", "44100", "-write_xing", "1", str(mp3)],
+            check=True,
+        )
+        wav.unlink()
     stems = {p.stem: p for p in base.glob("*.mp3")}
     if not stems:
         encontrado = [str(p.relative_to(outdir)) for p in outdir.rglob("*.mp3")][:8]
