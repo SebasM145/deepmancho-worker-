@@ -462,6 +462,88 @@ def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
         return None
 
 
+# ----------------------------------------------------------------------------
+# PLAN B y C de hot cues (v7.5). El detector estructural (detect_cues) exige
+# >= 24 compases y contraste de energia; si no lo encuentra devolvia None y el
+# tema quedaba SIN cues (bocetos, frases, correcciones, temas muy planos).
+# Ahora nunca queda vacio:
+#   B) rejilla de frases desde el ancla real: A en 0, H en la ultima frase que
+#      deja cola, intermedios en los bordes de frase con mas cambio medido.
+#   C) sin BPM: por tiempo (A en 0, H al 85 %).
+# Ambos van con confidence < 0.5 y "origen": el mezclador no los usa para
+# mezcla automatica (cueConfidence.ts) pero el DJ puede saltar a ellos, y el
+# worker-result los etiqueta cue_source='grilla_v1' / 'tiempo_v1'.
+# ----------------------------------------------------------------------------
+CONF_RESPALDO = 0.3
+
+
+def _cue_respaldo(num, pos_ms, energia, origen, conf=CONF_RESPALDO):
+    label, color = CUE_DEF[num]
+    return {"number": num, "label": label, "color": color, "positionMs": int(round(pos_ms)),
+            "energy": int(energia), "confidence": 1.0 if num == 0 else conf, "origen": origen}
+
+
+def cues_respaldo(y: np.ndarray, sr: int, bpm, first_beat_ms):
+    """Plan B: cues sobre la rejilla de frases. None solo si no hay BPM."""
+    if not bpm or not (40 < float(bpm) < 240):
+        return None
+    try:
+        bar_ms = (60000.0 / float(bpm)) * 4
+        dur_ms = (len(y) / sr) * 1000.0
+        anchor = float(first_beat_ms or 0.0)
+        if anchor < 0 or anchor > dur_ms:
+            anchor = 0.0
+        n_bars = int((dur_ms - anchor) // bar_ms)
+        if n_bars < 2:
+            return [_cue_respaldo(0, 0, 5, "grilla")]
+        # Frase de 8 compases; en audio corto, de 4 (o 2) para que entren cues.
+        paso = 8 if n_bars >= 32 else (4 if n_bars >= 8 else 2)
+        F = _bar_band_energies(y, sr, anchor, bar_ms, n_bars)
+        tot = 20 * np.log10(np.maximum(np.sqrt(sum(10 ** (F[k] / 10) for k in F)), 1e-6))
+        p10, p90 = float(np.percentile(tot, 10)), float(np.percentile(tot, 90))
+        M = np.vstack([F[k] for k in ("low", "lowmid", "mid", "high")]).T
+        M = (M - M.mean(0)) / (M.std(0) + 1e-6)
+        media = max(1, paso // 2)
+
+        def novedad(b):
+            pre, post = M[max(0, b - media):b], M[b:b + media]
+            return float(np.linalg.norm(post.mean(0) - pre.mean(0))) if pre.size and post.size else 0.0
+
+        def energia(b):
+            seg = tot[b:b + paso]
+            return _energia_1_10(float(np.median(seg)) if seg.size else p10, p10, p90)
+
+        bordes = list(range(paso, n_bars, paso))
+        # H: ultima frase que deja cola (16 compases o un cuarto del tema);
+        # entre las candidatas del ultimo tercio, la de mayor caida de energia.
+        cola = min(16, max(paso, n_bars // 4))
+        cand_h = [b for b in bordes if n_bars - b >= cola and b >= n_bars * 0.6]
+        if cand_h:
+            def caida(b):
+                return float(np.median(tot[max(0, b - paso):b])) - float(np.median(tot[b:b + paso]))
+            h = max(cand_h, key=lambda b: (caida(b), b))
+        else:
+            h = bordes[-1] if bordes else None
+        medios = [b for b in bordes if h is None or b < h]
+        medios = sorted(sorted(medios, key=novedad, reverse=True)[:6])
+        cues = [_cue_respaldo(0, 0, energia(0), "grilla")]
+        for i, b in enumerate(medios, start=1):
+            cues.append(_cue_respaldo(i, anchor + b * bar_ms, energia(b), "grilla"))
+        if h is not None:
+            cues.append(_cue_respaldo(7, anchor + h * bar_ms, energia(h), "grilla"))
+        return [c for c in cues if c["positionMs"] < dur_ms - 250]
+    except Exception as e:
+        print(f"    cues_respaldo fallo: {e}", flush=True)
+        return [_cue_respaldo(0, 0, 5, "grilla")]
+
+
+def cues_por_tiempo(dur_ms: float):
+    """Plan C: sin BPM no hay rejilla. A en 0 y H al 85 % del audio."""
+    if not dur_ms or dur_ms < 4000:
+        return [_cue_respaldo(0, 0, 5, "tiempo", 0.2)]
+    return [_cue_respaldo(0, 0, 5, "tiempo", 0.2), _cue_respaldo(7, dur_ms * 0.85, 5, "tiempo", 0.2)]
+
+
 def detect_vocal_segments(y: np.ndarray, sr: int, bpm, first_beat_ms):
     """Regiones (tramos) con voz — capa aparte de los cue points.
     Banda vocal ~300-3000 Hz sostenida y por encima de los agudos. Best-effort."""
@@ -829,6 +911,10 @@ def analyze(path: str, bpm_seed=None) -> dict:
 
             # AHORA si: los cues se calculan sobre el ancla DEFINITIVA.
             cues = detect_cues(y, sr, bpm_grid, fb)
+            if not cues:
+                # Plan B: sin estructura medible, rejilla de frases.
+                cues = cues_respaldo(y, sr, bpm_grid, fb)
+                print(f"    v7.5 plan B de cues (rejilla): {len(cues or [])} cues", flush=True)
             out["cue_points"] = cues
 
             # 2-3) MIX-IN/MIX-OUT v7.1: REFUTADOS en el lote de 25 (20-ago) —
@@ -901,6 +987,14 @@ def analyze(path: str, bpm_seed=None) -> dict:
         traceback.print_exc()
         print("    v7 falló (no bloquea el job)", flush=True)
 
+    dur_total_ms = (len(y) / sr) * 1000.0
+    if not out.get("cue_points"):
+        # Plan B sin el pipeline v7 (BPM de detect_grid) o Plan C (sin BPM).
+        out["cue_points"] = cues_respaldo(y, sr, bpm, first_beat_ms) or cues_por_tiempo(dur_total_ms)
+        print(f"    v7.5 respaldo de cues: {len(out['cue_points'])} ({out['cue_points'][0].get('origen')})", flush=True)
+    # Duracion real (solo si no se corto en MAX_DURATION): muchos temas generados llegan sin ella.
+    if dur_total_ms < (MAX_DURATION - 1) * 1000:
+        out["duration_seconds"] = int(round(dur_total_ms / 1000.0))
     return out
 
 
@@ -1673,7 +1767,7 @@ def poll_set_render():
 
 
 def main():
-    print("DeepMancho worker iniciado (v7.4.2: HOT CUES metodologia MIK sobre el ancla DEFINITIVA (A en cero, grilla de 8 compases, energia 1-10) + rendition MP3 192k). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.5: HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     if GOLDEN_EXAM:
