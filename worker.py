@@ -27,6 +27,8 @@ import json
 import tempfile
 import traceback
 import subprocess
+import gc
+import ctypes
 
 import numpy as np
 import librosa
@@ -1766,8 +1768,20 @@ def poll_set_render():
     return True
 
 
+def liberar_memoria():
+    """Devuelve al sistema la RAM de los picos de un analisis (v7.5.1).
+    numpy/librosa piden varios GB por tema (WAV de 65 MB, filtros en float64) y
+    glibc no los devuelve: cada replica quedaba con su maximo (~4 GB ociosos,
+    11,9 GB de promedio en 3 replicas = ~US$120/mes solo en RAM)."""
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass  # fuera de Linux/glibc no hay malloc_trim
+
+
 def main():
-    print("DeepMancho worker iniciado (v7.5: HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.5.1: HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     if GOLDEN_EXAM:
@@ -1776,6 +1790,7 @@ def main():
         except Exception:
             traceback.print_exc()
             print("[CM2 EXAMEN] el examen fallo pero el worker sigue normal", flush=True)
+        liberar_memoria()
     idle = 0
     while True:
         try:
@@ -1787,12 +1802,14 @@ def main():
         if job:
             idle = 0
             process_job(job, track, audio_url, rendition_upload)
+            liberar_memoria()
         else:
             # Sin jobs de analisis: aprovechar para renderizar sets si hay cola.
             # El analisis tiene prioridad (un track sin analizar bloquea mas que
             # un set sin renderizar).
             if ENABLE_SET_RENDER and poll_set_render():
                 idle = 0
+                liberar_memoria()
                 continue
             idle += 1
             if idle % 12 == 1:
