@@ -825,10 +825,20 @@ def sanity_check(result, dur_ms):
     return problemas, round(confianza, 2)
 
 
+class AudioMudo(Exception):
+    """La pista no tiene audio util (silencio): no hay tempo, rejilla ni cues que medir."""
+
+
+SILENCIO_PICO = 1e-4      # ~ -80 dBFS
+TOPE_ANALISIS_S = 600     # un analisis nunca puede tomar mas de 10 min
+
+
 def analyze(path: str, bpm_seed=None) -> dict:
     y, sr = librosa.load(path, sr=SR, mono=True, duration=MAX_DURATION)
     if y.size == 0:
         raise RuntimeError("audio vacío")
+    if float(np.max(np.abs(y))) < SILENCIO_PICO:
+        raise AudioMudo("pista sin audio útil (silencio)")
     # ── Rejilla de compases — metodología derivada de Rekordbox (v5) ──
     # Reemplaza beat_track, que tomaba el PRIMER golpe detectado como
     # ancla (podía ser el 2, 3 o 4 del compás). Medido contra 729
@@ -1484,7 +1494,21 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
             send_result(job_id, track_id, "error", error="track sin audio")
             return
         tmp = download_audio(audio_url)
-        result = analyze(tmp, bpm_seed=track.get("bpm"))
+        # Tope por trabajo: si algo se cuelga, falla este tema y la replica sigue con la cola.
+        import signal
+        def _tope(_s, _f):
+            raise TimeoutError(f"analisis mas largo que {TOPE_ANALISIS_S // 60} min (se corta para no trabar la cola)")
+        signal.signal(signal.SIGALRM, _tope)
+        signal.alarm(TOPE_ANALISIS_S)
+        try:
+            result = analyze(tmp, bpm_seed=track.get("bpm"))
+        except AudioMudo as e:
+            signal.alarm(0)
+            send_result(job_id, track_id, "done", result={"pista_vacia": True, "analysis_flags": ["silencio"]})
+            print(f"[job {job_id}] {e}: marcada como pista vacía", flush=True)
+            return
+        finally:
+            signal.alarm(0)
         # CM1-bis: loudness restaurado (la v5 lo habia perdido — regresion detectada 18-ago)
         lufs = compute_loudness_lufs(tmp)
         if lufs is not None:

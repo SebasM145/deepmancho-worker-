@@ -1,6 +1,12 @@
 # Historial de versiones · worker.py (análisis)
 
 
+
+## 7.5.2 (30-sep-2026) — LA COLA NO SE TRABA
+- Una pista muda colgaba `detect_tempo`: librosa daba 0 BPM y `while seed_bpm < 90: seed_bpm *= 2` no terminaba. Colgó las 3 réplicas con pistas «Piano» vacías (la cola quedó 1 h sin avanzar). Ahora 0 o no finito → 126.
+- `analyze` detecta silencio (pico < −80 dBFS) y devuelve `pista_vacia` sin analizar.
+- Tope de 10 min por trabajo (SIGALRM): si algo se cuelga, falla ese tema y la réplica sigue.
+- En la base, `claim_analysis_job` ya no toma temas en la papelera ni pistas vacías, y corta a los 3 intentos.
 ## stems_worker 1.22.3 (30-sep-2026) — PISTAS SIN RETRASO
 - Demucs ya no escribe MP3 con `--mp3` (lameenc): ese codificador no guarda el retardo y las pistas llegaban **1105 muestras (25 ms) tarde** respecto de la mezcla.
 - Ahora demucs entrega WAV y ffmpeg (libmp3lame 192k, cabecera Xing/LAME) lo codifica, la misma cadena que la mezcla: cualquier reproductor trata igual canción y pistas.
