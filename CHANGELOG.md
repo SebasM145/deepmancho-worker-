@@ -2,6 +2,13 @@
 
 
 
+## Espera creciente en los tres workers (30-sep-2026) — W2 · stems_worker 1.22.4
+- Con la cola vacía, la espera arranca en `POLL_INTERVAL_SECONDS`, se duplica en cada vuelta sin trabajo hasta `POLL_MAX_SECONDS` y vuelve al inicio apenas llega un trabajo. Los errores de red también esperan más, con ±20 % para que las réplicas no choquen.
+- Topes: análisis y stems 120 s; verificador 300 s (nadie lo espera en pantalla).
+- Antes: ~73.000 consultas al día con las colas vacías (3 réplicas cada 5 s, stems 3 consultas cada 15 s, verificador cada 20 s). Ahora ≈4.600 (≈3.200 cuando W1 deje una réplica).
+- Costo: tras un rato sin trabajo, un análisis o un render puede tardar hasta 2 min en arrancar.
+- Pruebas: `tests/test_espera.py`.
+
 ## 7.5.2 (30-sep-2026) — LA COLA NO SE TRABA
 - Una pista muda colgaba `detect_tempo`: librosa daba 0 BPM y `while seed_bpm < 90: seed_bpm *= 2` no terminaba. Colgó las 3 réplicas con pistas «Piano» vacías (la cola quedó 1 h sin avanzar). Ahora 0 o no finito → 126.
 - `analyze` detecta silencio (pico < −80 dBFS) y devuelve `pista_vacia` sin analizar.
