@@ -67,6 +67,10 @@ def detect_tempo(y, sr, seed_bpm=None, env=None):
     if seed_bpm is None or not (60 <= seed_bpm <= 200):
         t, _ = librosa.beat.beat_track(y=y, sr=sr, trim=False)
         seed_bpm = float(np.atleast_1d(t)[0]) if np.atleast_1d(t).size else 126.0
+        # Con silencio librosa devuelve 0 y el «while < 90: *= 2» de abajo no terminaba nunca
+        # (colgó las 3 réplicas el 30-sep con pistas de piano mudas).
+        if not np.isfinite(seed_bpm) or seed_bpm <= 0:
+            seed_bpm = 126.0
         # corrección de octava: librosa cae en sub/super armónicos
         while seed_bpm < 90:
             seed_bpm *= 2
