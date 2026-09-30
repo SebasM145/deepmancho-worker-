@@ -1381,7 +1381,10 @@ def next_job():
     job = data.get("job")
     if not job:
         return None, None, None, None
-    return job, data.get("track") or {}, data.get("audio_url"), data.get("rendition_upload")
+    # El 4.º valor lleva las dos subidas firmadas: rendicion de escucha y master MP3 320
+    # (este ultimo solo cuando la plataforma marca needs_master_conversion).
+    return job, data.get("track") or {}, data.get("audio_url"), {
+        "rendition": data.get("rendition_upload"), "master": data.get("master_upload")}
 
 
 # ---------------------------------------------------------------------------
@@ -1403,10 +1406,15 @@ AUDIO_STANDARD = {
 }
 
 
-def make_rendition(src_path: str):
-    """Convierte al ESTANDAR de la plataforma (MP3 CBR 192k). Ruta o None."""
+# Master de biblioteca (7.5.1): todo lo que suben los DJs se guarda en MP3 320k;
+# solo las canciones creadas en el Estudio conservan WAV para descargar.
+MASTER_BITRATE = "320k"
+
+
+def make_rendition(src_path: str, bitrate: str = None, sufijo: str = ".stream"):
+    """Convierte al ESTANDAR de la plataforma (MP3 CBR 192k, o `bitrate`). Ruta o None."""
     try:
-        out = src_path + ".stream" + AUDIO_STANDARD["ext"]
+        out = src_path + sufijo + AUDIO_STANDARD["ext"]
         proc = subprocess.run(
             ["ffmpeg", "-y", "-i", src_path,
              "-vn",
@@ -1416,7 +1424,7 @@ def make_rendition(src_path: str):
              "-ar", AUDIO_STANDARD["sample_rate"],
              "-ac", AUDIO_STANDARD["channels"],
              "-c:a", AUDIO_STANDARD["codec"],
-             "-b:a", AUDIO_STANDARD["bitrate"],
+             "-b:a", bitrate or AUDIO_STANDARD["bitrate"],
              "-f", "mp3", out],
             capture_output=True, timeout=180,
         )
@@ -1466,7 +1474,7 @@ def send_result(job_id: str, track_id: str, status: str, result: dict = None, er
 # ----------------------------------------------------------------------------
 # Main loop
 # ----------------------------------------------------------------------------
-def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict = None):
+def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict = None, master_upload: dict = None):
     job_id = job["id"]
     track_id = job["track_id"]
     print(f"[job {job_id}] track {track_id} — analizando...", flush=True)
@@ -1515,6 +1523,20 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
                     print(f"[job {job_id}] WARN: no se pudo subir la rendition", flush=True)
                 try:
                     os.remove(rend)
+                except Exception:
+                    pass
+        # Master MP3 320k (subidas masivas de WAV/AIFF/FLAC): worker-result cambia
+        # audio_asset_path y borra el original solo despues de guardar la fila.
+        if master_upload and master_upload.get("url") and master_upload.get("path") and track.get("needs_master_conversion"):
+            master = make_rendition(tmp, bitrate=MASTER_BITRATE, sufijo=".master")
+            if master:
+                if upload_rendition(master_upload["url"], master):
+                    result["master_path"] = master_upload["path"]
+                    print(f"[job {job_id}] master MP3 320k subido: {master_upload['path']}", flush=True)
+                else:
+                    print(f"[job {job_id}] WARN: no se pudo subir el master MP3", flush=True)
+                try:
+                    os.remove(master)
                 except Exception:
                     pass
         # respetar bpm/key de tags: el backend solo los usa si el track no los tenía
@@ -1794,14 +1816,14 @@ def main():
     idle = 0
     while True:
         try:
-            job, track, audio_url, rendition_upload = next_job()
+            job, track, audio_url, subidas = next_job()
         except Exception as e:
             print(f"next_job error: {e}", flush=True)
             time.sleep(POLL_INTERVAL)
             continue
         if job:
             idle = 0
-            process_job(job, track, audio_url, rendition_upload)
+            process_job(job, track, audio_url, (subidas or {}).get("rendition"), (subidas or {}).get("master"))
             liberar_memoria()
         else:
             # Sin jobs de analisis: aprovechar para renderizar sets si hay cola.
