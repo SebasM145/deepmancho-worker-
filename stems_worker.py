@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import shutil
 import signal
 import subprocess
@@ -49,6 +50,7 @@ import requests
 API = os.environ["WORKER_API_URL"].rstrip("/")
 SECRET = os.environ["WORKER_SECRET"]
 POLL = int(os.environ.get("POLL_INTERVAL_SECONDS", "15"))
+POLL_MAX = float(os.environ.get("POLL_MAX_SECONDS", "120"))  # tope de la espera creciente
 MODEL = os.environ.get("STEMS_MODEL", "htdemucs_6s")
 # Los modelos htdemucs no aceptan segmentos > 7.8 s (largo de entrenamiento).
 SEGMENT = str(int(min(7, int(float(os.environ.get("DEMUCS_SEGMENT", "7"))))))  # entero: demucs no acepta decimales
@@ -63,6 +65,31 @@ MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
 VERSION = "1.23.0"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
+
+
+class Espera:
+    """Espera creciente con la cola vacía (W2, 30-sep-2026): arranca en `base`, se
+    duplica en cada vuelta sin trabajo hasta `tope` y vuelve a `base` al recibirlo.
+    Con espera fija, los workers hacían ~73.000 consultas al día sin nada que hacer.
+    Copia idéntica en worker.py, stems_worker.py y grid_verifier.py: cada imagen
+    copia solo su archivo."""
+
+    def __init__(self, base: float, tope: float):
+        self.base = max(1.0, float(base))
+        self.tope = max(self.base, float(tope))
+        self.actual = self.base
+
+    def trabajo(self):
+        self.actual = self.base
+
+    def vacia(self) -> float:
+        s = self.actual
+        self.actual = min(self.tope, self.actual * 2)
+        return s
+
+    def error(self) -> float:
+        # Mismo crecimiento, con ±20 % para que las réplicas no reintenten a la vez.
+        return self.vacia() * random.uniform(0.8, 1.2)
 
 
 def log(*a):
@@ -132,7 +159,10 @@ def to_wav_mono(path: Path, sr: int = 22050) -> tuple[np.ndarray, int]:
 def run_demucs(src: Path, outdir: Path, model: str = MODEL) -> dict[str, Path]:
     cmd = [
         sys.executable, "-m", "demucs", "-n", model, "-d", "cpu",
-        "--segment", SEGMENT, "-j", JOBS, "--overlap", OVERLAP, "--mp3", "--mp3-bitrate", "192", "-o", str(outdir), str(src),
+        # WAV y no --mp3: el MP3 de demucs (lameenc) no guarda el retardo del codificador y las pistas
+        # llegaban ~25 ms (1105 muestras) tarde respecto de la mezcla. Se codifican con ffmpeg, la misma
+        # cadena que la mezcla, así cualquier reproductor las trata igual (1.23.1).
+        "--segment", SEGMENT, "-j", JOBS, "--overlap", OVERLAP, "-o", str(outdir), str(src),
     ]
     log("demucs:", " ".join(cmd[2:]))
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -142,6 +172,13 @@ def run_demucs(src: Path, outdir: Path, model: str = MODEL) -> dict[str, Path]:
     # OJO: demucs guarda en <salida>/<modelo>/<nombre>/ — hay que usar el
     # modelo que se le pasó, no el de por defecto. (Bug de la v1.9.)
     base = outdir / model / src.stem
+    for wav in base.glob("*.wav"):
+        mp3 = wav.with_suffix(".mp3")
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-i", str(wav), "-c:a", "libmp3lame", "-b:a", "192k", "-ar", "44100", "-write_xing", "1", str(mp3)],
+            check=True,
+        )
+        wav.unlink()
     stems = {p.stem: p for p in base.glob("*.mp3")}
     if not stems:
         encontrado = [str(p.relative_to(outdir)) for p in outdir.rglob("*.mp3")][:8]
@@ -294,12 +331,13 @@ def _leer_estereo(path: Path, sr: int = SR_SEPARACION) -> np.ndarray:
 
 
 def _escribir_audio(audio: np.ndarray, dest: Path, sr: int = SR_SEPARACION):
-    """(C, T) → mp3 192 kbps (igual que demucs --mp3) o wav float según la extensión.
+    """(C, T) → mp3 192 kbps con ffmpeg, la misma cadena que run_demucs (1.22.3: cabecera
+    Xing/LAME con el retardo, sin el atraso de 25 ms de demucs --mp3), o wav float según la extensión.
     Recorte como demucs (clip_mode rescale): si pasa de 1, se baja esa pista entera."""
     pico = float(np.max(np.abs(audio))) if audio.size else 0.0
     if pico > 1.0:
         audio = audio / (1.01 * pico)
-    fmt = ["-c:a", "libmp3lame", "-b:a", "192k"] if dest.suffix == ".mp3" else ["-c:a", "pcm_f32le"]
+    fmt = ["-c:a", "libmp3lame", "-b:a", "192k", "-write_xing", "1"] if dest.suffix == ".mp3" else ["-c:a", "pcm_f32le"]
     subprocess.run(
         ["ffmpeg", "-v", "error", "-y", "-f", "f32le", "-ar", str(sr), "-ac", str(audio.shape[0]), "-i", "-", *fmt, str(dest)],
         input=np.ascontiguousarray(audio.T, dtype=np.float32).tobytes(), check=True,
@@ -1832,16 +1870,19 @@ def process_render(d: dict):
 def main():
     signal.signal(signal.SIGTERM, _on_shutdown)
     signal.signal(signal.SIGINT, _on_shutdown)
-    log(f"stems_worker v{VERSION} listo · motor {elegir_motor()} · modelo {MODEL} · segmento {SEGMENT}s · jobs {JOBS} · overlap {OVERLAP} · hilos {os.environ.get('OMP_NUM_THREADS')} · sondeo cada {POLL}s")
+    log(f"stems_worker v{VERSION} listo · motor {elegir_motor()} · modelo {MODEL} · segmento {SEGMENT}s · jobs {JOBS} · overlap {OVERLAP} · hilos {os.environ.get('OMP_NUM_THREADS')} · sondeo cada {POLL}s (hasta {POLL_MAX:.0f}s con la cola vacía)")
+    espera = Espera(POLL, POLL_MAX)
     while True:
         try:
             # v1.22: el render primero (un DJ lo está esperando en pantalla).
             rj = claim_render()
             if rj:
+                espera.trabajo()
                 process_render(rj)
                 continue
             job = claim()
             if job:
+                espera.trabajo()
                 CURRENT_JOB["id"] = job["job_id"]
                 try:
                     process(job)
@@ -1856,11 +1897,14 @@ def main():
             # Sin separaciones pendientes: cortar loops.
             lj = claim_loops()
             if lj:
+                espera.trabajo()
                 process_loops(lj)
                 continue
         except Exception as e:  # noqa: BLE001
             log("error en el sondeo:", repr(e))
-        time.sleep(POLL)
+            time.sleep(espera.error())
+            continue
+        time.sleep(espera.vacia())
 
 
 if __name__ == "__main__":

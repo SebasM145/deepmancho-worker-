@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import signal
 import subprocess
 import sys
@@ -39,7 +40,7 @@ import urllib.request
 
 import numpy as np
 
-VERSION = "1.0.0-py"
+VERSION = "1.1.0-py"
 MIXER_SOURCE_COMMIT = "11f31dbf"
 
 # ── Constantes (idénticas a gridVerify.ts) ───────────────────────────────────
@@ -366,6 +367,57 @@ def decode_file(path: str):
 
 
 # ── Medición de una pista ────────────────────────────────────────────────────
+# Errores que dan lo mismo en cada intento: se reportan como `determinista:<código>`
+# para que la plataforma no vuelva a encolar el trabajo (W4, 30-sep-2026: el 100 %
+# de los fallos del día eran estos, repetidos 3 veces por tema).
+DETERMINISTAS = ("no_bpm", "no_anchor", "too_short", "no_fit", "bad_measurement")
+MIN_DURACION_S = 30
+
+# Los mismos rangos que valida grid-verify-result: fuera de ellos responde 400
+# bad_measurement y cierra el trabajo. Mejor detectarlo aquí y decir por qué.
+RANGOS_MEDIDA = {
+    "anchor_ms": (0, 4 * 3600 * 1000),
+    "bpm_fine": (-1.5, 1.5),
+    "conf": (0, 1),
+    "peak_ratio": (0, 99),
+    "windows_good": (0, 10000),
+    "windows_total": (0, 10000),
+    "residual_beats": (0, 10),
+}
+
+
+def motivo_sin_medir(track: dict) -> str | None:
+    """Lo que ya se sabe del catálogo, sin bajar el audio: tema sin BPM, sin
+    ancla o más corto que el mínimo. Mismas reglas que measure_track."""
+    if not eff_bpm(track):
+        return "no_bpm"
+    if first_beat_ms_of(track) is None:
+        return "no_anchor"
+    dur = _fpos(track.get("duration_seconds"))
+    if dur is not None and dur < MIN_DURACION_S:
+        return "too_short"
+    return None
+
+
+def medida_invalida(payload: dict) -> str | None:
+    """Nombre del primer campo vacío, no finito o fuera de rango; None si todo está bien."""
+    for campo, (lo, hi) in RANGOS_MEDIDA.items():
+        v = payload.get(campo)
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            return campo
+        if not math.isfinite(n) or n < lo or n > hi:
+            return campo
+    return None
+
+
+def codigo_error(e: Exception) -> str:
+    """Texto que se reporta: los deterministas llevan el prefijo `determinista:`."""
+    err = str(e)[:500]
+    return f"determinista:{err}" if err in DETERMINISTAS else err
+
+
 def measure_track(track: dict, pcm: np.ndarray, sr: int) -> dict:
     catalog_bpm = eff_bpm(track)
     prior_ms = first_beat_ms_of(track)
@@ -373,7 +425,7 @@ def measure_track(track: dict, pcm: np.ndarray, sr: int) -> dict:
         raise RuntimeError("no_bpm")
     if prior_ms is None:
         raise RuntimeError("no_anchor")
-    if pcm.shape[0] / sr < 30:
+    if pcm.shape[0] / sr < MIN_DURACION_S:
         raise RuntimeError("too_short")
     t0 = time.perf_counter()
     env, bin_rate = low_envelope(pcm, sr)
@@ -411,7 +463,33 @@ API = os.environ.get("WORKER_API_URL", "").rstrip("/")
 SECRET = os.environ.get("WORKER_SECRET", "")
 APPLY = os.environ.get("GRID_VERIFY_APPLY", "0") == "1"
 POLL_S = max(5, int(float(os.environ.get("POLL_INTERVAL_SECONDS", "20"))))
+POLL_MAX_S = float(os.environ.get("POLL_MAX_SECONDS", "300"))  # tope: nadie espera al verificador
 MAX_MB = max(5, int(float(os.environ.get("MAX_TRACK_MB", "60"))))
+
+
+class Espera:
+    """Espera creciente con la cola vacía (W2, 30-sep-2026): arranca en `base`, se
+    duplica en cada vuelta sin trabajo hasta `tope` y vuelve a `base` al recibirlo.
+    Con espera fija, los workers hacían ~73.000 consultas al día sin nada que hacer.
+    Copia idéntica en worker.py, stems_worker.py y grid_verifier.py: cada imagen
+    copia solo su archivo."""
+
+    def __init__(self, base: float, tope: float):
+        self.base = max(1.0, float(base))
+        self.tope = max(self.base, float(tope))
+        self.actual = self.base
+
+    def trabajo(self):
+        self.actual = self.base
+
+    def vacia(self) -> float:
+        s = self.actual
+        self.actual = min(self.tope, self.actual * 2)
+        return s
+
+    def error(self) -> float:
+        # Mismo crecimiento, con ±20 % para que las réplicas no reintenten a la vez.
+        return self.vacia() * random.uniform(0.8, 1.2)
 
 
 def log(msg: str, **extra):
@@ -488,6 +566,9 @@ def process_one() -> bool:
     audio_url = nxt.get("audio_url")
     t0 = time.perf_counter()
     try:
+        motivo = motivo_sin_medir(track)
+        if motivo:
+            raise RuntimeError(motivo)  # sin descargar: el resultado sería el mismo
         if not audio_url:
             raise RuntimeError("no_audio_url")
         path = track.get("path") or ""
@@ -497,15 +578,20 @@ def process_one() -> bool:
             nbytes = download(audio_url, f)
             pcm, sr = decode_file(f)
         m = measure_track(track, pcm, sr)
+        medida = measurement_payload(m, track.get("path"))
+        campo = medida_invalida(medida)
+        if campo:
+            log("bad_measurement", job=job["id"], track=job["track_id"], campo=campo, valor=str(medida.get(campo)))
+            raise RuntimeError("bad_measurement")
         res = api("grid-verify-result", {
             "job_id": job["id"], "track_id": job["track_id"], "ok": True, "apply": APPLY,
-            "measurement": measurement_payload(m, track.get("path")),
+            "measurement": medida,
         })
         log("verified", job=job["id"], track=job["track_id"], bytes=nbytes, sr=sr, bpm=m["pick"]["bpm"],
             dAnchor=m["pick"]["deltaAnchorMs"], dBpm=m["pick"]["deltaBpm"], conf=m["conf"], gate=m["passesGate"],
             rpc=res.get("result"), ms=int((time.perf_counter() - t0) * 1000))
     except Exception as e:  # noqa: BLE001
-        err = str(e)[:500]
+        err = codigo_error(e)
         log("failed", job=job["id"], track=job["track_id"], error=err, ms=int((time.perf_counter() - t0) * 1000))
         try:
             api("grid-verify-result", {"job_id": job["id"], "track_id": job["track_id"], "ok": False, "error": err})
@@ -528,15 +614,22 @@ def main_loop():
         sys.exit(1)
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
-    log("start", version=VERSION, apply=APPLY, pollS=POLL_S, api=API, mixerSource=MIXER_SOURCE_COMMIT)
+    log("start", version=VERSION, apply=APPLY, pollS=POLL_S, pollMaxS=POLL_MAX_S, api=API, mixerSource=MIXER_SOURCE_COMMIT)
+    espera = Espera(POLL_S, POLL_MAX_S)
     while not _stop:
         busy = False
+        segundos = 0.0
         try:
             busy = process_one()
+            if busy:
+                espera.trabajo()
+            else:
+                segundos = espera.vacia()
         except Exception as e:  # noqa: BLE001
             log("loop_error", error=str(e)[:300])
+            segundos = espera.error()
         if not busy:
-            for _ in range(POLL_S):
+            for _ in range(int(segundos)):
                 if _stop:
                     break
                 time.sleep(1)
