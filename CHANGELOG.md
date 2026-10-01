@@ -2,6 +2,13 @@
 
 
 
+## 7.5.3 (30-sep-2026) — CM2 CON CLAVE Y CON EXAMEN (W3)
+- CM2 pedía la rendición a `stream-track` **sin `x-worker-secret`**: fallaba en cada tema (404 en el proyecto de Lovable, 401 en el nuevo). Ahora `descargar_rendicion` manda la clave, también en el examen golden.
+- Sigue pidiendo el formato por defecto (`aac`, que cae a MP3 si no hay m4a): es el mismo audio que oye el navegador. Si `stream-track` da 5xx (el m4a legado no se migró al Storage nuevo, issue #35 de la plataforma), pide `format=mp3`.
+- CM2 solo escribe `first_beat_detected_ms` con `ENABLE_ANCHOR_BACKFILL=true` **y** el examen golden aprobado en ese arranque (antes el examen no bloqueaba nada). Hoy el examen sale NO APROBADO, así que no cambia ninguna rejilla.
+- El temporal de la rendición se borra aunque falle el cálculo (`finally`).
+- Pruebas: `tests/test_cm2.py`.
+
 ## 7.5.2 (30-sep-2026) — LA COLA NO SE TRABA
 - Una pista muda colgaba `detect_tempo`: librosa daba 0 BPM y `while seed_bpm < 90: seed_bpm *= 2` no terminaba. Colgó las 3 réplicas con pistas «Piano» vacías (la cola quedó 1 h sin avanzar). Ahora 0 o no finito → 126.
 - `analyze` detecta silencio (pico < −80 dBFS) y devuelve `pista_vacia` sin analizar.
