@@ -2,6 +2,13 @@
 
 
 
+## Espera creciente en los tres workers (30-sep-2026) — W2 · stems_worker 1.22.4
+- Con la cola vacía, la espera arranca en `POLL_INTERVAL_SECONDS`, se duplica en cada vuelta sin trabajo hasta `POLL_MAX_SECONDS` y vuelve al inicio apenas llega un trabajo. Los errores de red también esperan más, con ±20 % para que las réplicas no choquen.
+- Topes: análisis y stems 120 s; verificador 300 s (nadie lo espera en pantalla).
+- Antes: ~73.000 consultas al día con las colas vacías (3 réplicas cada 5 s, stems 3 consultas cada 15 s, verificador cada 20 s). Ahora ≈4.600 (≈3.200 cuando W1 deje una réplica).
+- Costo: tras un rato sin trabajo, un análisis o un render puede tardar hasta 2 min en arrancar.
+- Pruebas: `tests/test_espera.py`.
+
 ## grid_verifier 1.1.0 (30-sep-2026) — SIN REINTENTOS INÚTILES (W4)
 - Antes de bajar el audio revisa el catálogo: sin BPM, sin ancla o con `duration_seconds` < 30 s se reporta al instante, sin descarga.
 - La medida se valida con los mismos rangos que `grid-verify-result` (vacía, no finita o fuera de rango): antes llegaba y la plataforma respondía 400 `bad_measurement`.

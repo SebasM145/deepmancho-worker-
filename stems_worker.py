@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import shutil
 import signal
 import subprocess
@@ -44,6 +45,7 @@ import requests
 API = os.environ["WORKER_API_URL"].rstrip("/")
 SECRET = os.environ["WORKER_SECRET"]
 POLL = int(os.environ.get("POLL_INTERVAL_SECONDS", "15"))
+POLL_MAX = float(os.environ.get("POLL_MAX_SECONDS", "120"))  # tope de la espera creciente
 MODEL = os.environ.get("STEMS_MODEL", "htdemucs_6s")
 # Los modelos htdemucs no aceptan segmentos > 7.8 s (largo de entrenamiento).
 SEGMENT = str(int(min(7, int(float(os.environ.get("DEMUCS_SEGMENT", "7"))))))  # entero: demucs no acepta decimales
@@ -56,8 +58,33 @@ os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.22.3"
+VERSION = "1.22.4"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
+
+
+class Espera:
+    """Espera creciente con la cola vacía (W2, 30-sep-2026): arranca en `base`, se
+    duplica en cada vuelta sin trabajo hasta `tope` y vuelve a `base` al recibirlo.
+    Con espera fija, los workers hacían ~73.000 consultas al día sin nada que hacer.
+    Copia idéntica en worker.py, stems_worker.py y grid_verifier.py: cada imagen
+    copia solo su archivo."""
+
+    def __init__(self, base: float, tope: float):
+        self.base = max(1.0, float(base))
+        self.tope = max(self.base, float(tope))
+        self.actual = self.base
+
+    def trabajo(self):
+        self.actual = self.base
+
+    def vacia(self) -> float:
+        s = self.actual
+        self.actual = min(self.tope, self.actual * 2)
+        return s
+
+    def error(self) -> float:
+        # Mismo crecimiento, con ±20 % para que las réplicas no reintenten a la vez.
+        return self.vacia() * random.uniform(0.8, 1.2)
 
 
 def log(*a):
@@ -1534,16 +1561,19 @@ def process_render(d: dict):
 def main():
     signal.signal(signal.SIGTERM, _on_shutdown)
     signal.signal(signal.SIGINT, _on_shutdown)
-    log(f"stems_worker v{VERSION} listo · modelo {MODEL} · segmento {SEGMENT}s · jobs {JOBS} · overlap {OVERLAP} · hilos {os.environ.get('OMP_NUM_THREADS')} · sondeo cada {POLL}s")
+    log(f"stems_worker v{VERSION} listo · modelo {MODEL} · segmento {SEGMENT}s · jobs {JOBS} · overlap {OVERLAP} · hilos {os.environ.get('OMP_NUM_THREADS')} · sondeo cada {POLL}s (hasta {POLL_MAX:.0f}s con la cola vacía)")
+    espera = Espera(POLL, POLL_MAX)
     while True:
         try:
             # v1.22: el render primero (un DJ lo está esperando en pantalla).
             rj = claim_render()
             if rj:
+                espera.trabajo()
                 process_render(rj)
                 continue
             job = claim()
             if job:
+                espera.trabajo()
                 CURRENT_JOB["id"] = job["job_id"]
                 try:
                     process(job)
@@ -1558,11 +1588,14 @@ def main():
             # Sin separaciones pendientes: cortar loops.
             lj = claim_loops()
             if lj:
+                espera.trabajo()
                 process_loops(lj)
                 continue
         except Exception as e:  # noqa: BLE001
             log("error en el sondeo:", repr(e))
-        time.sleep(POLL)
+            time.sleep(espera.error())
+            continue
+        time.sleep(espera.vacia())
 
 
 if __name__ == "__main__":

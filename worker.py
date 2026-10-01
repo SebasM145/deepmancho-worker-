@@ -23,6 +23,7 @@ import os
 import sys
 import time
 import math
+import random
 import json
 import tempfile
 import traceback
@@ -43,6 +44,7 @@ import requests
 WORKER_API_URL = os.environ.get("WORKER_API_URL", "").rstrip("/")
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
+POLL_MAX = float(os.environ.get("POLL_MAX_SECONDS", "120"))  # tope de la espera creciente
 # Fase 2 (opcional): identificación por huella acústica (Chromaprint + AcoustID).
 # Si no está la key o falta `fpcalc`, el worker sigue funcionando igual sin identificar.
 ACOUSTID_API_KEY = os.environ.get("ACOUSTID_API_KEY", "")
@@ -53,6 +55,31 @@ MAX_DURATION = 600  # analiza como máximo 10 min (tope de tiempo/memoria)
 # 3000 da ~4x de detalle para el zoom por compás sin inflar demasiado el payload.
 BUCKETS = 3000
 HEADERS = {"x-worker-secret": WORKER_SECRET, "Content-Type": "application/json"}
+
+
+class Espera:
+    """Espera creciente con la cola vacía (W2, 30-sep-2026): arranca en `base`, se
+    duplica en cada vuelta sin trabajo hasta `tope` y vuelve a `base` al recibirlo.
+    Con espera fija, los workers hacían ~73.000 consultas al día sin nada que hacer.
+    Copia idéntica en worker.py, stems_worker.py y grid_verifier.py: cada imagen
+    copia solo su archivo."""
+
+    def __init__(self, base: float, tope: float):
+        self.base = max(1.0, float(base))
+        self.tope = max(self.base, float(tope))
+        self.actual = self.base
+
+    def trabajo(self):
+        self.actual = self.base
+
+    def vacia(self) -> float:
+        s = self.actual
+        self.actual = min(self.tope, self.actual * 2)
+        return s
+
+    def error(self) -> float:
+        # Mismo crecimiento, con ±20 % para que las réplicas no reintenten a la vez.
+        return self.vacia() * random.uniform(0.8, 1.2)
 
 if not WORKER_API_URL or not WORKER_SECRET:
     print("ERROR: faltan WORKER_API_URL o WORKER_SECRET", flush=True)
@@ -1857,15 +1884,17 @@ def main():
             print("[CM2 EXAMEN] el examen fallo pero el worker sigue normal", flush=True)
         liberar_memoria()
     idle = 0
+    espera = Espera(POLL_INTERVAL, POLL_MAX)
     while True:
         try:
             job, track, audio_url, subidas = next_job()
         except Exception as e:
             print(f"next_job error: {e}", flush=True)
-            time.sleep(POLL_INTERVAL)
+            time.sleep(espera.error())
             continue
         if job:
             idle = 0
+            espera.trabajo()
             process_job(job, track, audio_url, (subidas or {}).get("rendition"), (subidas or {}).get("master"))
             liberar_memoria()
         else:
@@ -1874,12 +1903,13 @@ def main():
             # un set sin renderizar).
             if ENABLE_SET_RENDER and poll_set_render():
                 idle = 0
+                espera.trabajo()
                 liberar_memoria()
                 continue
             idle += 1
             if idle % 12 == 1:
-                print("sin jobs pendientes...", flush=True)
-            time.sleep(POLL_INTERVAL)
+                print(f"sin jobs pendientes... (proxima consulta en {espera.actual:.0f} s)", flush=True)
+            time.sleep(espera.vacia())
 
 
 if __name__ == "__main__":

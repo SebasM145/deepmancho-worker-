@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import signal
 import subprocess
 import sys
@@ -462,7 +463,33 @@ API = os.environ.get("WORKER_API_URL", "").rstrip("/")
 SECRET = os.environ.get("WORKER_SECRET", "")
 APPLY = os.environ.get("GRID_VERIFY_APPLY", "0") == "1"
 POLL_S = max(5, int(float(os.environ.get("POLL_INTERVAL_SECONDS", "20"))))
+POLL_MAX_S = float(os.environ.get("POLL_MAX_SECONDS", "300"))  # tope: nadie espera al verificador
 MAX_MB = max(5, int(float(os.environ.get("MAX_TRACK_MB", "60"))))
+
+
+class Espera:
+    """Espera creciente con la cola vacía (W2, 30-sep-2026): arranca en `base`, se
+    duplica en cada vuelta sin trabajo hasta `tope` y vuelve a `base` al recibirlo.
+    Con espera fija, los workers hacían ~73.000 consultas al día sin nada que hacer.
+    Copia idéntica en worker.py, stems_worker.py y grid_verifier.py: cada imagen
+    copia solo su archivo."""
+
+    def __init__(self, base: float, tope: float):
+        self.base = max(1.0, float(base))
+        self.tope = max(self.base, float(tope))
+        self.actual = self.base
+
+    def trabajo(self):
+        self.actual = self.base
+
+    def vacia(self) -> float:
+        s = self.actual
+        self.actual = min(self.tope, self.actual * 2)
+        return s
+
+    def error(self) -> float:
+        # Mismo crecimiento, con ±20 % para que las réplicas no reintenten a la vez.
+        return self.vacia() * random.uniform(0.8, 1.2)
 
 
 def log(msg: str, **extra):
@@ -587,15 +614,22 @@ def main_loop():
         sys.exit(1)
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
-    log("start", version=VERSION, apply=APPLY, pollS=POLL_S, api=API, mixerSource=MIXER_SOURCE_COMMIT)
+    log("start", version=VERSION, apply=APPLY, pollS=POLL_S, pollMaxS=POLL_MAX_S, api=API, mixerSource=MIXER_SOURCE_COMMIT)
+    espera = Espera(POLL_S, POLL_MAX_S)
     while not _stop:
         busy = False
+        segundos = 0.0
         try:
             busy = process_one()
+            if busy:
+                espera.trabajo()
+            else:
+                segundos = espera.vacia()
         except Exception as e:  # noqa: BLE001
             log("loop_error", error=str(e)[:300])
+            segundos = espera.error()
         if not busy:
-            for _ in range(POLL_S):
+            for _ in range(int(segundos)):
                 if _stop:
                     break
                 time.sleep(1)
