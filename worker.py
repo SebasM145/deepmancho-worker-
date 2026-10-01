@@ -116,6 +116,13 @@ SET_TARGET_LUFS = -14.0
 
 GOLDEN_EXAM = os.environ.get("GOLDEN_EXAM", "true").lower() != "false"
 ENABLE_ANCHOR_BACKFILL = os.environ.get("ENABLE_ANCHOR_BACKFILL", "").lower() == "true"
+EXAMEN_CM2_APROBADO = False  # lo fija main() con el resultado de golden_exam()
+
+
+def cm2_habilitado() -> bool:
+    """CM2 escribe anclas solo con la variable Y el examen golden aprobado en este
+    arranque (7.5.3). Antes bastaba la variable: el examen no bloqueaba nada."""
+    return ENABLE_ANCHOR_BACKFILL and EXAMEN_CM2_APROBADO
 ENABLE_MIX_V7 = os.environ.get("ENABLE_MIX_V7", "0") == "1"  # v7.1 MIX-IN/OUT refutados: apagados por default
 ANCHOR_SR = 22050    # SR del análisis de ancla (independiente del SR=11025 general)
 ANCHOR_HOP = 128     # ~5.8 ms por frame de onset a 22050 Hz
@@ -1340,9 +1347,36 @@ def compute_anchor(path: str, bpm: float):
                 n_kicks=int(len(pk)))
 
 
-def rendition_url(track_id: str) -> str:
+def rendition_url(track_id: str, formato: str = "aac") -> str:
     """URL del MISMO audio que reproduce el navegador (stream-track)."""
-    return f"{WORKER_API_URL}/stream-track?track_id={track_id}&format=aac"
+    return f"{WORKER_API_URL}/stream-track?track_id={track_id}&format={formato}"
+
+
+def descargar_rendicion(track_id: str) -> str:
+    """Baja la rendition de stream-track a un temporal y devuelve su ruta.
+    Manda x-worker-secret: sin el, stream-track responde 401 (antes 404) y CM2
+    fallaba en cada tema. La extension sale del content-type real (m4a o mp3).
+    Si el m4a legado no esta en el Storage (stream-track da 502, issue #35 de la
+    plataforma), pide la otra rendicion del mismo tema: el MP3."""
+    cab = {"x-worker-secret": WORKER_SECRET}
+    r = requests.get(rendition_url(track_id), headers=cab, timeout=180)
+    if r.status_code >= 500:
+        r = requests.get(rendition_url(track_id, "mp3"), headers=cab, timeout=180)
+    r.raise_for_status()
+    suf = ".m4a" if "mp4" in r.headers.get("content-type", "") else ".mp3"
+    tmp = tempfile.NamedTemporaryFile(suffix=suf, delete=False)
+    tmp.write(r.content)
+    tmp.close()
+    return tmp.name
+
+
+def ancla_de_rendicion(track_id: str, bpm: float) -> dict:
+    """compute_anchor sobre la rendition; el temporal se borra aunque falle."""
+    ruta = descargar_rendicion(track_id)
+    try:
+        return compute_anchor(ruta, bpm)
+    finally:
+        os.remove(ruta)
 
 
 def _wrap(x: float, T: float) -> float:
@@ -1357,13 +1391,7 @@ def golden_exam():
     resultados = {}
     for i, (tid, title, bpm, gold) in enumerate(GOLDEN_TRACKS):
         try:
-            url = rendition_url(tid)
-            r = requests.get(url, timeout=180)
-            r.raise_for_status()
-            tmp = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
-            tmp.write(r.content); tmp.close()
-            res = compute_anchor(tmp.name, bpm)
-            os.remove(tmp.name)
+            res = ancla_de_rendicion(tid, bpm)
             res["gold"] = gold; res["bpm"] = bpm
             resultados[i] = res
             flag = " ⚠ residuo alto" if res["residuo_ms"] > 8 else ""
@@ -1386,12 +1414,7 @@ def golden_exam():
               f"error {err:+.1f} ms {'✅' if ok else '❌'}", flush=True)
     for tid, title, bpm in BLIND_TRACKS:
         try:
-            r = requests.get(rendition_url(tid), timeout=180)
-            r.raise_for_status()
-            tmp = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
-            tmp.write(r.content); tmp.close()
-            res = compute_anchor(tmp.name, bpm)
-            os.remove(tmp.name)
+            res = ancla_de_rendicion(tid, bpm)
             print(f"[CM2 CIEGA] {title}: ancla={res['ancla_ms']}ms "
                   f"bpm_real={res['bpm_real']} residuo={res['residuo_ms']}ms", flush=True)
         except Exception as e:
@@ -1543,16 +1566,11 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
         # CM2 (solo con ENABLE_ANCHOR_BACKFILL=true y examen aprobado): ancla de
         # precision sobre la RENDITION (lo que oye el DJ), nunca sobre el master.
         # Escribe SOLO first_beat_detected_ms; jamas first_beat_offset_ms ni _source.
-        if ENABLE_ANCHOR_BACKFILL:
+        if cm2_habilitado():
             try:
                 bpm_ref = track.get("bpm") or result.get("bpm")
                 if bpm_ref and 40 < float(bpm_ref) < 240:
-                    rr = requests.get(rendition_url(track_id), timeout=180)
-                    rr.raise_for_status()
-                    rtmp = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
-                    rtmp.write(rr.content); rtmp.close()
-                    anc = compute_anchor(rtmp.name, float(bpm_ref))
-                    os.remove(rtmp.name)
+                    anc = ancla_de_rendicion(track_id, float(bpm_ref))
                     if anc["residuo_ms"] <= 8:
                         result["first_beat_detected_ms"] = int(round(anc["ancla_ms"]))
                         print(f"[job {job_id}] CM2 ancla={anc['ancla_ms']}ms residuo={anc['residuo_ms']}ms", flush=True)
@@ -1854,12 +1872,13 @@ def liberar_memoria():
 
 
 def main():
-    print("DeepMancho worker iniciado (v7.5.1: HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.5.3: CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
+    global EXAMEN_CM2_APROBADO
     if GOLDEN_EXAM:
         try:
-            golden_exam()
+            EXAMEN_CM2_APROBADO = bool(golden_exam())
         except Exception:
             traceback.print_exc()
             print("[CM2 EXAMEN] el examen fallo pero el worker sigue normal", flush=True)
