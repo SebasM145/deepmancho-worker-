@@ -20,4 +20,14 @@ RUN pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requir
 RUN python -c "from demucs.pretrained import get_model; get_model('htdemucs_6s'); get_model('htdemucs')"
 
 COPY stems_worker.py .
+
+# v1.23 motor híbrido: APAGADO por defecto (STEMS_ENGINE sin definir = demucs).
+# Código y pesos (~1,1 GB) se bajan la primera vez que un trabajo lo pide, a HIBRIDO_DIR.
+# Para meterlos en la imagen: --build-arg PRECARGAR_HIBRIDO=1 (la imagen crece ~1,1 GB).
+ENV HIBRIDO_DIR=/models/hibrido
+ARG PRECARGAR_HIBRIDO=0
+RUN if [ "$PRECARGAR_HIBRIDO" = "1" ]; then \
+      WORKER_API_URL=http://build WORKER_SECRET=build python -c "import stems_worker as s; s.asegurar_hibrido(verificar=True)"; \
+    fi
+
 CMD ["python", "-u", "stems_worker.py"]
