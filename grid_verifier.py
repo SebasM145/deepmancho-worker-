@@ -41,6 +41,7 @@ import urllib.request
 
 import numpy as np
 
+# Railway solo despliega pushes de un solo padre (squash); los merge commits no disparan nada.
 VERSION = "1.1.2-py"
 MIXER_SOURCE_COMMIT = "11f31dbf"
 
