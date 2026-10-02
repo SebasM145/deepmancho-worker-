@@ -51,6 +51,8 @@ def render(monkeypatch, audios, transiciones):
     pcm = {f"http://audio/{tid}": a for (tid, _), a in zip(audios, AUDIOS[0])}
 
     class R:
+        status_code = 200
+
         def __init__(self, url):
             self.content = url.encode()
 
@@ -173,3 +175,30 @@ def test_sin_plan_usa_el_metodo_anterior(monkeypatch):
     monkeypatch.setattr(worker, "_masterizar_y_subir", lambda s, d, u, r: 0.0)
     worker.render_set({"spec": {}}, [{"id": "a"}, {"id": "b"}], "u", "r")
     assert "si" in llamado
+
+
+def test_sin_estirar_pasa_con_eco(monkeypatch, capsys):
+    """Revisión del integrador: si no se puede igualar el tempo, nunca cruzar dos tempos."""
+    con_audios(golpes(124, 40, 440), golpes(126, 30, 1500))
+    monkeypatch.setattr(worker, "_estirar_pcm", lambda x, tempo, d: None)
+    plan = transicion("mezcla", salida_seg=20.0, duracion_seg=8.0, rate=124 / 126, release_seg=4.0)
+    sal, tl = render(monkeypatch, [("a", 124), ("b", 126)], [plan])
+    assert "pasa con eco" in capsys.readouterr().out
+    assert tl[1]["start_seconds"] == pytest.approx(20.0, abs=1e-3)
+    assert len(sal) == pytest.approx((20 + 30) * SR, abs=2)      # la entrante entera, sin estirar
+
+
+def test_descarga_fallida_sin_url_firmada(monkeypatch, tmp_path):
+    class R:
+        status_code = 403
+
+    monkeypatch.setattr(worker.requests, "get", lambda url, timeout=None: R())
+    with pytest.raises(RuntimeError) as e:
+        worker._bajar_tema("https://x.supabase.co/storage/v1/object/sign/music/a.mp3?token=eyJsecreto", str(tmp_path / "a"))
+    assert "eyJ" not in str(e.value) and "403" in str(e.value) and "x.supabase.co" in str(e.value)
+
+
+def test_sin_firmas():
+    msg = "404 for url: https://x.supabase.co/storage/v1/object/sign/a.mp3?token=eyJabc&x=1 al bajar"
+    limpio = worker._sin_firmas(msg)
+    assert "eyJ" not in limpio and "https://x.supabase.co/storage/v1/object/sign/a.mp3?…" in limpio

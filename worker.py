@@ -1723,6 +1723,21 @@ def _cue(cues, label, default=None):
     return default
 
 
+def _bajar_tema(url, dest):
+    """Baja el audio de un tema del set. Si falla, el error dice solo el codigo y el
+    host: la URL firmada (con su token) no llega al log ni a set_render_jobs.error."""
+    from urllib.parse import urlsplit
+    host = urlsplit(url or "").hostname or "?"
+    try:
+        r = requests.get(url, timeout=300)
+    except requests.RequestException as e:
+        raise RuntimeError(f"descarga fallida ({type(e).__name__}) desde {host}") from None
+    if r.status_code >= 400:
+        raise RuntimeError(f"descarga fallida (HTTP {r.status_code}) desde {host}")
+    with open(dest, "wb") as f:
+        f.write(r.content)
+
+
 def _mezcla_libre(tracks, tmpdir):
     """Metodo anterior (sin plan): tempo unico del set, cruces de XFADE_BARS sobre los cues
     MIX-IN/MIX-OUT. Solo para trabajos sin `spec.transiciones` (sets viejos)."""
@@ -1732,11 +1747,8 @@ def _mezcla_libre(tracks, tmpdir):
     for i, tr in enumerate(tracks):
         titulo = tr.get("title") or "?"
         print(f"  [{i+1}/{len(tracks)}] {titulo}", flush=True)
-        r = requests.get(tr["audio_url"], timeout=300)
-        r.raise_for_status()
         p = os.path.join(tmpdir, f"{i}.audio")
-        with open(p, "wb") as f:
-            f.write(r.content)
+        _bajar_tema(tr.get("audio_url"), p)
 
         bpm_tr = float(tr.get("bpm") or 0) + float(tr.get("bpm_fine") or 0)
         if not bpm_tr:
@@ -1925,7 +1937,12 @@ def _estirar_pcm(x, tempo, tmpdir):
             return np.frombuffer(out, dtype=np.float32).reshape(-1, 2).copy()
         except subprocess.CalledProcessError:
             continue
-    return x
+    print(f"    ⚠ no se pudo estirar a tempo {tempo:.4f} (ni rubberband ni atempo)", flush=True)
+    return None
+
+
+class SinEstirar(RuntimeError):
+    """La entrante no se pudo igualar al tempo de la saliente."""
 
 
 def _unir(a, b, n=int(0.01 * SET_SR)):
@@ -1951,6 +1968,8 @@ def linea_entrante(audio, entrada_seg, dur_seg, rate, release_seg, tmpdir):
     n2 = int(rel * medio * sr)
     tramo1 = _estirar_pcm(audio[pos:pos + n1], rate, tmpdir)
     tramo2 = _estirar_pcm(audio[pos + n1:pos + n1 + n2], medio, tmpdir)
+    if tramo1 is None or tramo2 is None:
+        raise SinEstirar(f"rate {rate:.4f}")
     resto = audio[pos + n1 + n2:]
     pcm = _unir(_unir(tramo1, tramo2), resto)
     tramos = [(entrada_seg, 0.0, rate),
@@ -2005,11 +2024,8 @@ def _mezcla_plan(tracks, transiciones, tmpdir):
     ini_linea, tramos_linea = 0, [(0.0, 0.0, 1.0)]  # donde arranca la linea del tema actual
     for i, tr in enumerate(tracks):
         print(f"  [{i+1}/{len(tracks)}] {tr.get('title') or '?'}", flush=True)
-        r = requests.get(tr["audio_url"], timeout=300)
-        r.raise_for_status()
         p = os.path.join(tmpdir, f"{i}.audio")
-        with open(p, "wb") as f:
-            f.write(r.content)
+        _bajar_tema(tr.get("audio_url"), p)
         audio = _decode_pcm(p)
         if i == 0:
             salida = audio
@@ -2030,8 +2046,15 @@ def _mezcla_plan(tracks, transiciones, tmpdir):
 
         if tipo == "mezcla":
             dur = max(0.0, _num(t.get("duracion_seg"), 0.0))
-            linea, tramos = linea_entrante(audio, entrada, dur, _num(t.get("rate")),
-                                           _num(t.get("release_seg"), 0.0), tmpdir)
+            try:
+                linea, tramos = linea_entrante(audio, entrada, dur, _num(t.get("rate")),
+                                               _num(t.get("release_seg"), 0.0), tmpdir)
+            except SinEstirar as e:
+                # Como el planificador: dos tempos distintos nunca se cruzan sin igualar.
+                # Sin estirar, la transicion pasa con eco en el mismo downbeat.
+                print(f"    ⚠ mezcla sin igualar tempo ({e}): pasa con eco", flush=True)
+                tipo = "eco"
+        if tipo == "mezcla":
             n = max(1, min(int(dur * sr), len(linea), len(salida) - corte))
             x = np.linspace(0.0, 1.0, n)
             g_out, g_in = ganancias_mezcla(x, _num(t.get("asimetria"), 0.6))
@@ -2091,6 +2114,12 @@ def _tl(tr):
             "label": tr.get("label")}
 
 
+def _sin_firmas(texto):
+    """Quita el query string (token de las URLs firmadas) de un mensaje de error."""
+    import re
+    return re.sub(r"(https?://[^\s?'\"]+)\?[^\s'\"]*", r"\1?…", texto)
+
+
 def poll_set_render():
     """Busca un job de render de set y lo procesa. Devuelve True si hizo algo."""
     try:
@@ -2111,7 +2140,7 @@ def poll_set_render():
     except Exception as e:
         traceback.print_exc()
         try:
-            _set_api("fail", {"job_id": job["id"], "error": str(e)[:2000]})
+            _set_api("fail", {"job_id": job["id"], "error": _sin_firmas(str(e))[:2000]})
         except Exception:
             pass
     return True
@@ -2130,7 +2159,7 @@ def liberar_memoria():
 
 
 def main():
-    print("DeepMancho worker iniciado (v7.5.3: CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.6: el set sigue el plan del DJ; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     global EXAMEN_CM2_APROBADO

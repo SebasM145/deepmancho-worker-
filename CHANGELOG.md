@@ -9,6 +9,8 @@
   - ganancias equal-power con `asimetria`; graves con shelf de 120 Hz (swap −12 dB en `graves_swap_en`, o −6 → 0 dB sin swap);
   - eco a tempo (1 beat, realimentación 0,45, cola de 8 beats); corte y encadenado (al final útil si `salida_seg` es null).
 - Si `spec.transiciones` no coincide con los temas (orden, cantidad o tipo), usa el método anterior: los sets viejos no cambian.
+- Si una mezcla no se puede igualar en tempo (fallan rubberband y atempo), lo avisa en el log y esa transición pasa con eco en el mismo compás: nunca se cruzan dos tempos sin igualar, igual que en el planificador.
+- Una descarga que falla deja solo el código HTTP y el host: la URL firmada no llega al log ni a `set_render_jobs.error`.
 - El temporal `dm_set_*` se borra siempre (antes nunca se borraba).
 - Sigue apagado si `ENABLE_SET_RENDER` no está en Railway.
 - Pruebas: `tests/test_set_plan.py` (corte, encadenado, eco, mezcla con temas sintéticos a 124 y 126 BPM: la entrante suena a 124 durante la mezcla).
