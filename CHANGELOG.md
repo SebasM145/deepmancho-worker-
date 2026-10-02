@@ -2,6 +2,12 @@
 
 
 
+## 7.6.3 (2-oct-2026) — GÉNERO DETECTADO, ETAPA A: ETIQUETAS
+- Para la subida sin ordenar (~1.000 temas; cada género alimenta su emisora): el análisis lee la etiqueta de género del **original** (ID3 `TCON`, Vorbis, MP4) con ffmpeg y la lleva al nombre de Beatport que usa la Biblioteca.
+- Envía `genre_detected`, `genre_confidence` y `genre_source='etiqueta'` por worker-result. Confianza 0,95 si el género se reconoce; 0,6 si no lo conocemos (se respeta); 0,3 si es demasiado amplio («Electronic», «Dance»). Con menos de 0,7, o sin etiqueta, suma la bandera `genero_por_revisar` a `analysis_flags`.
+- La etapa B (clasificador por audio para los temas sin etiqueta) llega con el catálogo etiquetado.
+- Pruebas: `tests/test_genero.py`. Con los 7 temas del golden set: 7 de 7 leídos.
+
 ## Espera creciente en los tres workers (30-sep-2026) — W2 · stems_worker 1.22.4
 - Con la cola vacía, la espera arranca en `POLL_INTERVAL_SECONDS`, se duplica en cada vuelta sin trabajo hasta `POLL_MAX_SECONDS` y vuelve al inicio apenas llega un trabajo. Los errores de red también esperan más, con ±20 % para que las réplicas no choquen.
 - Topes: análisis y stems 120 s; verificador 300 s (nadie lo espera en pantalla).
