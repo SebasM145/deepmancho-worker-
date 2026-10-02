@@ -96,4 +96,5 @@ def test_error_a_la_base_sin_firma(enviados):
 
 def test_codigo_error_del_verificador_sin_firma():
     assert "eyJ" not in grid_verifier.codigo_error(RuntimeError(f"HTTP Error 403 for {URL}"))
-    assert grid_verifier.codigo_error(RuntimeError("no_anchor")) == "determinista:no_anchor"
+    assert grid_verifier.codigo_error(RuntimeError("no_anchor")) == "esperando_analisis:no_anchor"  # carrera, #14
+    assert grid_verifier.codigo_error(RuntimeError("too_short")) == "determinista:too_short"

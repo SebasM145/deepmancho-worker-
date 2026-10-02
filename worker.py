@@ -901,7 +901,12 @@ class AudioMudo(Exception):
 
 
 SILENCIO_PICO = 1e-4      # ~ -80 dBFS
-TOPE_ANALISIS_S = 600     # un analisis nunca puede tomar mas de 10 min
+# Tope de un TRABAJO completo (descarga + analisis + CM2 + rendicion + master + subidas).
+# Tiene que quedar por debajo del plazo de claim_analysis_job (8 min): si no, con
+# varias replicas un tema lento lo toma otra replica a la vez (doble trabajo).
+TOPE_TRABAJO_S = int(float(os.environ.get("TOPE_TRABAJO_S", "420")))
+# Tope de descarga del original (MB): se baja por partes a disco, nunca entero a RAM.
+MAX_TRACK_MB = int(float(os.environ.get("MAX_TRACK_MB", "250")))
 
 
 def entero_js(x: float) -> int:
@@ -1652,13 +1657,32 @@ def detectar_genero(path: str) -> dict:
     return out
 
 
+class ArchivoMuyGrande(RuntimeError):
+    """El original supera MAX_TRACK_MB: no se baja (protege la RAM de la replica)."""
+
+
 def download_audio(audio_url: str) -> str:
-    r = requests.get(audio_url, timeout=120)
-    r.raise_for_status()
+    """Baja el original a un temporal, por partes y con tope de MAX_TRACK_MB."""
+    tope = MAX_TRACK_MB * 1024 * 1024
     ext = os.path.splitext(audio_url.split("?")[0])[1] or ".audio"
-    tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
-    tmp.write(r.content)
-    tmp.close()
+    with requests.get(audio_url, timeout=120, stream=True) as r:
+        r.raise_for_status()
+        largo = int(r.headers.get("content-length") or 0)
+        if largo > tope:
+            raise ArchivoMuyGrande(f"archivo de {largo // (1024 * 1024)} MB (tope {MAX_TRACK_MB} MB)")
+        tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+        n = 0
+        try:
+            for parte in r.iter_content(chunk_size=1024 * 1024):
+                n += len(parte)
+                if n > tope:
+                    raise ArchivoMuyGrande(f"archivo de mas de {MAX_TRACK_MB} MB")
+                tmp.write(parte)
+        except BaseException:
+            tmp.close()
+            os.remove(tmp.name)
+            raise
+        tmp.close()
     return tmp.name
 
 
@@ -1684,22 +1708,20 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
         if not audio_url:
             send_result(job_id, track_id, "error", error="track sin audio")
             return
-        tmp = download_audio(audio_url)
-        # Tope por trabajo: si algo se cuelga, falla este tema y la replica sigue con la cola.
+        # Tope por TRABAJO completo (no solo el analisis): por debajo del plazo de 8 min del
+        # claim, asi ninguna otra replica lo retoma mientras este sigue (carga con 5 replicas).
         import signal
         def _tope(_s, _f):
-            raise TimeoutError(f"analisis mas largo que {TOPE_ANALISIS_S // 60} min (se corta para no trabar la cola)")
+            raise TimeoutError(f"trabajo mas largo que {TOPE_TRABAJO_S // 60} min (se corta para no trabar la cola)")
         signal.signal(signal.SIGALRM, _tope)
-        signal.alarm(TOPE_ANALISIS_S)
+        signal.alarm(TOPE_TRABAJO_S)
+        tmp = download_audio(audio_url)
         try:
             result = analyze(tmp, bpm_seed=track.get("bpm"))
         except AudioMudo as e:
-            signal.alarm(0)
             send_result(job_id, track_id, "done", result={"pista_vacia": True, "analysis_flags": ["silencio"]})
             print(f"[job {job_id}] {e}: marcada como pista vacía", flush=True)
             return
-        finally:
-            signal.alarm(0)
         # CM1-bis: loudness restaurado (la v5 lo habia perdido — regresion detectada 18-ago)
         # Genero (antes de convertir: las etiquetas viven en el original).
         try:
@@ -1773,6 +1795,8 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
         n_cues = len(result.get("cue_points") or [])
         print(f"[job {job_id}] OK — cues={n_cues} energy={result['energy']}", flush=True)
     except Exception as e:
+        import signal
+        signal.alarm(0)  # que el tope no corte el aviso de error
         traceback.print_exc()
         try:
             send_result(job_id, track_id, "error", error=str(e))
@@ -1780,6 +1804,8 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
             pass
         print(f"[job {job_id}] FALLO: {e}", flush=True)
     finally:
+        import signal
+        signal.alarm(0)
         if tmp and os.path.exists(tmp):
             try:
                 os.remove(tmp)
@@ -2416,7 +2442,7 @@ def liberar_memoria():
 
 def main():
     filtrar_salida()
-    print("DeepMancho worker iniciado (v7.6: el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.6.3: genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     global EXAMEN_CM2_APROBADO

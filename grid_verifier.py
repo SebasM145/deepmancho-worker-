@@ -41,7 +41,7 @@ import urllib.request
 
 import numpy as np
 
-VERSION = "1.1.1-py"
+VERSION = "1.1.2-py"
 MIXER_SOURCE_COMMIT = "11f31dbf"
 
 # ── Constantes (idénticas a gridVerify.ts) ───────────────────────────────────
@@ -371,7 +371,12 @@ def decode_file(path: str):
 # Errores que dan lo mismo en cada intento: se reportan como `determinista:<código>`
 # para que la plataforma no vuelva a encolar el trabajo (W4, 30-sep-2026: el 100 %
 # de los fallos del día eran estos, repetidos 3 veces por tema).
-DETERMINISTAS = ("no_bpm", "no_anchor", "too_short", "no_fit", "bad_measurement")
+# `no_anchor` NO es determinista: es una carrera. El trabajo se encola al subir el tema,
+# antes de que el analisis escriba el ancla, y se vuelve a encolar cuando el analisis
+# termina (registros del 2-oct: b28519e5 no_anchor 04:26:20 -> analizado 04:26:24 ->
+# trabajo nuevo 04:27:24). Se reporta como `esperando_analisis` para que nunca quede
+# cerrado para siempre.
+DETERMINISTAS = ("no_bpm", "too_short", "no_fit", "bad_measurement")
 MIN_DURACION_S = 30
 
 # Los mismos rangos que valida grid-verify-result: fuera de ellos responde 400
@@ -416,6 +421,8 @@ def medida_invalida(payload: dict) -> str | None:
 def codigo_error(e: Exception) -> str:
     """Texto que se reporta: los deterministas llevan el prefijo `determinista:`."""
     err = sin_firma(e)[:500]
+    if err == "no_anchor":
+        return "esperando_analisis:no_anchor"
     return f"determinista:{err}" if err in DETERMINISTAS else err
 
 
