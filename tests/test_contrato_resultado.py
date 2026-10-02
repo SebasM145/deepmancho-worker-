@@ -57,8 +57,7 @@ def test_tempo(resultado):
     assert numero(resultado["bpm"], 40, 240)
     assert numero(resultado["bpm_precise"], 40, 240)
     assert numero(resultado["bpm_fine"], -1, 1)
-    # Tempo efectivo = bpm entero + bpm_fine (así lo guarda worker-result).
-    assert round(resultado["bpm"]) + resultado["bpm_fine"] == pytest.approx(resultado["bpm_precise"], abs=0.01)
+    # Que round(bpm) + bpm_fine == bpm_precise lo prueba tests/test_tempo_coherente.py (PR #10).
     assert resultado["bpm_precise"] == pytest.approx(124, abs=0.05)
     assert resultado["tempo_stability"] in ("constante", "variable", "desconocido")
     assert numero(resultado["tempo_residual_ms"], 0, 10000)
