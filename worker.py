@@ -2060,7 +2060,7 @@ def _mezcla_plan(tracks, transiciones, tmpdir):
                 salida = np.vstack([salida[:corte], linea])
             print(f"    {tipo} en {corte/sr/60:.1f} min ({t.get('razon') or 'sin razon'})", flush=True)
 
-        tracklist.append({"position": i + 1, "start_seconds": int(corte / sr), **_tl(tr)})
+        tracklist.append({"position": i + 1, "start_seconds": round(corte / sr, 3), **_tl(tr)})
         ini_linea, tramos_linea = corte, tramos
     return salida, tracklist
 

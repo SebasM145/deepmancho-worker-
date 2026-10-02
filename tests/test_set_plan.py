@@ -115,7 +115,7 @@ def test_seg_en_linea():
 def test_corte_entra_justo_en_el_compas(monkeypatch):
     con_audios(golpes(124, 40, 440), golpes(124, 30, 1500))
     sal, tl = render(monkeypatch, [("a", 124), ("b", 124)], [transicion("corte", salida_seg=20.0)])
-    assert tl[1]["start_seconds"] == 20
+    assert tl[1]["start_seconds"] == pytest.approx(20.0, abs=1e-3)  # con milisegundos (P2 de #75)
     assert len(sal) == pytest.approx((20 + 30) * SR, abs=2)
     b = energia_en(sal, 1500, 20.1, 25)
     assert energia_en(sal, 1500, 0, 19.9) < b * 1e-4
@@ -125,14 +125,14 @@ def test_corte_entra_justo_en_el_compas(monkeypatch):
 def test_encadenado_al_final_util(monkeypatch):
     con_audios(golpes(124, 30, 440, silencio_final_s=5), golpes(124, 10, 1500))
     sal, tl = render(monkeypatch, [("a", 124), ("b", 124)], [transicion("encadenado", salida_seg=None)])
-    assert tl[1]["start_seconds"] in (29, 30)                   # no espera los 5 s de silencio
+    assert 29.4 < tl[1]["start_seconds"] < 30.0  # tras el último golpe, sin los 5 s de silencio                   # no espera los 5 s de silencio
     assert len(sal) < 41 * SR
 
 
 def test_eco_deja_cola_a_tempo(monkeypatch):
     con_audios(golpes(120, 40, 440), golpes(120, 30, 1500))
     sal, tl = render(monkeypatch, [("a", 120), ("b", 120)], [transicion("eco", salida_seg=20.0)])
-    assert tl[1]["start_seconds"] == 20
+    assert tl[1]["start_seconds"] == pytest.approx(20.0, abs=1e-3)
     cola = energia_en(sal, 440, 20.5, 22)                       # repeticiones del eco
     assert cola > 0
     assert energia_en(sal, 440, 26, 50) < cola * 0.05            # se apaga en ~8 beats (4 s)
@@ -147,7 +147,7 @@ def test_mezcla_iguala_tempo_y_respeta_el_plan(monkeypatch):
                       graves_swap=True, graves_swap_en=0.5)
     sal, tl = render(monkeypatch, [("a", 124), ("b", 126)], [plan])
     dur = plan["duracion_seg"]
-    assert tl[1]["start_seconds"] == 30
+    assert tl[1]["start_seconds"] == pytest.approx(30.0, abs=1e-3)
     a, b = energia_en(sal, 440, 0, 29.9), energia_en(sal, 1500, 30 + dur + 0.1, 30 + dur + 5)
     assert energia_en(sal, 1500, 0, 29.9) < b * 1e-4              # antes del plan no suena la entrante
     assert energia_en(sal, 440, 30 + dur + 0.1, 30 + dur + 5) < a * 1e-4   # después solo la entrante
