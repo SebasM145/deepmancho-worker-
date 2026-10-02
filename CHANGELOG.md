@@ -1,12 +1,13 @@
 # Historial de versiones · worker.py (análisis)
 
-## grid_detect (2-oct-2026) — TEMPO CORRECTO SIN BPM PREVIO
+## 7.5.4 (2-oct-2026) — TEMPO CORRECTO SIN BPM PREVIO
 - Un tema que llega sin BPM (sin etiqueta) toma el tempo de `detect_tempo`. La semilla de librosa sale cuantizada (a 11025 Hz y hop 512: 99,4 · 107,7 · 117,5 · 129,2 · 143,6…) y la búsqueda era de ±4 BPM alrededor de ella, así que **121,5–125,1 y 133,2–139,5 BPM no se podían encontrar**. Un tema de 124 salía 125,3; uno de 135, 125,3; uno de 6 min a 124, 128,7.
 - En producción se veía como `v7 bpm 121.42 → 121.44 (resid 104.9 ms, variable)`: el tempo pegado al borde de la búsqueda y la rejilla marcada como «variable».
 - Ahora la búsqueda gruesa es de ±8 % de la semilla (mínimo ±4 BPM), que cubre el salto entre dos valores vecinos hasta ~180 BPM. Cuesta ~30 % más en ese paso (20 s → 26 s en un tema de 6 min).
 - No cambia nada para los temas con BPM previo: el v7 sigue afinando alrededor de ese BPM.
-- **Tempo efectivo coherente** (`worker.py`): con BPM sembrado (reanálisis o tema con BPM sin bloquear), `analyze` mandaba el `bpm` de `detect_grid` —que ignora la semilla— junto al `bpm_fine` calculado sobre la semilla. `worker-result` guarda `round(bpm) + bpm_fine`: con semilla 124 y detección 125,26 quedaba 125,009 en vez de 124,009. Ahora, si el v7 afina el tempo, `bpm` es el entero de la referencia.
-- Pruebas: `tests/test_tempo_sin_semilla.py` (4 de 8 fallan con el código anterior) y `tests/test_tempo_coherente.py`.
+- **Tempo efectivo coherente** (`worker.py`): `bpm_fine` se calcula contra el mismo entero que usa `worker-result`. Sin BPM previo, ese entero es `Math.round(bpm)` de JS, que redondea ,5 hacia arriba; el `round` de Python redondea al par (124,5 → 124 aquí y 125 allá), y el tempo guardado quedaba 1 BPM corrido.
+- **Con BPM bloqueado** (etiqueta, manual o `bpm_tag`; es el único caso en que `worker-next` manda semilla), `bpm` sigue siendo la medida propia de `detect_grid`. `worker-result` no toca el entero bloqueado: usa `bpm_precise` para el decimal y compara `bpm` con la etiqueta para la bandera `bpm_etiqueta_difiere`. Un primer intento de este PR mandaba el entero de la semilla y apagaba esa bandera para siempre (lo vio el integrador).
+- Pruebas: `tests/test_tempo_sin_semilla.py` (4 de 8 fallan con el código anterior) y `tests/test_tempo_coherente.py` (replica `decidirTempo` y la bandera de `worker-result`).
 
 
 
