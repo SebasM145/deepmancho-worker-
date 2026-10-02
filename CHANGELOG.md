@@ -2,6 +2,13 @@
 
 
 
+## 7.6.1 (2-oct-2026) — COPIAS DE ESCUCHA SIN ETIQUETAS (#265, privacidad)
+- La copia de escucha (MP3 192k) se genera **sin metadatos** (`-map_metadata -1`, sin ID3v1/ID3v2, sin capítulos) y **sin portada embebida** (`-map 0:a:0`). La radio y el catálogo la sirven a anónimos, y el visitante nunca debe ver el título ni el artista reales.
+- El master MP3 320k de descarga (dueño o comprador) conserva sus etiquetas.
+- **Reproceso de las copias existentes**, en tandas por la cola `stream-limpiar` (`next` / `result` / `fail`): se baja la copia, se quitan las etiquetas **sin re-codificar** (mismo audio y mismo timeline: rejilla y cues siguen valiendo) y se sube a la **misma ruta**. El worker no escribe en la base. Corre solo con la cola de análisis vacía; si la función todavía no existe (404), se omite.
+- Medido con 3 copias reales de producción: traían `TIT2`; después, ninguna etiqueta, con la misma duración (393,64 → 393,64 s) y ~400 bytes menos.
+- Pruebas: `tests/test_stream_sin_etiquetas.py`.
+
 ## Espera creciente en los tres workers (30-sep-2026) — W2 · stems_worker 1.22.4
 - Con la cola vacía, la espera arranca en `POLL_INTERVAL_SECONDS`, se duplica en cada vuelta sin trabajo hasta `POLL_MAX_SECONDS` y vuelve al inicio apenas llega un trabajo. Los errores de red también esperan más, con ±20 % para que las réplicas no choquen.
 - Topes: análisis y stems 120 s; verificador 300 s (nadie lo espera en pantalla).

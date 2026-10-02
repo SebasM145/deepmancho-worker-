@@ -26,6 +26,7 @@ import math
 import random
 import json
 import tempfile
+import shutil
 import traceback
 import subprocess
 import gc
@@ -1471,15 +1472,24 @@ AUDIO_STANDARD = {
 MASTER_BITRATE = "320k"
 
 
-def make_rendition(src_path: str, bitrate: str = None, sufijo: str = ".stream"):
-    """Convierte al ESTANDAR de la plataforma (MP3 CBR 192k, o `bitrate`). Ruta o None."""
+# #265 (privacidad): la copia de ESCUCHA no lleva etiquetas (titulo, artista,
+# album, comentarios ni portada): la radio y el catalogo publico la sirven a
+# anonimos y el visitante nunca debe ver el nombre real. El master de DESCARGA
+# (MP3 320k para el dueno o el comprador) si conserva sus etiquetas.
+SIN_ETIQUETAS = ["-map_metadata", "-1", "-map_chapters", "-1", "-id3v2_version", "0",
+                 "-write_id3v1", "0", "-fflags", "+bitexact"]
+
+
+def make_rendition(src_path: str, bitrate: str = None, sufijo: str = ".stream", etiquetas: bool = False):
+    """Convierte al ESTANDAR de la plataforma (MP3 CBR 192k, o `bitrate`). Ruta o None.
+    `etiquetas=False` (escucha): sin metadatos ni portada. True: solo el master de descarga."""
     try:
         out = src_path + sufijo + AUDIO_STANDARD["ext"]
+        meta = ["-map_metadata", "0", "-id3v2_version", "3"] if etiquetas else SIN_ETIQUETAS
         proc = subprocess.run(
             ["ffmpeg", "-y", "-i", src_path,
-             "-vn",
-             "-map_metadata", "0",          # preserva titulo/artista/BPM/key
-             "-id3v2_version", "3",
+             "-map", "0:a:0", "-vn",        # solo el audio: la portada embebida no pasa
+             *meta,
              "-write_xing", "1",            # header Xing: duracion y seek fiables
              "-ar", AUDIO_STANDARD["sample_rate"],
              "-ac", AUDIO_STANDARD["channels"],
@@ -1597,7 +1607,7 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
         # Master MP3 320k (subidas masivas de WAV/AIFF/FLAC): worker-result cambia
         # audio_asset_path y borra el original solo despues de guardar la fila.
         if master_upload and master_upload.get("url") and master_upload.get("path") and track.get("needs_master_conversion"):
-            master = make_rendition(tmp, bitrate=MASTER_BITRATE, sufijo=".master")
+            master = make_rendition(tmp, bitrate=MASTER_BITRATE, sufijo=".master", etiquetas=True)
             if master:
                 if upload_rendition(master_upload["url"], master):
                     result["master_path"] = master_upload["path"]
@@ -1833,6 +1843,113 @@ def _tl(tr):
             "label": tr.get("label")}
 
 
+# ----------------------------------------------------------------------------
+# #265 · Limpieza de las copias de escucha ya subidas (en tandas, por la cola)
+# ----------------------------------------------------------------------------
+# Contrato con la plataforma (funcion `stream-limpiar`, x-worker-secret):
+#   POST ?action=next   -> {job: null} | {job: {id, track_id}, audio_url, upload: {url, path}}
+#                          audio_url = la copia de escucha actual (firmada);
+#                          upload    = la MISMA ruta, con upsert: la base no cambia.
+#   POST ?action=result -> {job_id, path, bytes}
+#   POST ?action=fail   -> {job_id, error}
+# Sin re-codificar: se copia el audio tal cual y solo se quitan las etiquetas, asi
+# que no se pierde calidad ni cambia el timeline (rejilla y cues siguen validos).
+# Si la funcion no existe todavia (404), el worker la ignora.
+LIMPIEZA_DISPONIBLE = True
+
+
+def tiene_etiquetas(path: str) -> bool:
+    """True si el archivo trae ID3v2 al principio, ID3v1 al final o atomos de texto MP4."""
+    with open(path, "rb") as f:
+        cab = f.read(10)
+        f.seek(0, os.SEEK_END)
+        n = f.tell()
+        f.seek(max(0, n - 128))
+        cola = f.read(128)
+        f.seek(0)
+        todo = f.read() if n < 64 * 1024 * 1024 else b""
+    if cab[:3] == b"ID3" or cola[:3] == b"TAG":
+        return True
+    return any(a in todo for a in (b"\xa9nam", b"\xa9ART", b"covr"))
+
+
+def limpiar_etiquetas(src: str, ext: str) -> str:
+    """Copia el audio sin etiquetas ni portada. Devuelve la ruta nueva (o lanza)."""
+    out = src + ".limpio" + ext
+    fmt = ["-f", "mp3"] if ext == ".mp3" else ["-f", "ipod", "-movflags", "+faststart"]
+    proc = subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-i", src, "-map", "0:a:0", "-c:a", "copy",
+         *SIN_ETIQUETAS, *(["-write_xing", "1"] if ext == ".mp3" else []), *fmt, out],
+        capture_output=True, timeout=180)
+    if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
+        raise RuntimeError(f"ffmpeg no pudo limpiar ({proc.returncode})")
+    if tiene_etiquetas(out):
+        raise RuntimeError("la copia limpia todavia tiene etiquetas")
+    return out
+
+
+def _limpiar_api(action, payload=None):
+    r = requests.post(f"{WORKER_API_URL}/stream-limpiar?action={action}", headers=HEADERS,
+                      json=payload or {}, timeout=60)
+    if r.status_code == 404 and action == "next":
+        return None
+    r.raise_for_status()
+    return r.json()
+
+
+def poll_limpiar_streams() -> bool:
+    """Toma una copia de escucha de la cola, le quita las etiquetas y la vuelve a subir
+    en la misma ruta. True si hizo algo. No escribe en la base: la funcion guarda el resultado."""
+    global LIMPIEZA_DISPONIBLE
+    if not LIMPIEZA_DISPONIBLE:
+        return False
+    try:
+        data = _limpiar_api("next")
+    except Exception as e:
+        print(f"[limpiar-stream] no disponible: {type(e).__name__}", flush=True)
+        return False
+    if data is None:
+        LIMPIEZA_DISPONIBLE = False  # la funcion no existe: no se vuelve a preguntar hasta reiniciar
+        print("[limpiar-stream] la funcion stream-limpiar no existe todavia: se omite", flush=True)
+        return False
+    job = data.get("job")
+    if not job:
+        return False
+    up = data.get("upload") or {}
+    path = up.get("path") or ""
+    ext = ".m4a" if path.lower().endswith((".m4a", ".mp4", ".aac")) else ".mp3"
+    tmp = os.path.join(tempfile.mkdtemp(prefix="dm_limpiar_"), "in" + ext)
+    try:
+        r = requests.get(data.get("audio_url"), timeout=120)
+        if r.status_code >= 400:
+            raise RuntimeError(f"descarga fallida (HTTP {r.status_code})")
+        with open(tmp, "wb") as f:
+            f.write(r.content)
+        if tiene_etiquetas(tmp):
+            limpio = limpiar_etiquetas(tmp, ext)
+            with open(limpio, "rb") as f:
+                put = requests.put(up["url"], data=f, timeout=300,
+                                   headers={"Content-Type": "audio/mpeg" if ext == ".mp3" else "audio/mp4",
+                                            "x-upsert": "true"})
+            if put.status_code >= 400:
+                raise RuntimeError(f"subida fallida (HTTP {put.status_code})")
+            n = os.path.getsize(limpio)
+            print(f"[limpiar-stream] {job['track_id']}: sin etiquetas ({n} bytes)", flush=True)
+        else:
+            n = os.path.getsize(tmp)
+            print(f"[limpiar-stream] {job['track_id']}: ya estaba limpia", flush=True)
+        _limpiar_api("result", {"job_id": job["id"], "path": path, "bytes": n})
+    except Exception as e:
+        print(f"[limpiar-stream] {job.get('track_id')}: fallo ({str(e)[:200]})", flush=True)
+        try:
+            _limpiar_api("fail", {"job_id": job["id"], "error": str(e)[:500]})
+        except Exception:
+            pass
+    finally:
+        shutil.rmtree(os.path.dirname(tmp), ignore_errors=True)
+    return True
+
+
 def poll_set_render():
     """Busca un job de render de set y lo procesa. Devuelve True si hizo algo."""
     try:
@@ -1905,6 +2022,11 @@ def main():
                 idle = 0
                 espera.trabajo()
                 liberar_memoria()
+                continue
+            # #265: con la cola vacia, limpiar etiquetas de copias de escucha viejas.
+            if poll_limpiar_streams():
+                idle = 0
+                espera.trabajo()
                 continue
             idle += 1
             if idle % 12 == 1:
