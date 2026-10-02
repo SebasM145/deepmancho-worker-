@@ -67,7 +67,7 @@ def test_sin_ancla_no_descarga_y_reporta_determinista(monkeypatch):
     monkeypatch.setattr(gv, "download", lambda *a: pytest.fail("no debía descargar"))
     assert gv.process_one() is True
     assert plat.reportes == [{"job_id": "j1", "track_id": "t1", "ok": False,
-                              "error": "determinista:no_anchor"}]
+                              "error": "esperando_analisis:no_anchor"}]
 
 
 def tema_sintetico(bpm=124.0, ancla_s=0.25, dur_s=64, sr=44100):

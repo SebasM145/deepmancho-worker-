@@ -20,6 +20,7 @@ Config por variables de entorno:
 """
 
 import os
+import re
 import sys
 import time
 import math
@@ -900,7 +901,12 @@ class AudioMudo(Exception):
 
 
 SILENCIO_PICO = 1e-4      # ~ -80 dBFS
-TOPE_ANALISIS_S = 600     # un analisis nunca puede tomar mas de 10 min
+# Tope de un TRABAJO completo (descarga + analisis + CM2 + rendicion + master + subidas).
+# Tiene que quedar por debajo del plazo de claim_analysis_job (8 min): si no, con
+# varias replicas un tema lento lo toma otra replica a la vez (doble trabajo).
+TOPE_TRABAJO_S = int(float(os.environ.get("TOPE_TRABAJO_S", "420")))
+# Tope de descarga del original (MB): se baja por partes a disco, nunca entero a RAM.
+MAX_TRACK_MB = int(float(os.environ.get("MAX_TRACK_MB", "250")))
 
 
 def entero_js(x: float) -> int:
@@ -1567,13 +1573,116 @@ def upload_rendition(signed_url: str, rendition_path: str) -> bool:
         return False
 
 
+# ----------------------------------------------------------------------------
+# GENERO detectado (2-oct-2026, pedido del dueno: ~1.000 temas subidos sin ordenar;
+# cada genero alimenta su emisora). Etapa A: la etiqueta del archivo (ID3 TCON,
+# Beatport, Vorbis). Etapa B (clasificador por audio) llega con el catalogo etiquetado.
+# No escribe en la base: va por worker-result como genre_detected / genre_confidence.
+# ----------------------------------------------------------------------------
+GENERO_UMBRAL_REVISAR = 0.7
+
+# Nombres de Beatport (los que usa la Biblioteca) y sus variantes frecuentes.
+_GENEROS_BEATPORT = {
+    "tech house": "Tech House", "techhouse": "Tech House",
+    "house": "House", "deep house": "Deep House", "afro house": "Afro House",
+    "minimal / deep tech": "Minimal / Deep Tech", "minimal": "Minimal / Deep Tech", "deep tech": "Minimal / Deep Tech",
+    "melodic house & techno": "Melodic House & Techno", "melodic house and techno": "Melodic House & Techno",
+    "melodic techno": "Melodic House & Techno", "melodic house": "Melodic House & Techno",
+    "techno": "Techno (Peak Time / Driving)", "techno (peak time / driving)": "Techno (Peak Time / Driving)",
+    "peak time techno": "Techno (Peak Time / Driving)", "techno (raw / deep / hypnotic)": "Techno (Raw / Deep / Hypnotic)",
+    "hard techno": "Hard Techno", "progressive house": "Progressive House", "progressive": "Progressive House",
+    "organic house / downtempo": "Organic House / Downtempo", "organic house": "Organic House / Downtempo",
+    "downtempo": "Organic House / Downtempo", "jackin house": "Jackin House", "funky house": "Jackin House",
+    "nu disco / disco": "Nu Disco / Disco", "nu disco": "Nu Disco / Disco", "disco": "Nu Disco / Disco",
+    "indie dance": "Indie Dance", "electro house": "Electro House", "bass house": "Bass House",
+    "uk garage / bassline": "UK Garage / Bassline", "uk garage": "UK Garage / Bassline", "garage": "UK Garage / Bassline",
+    "trance": "Trance (Main Floor)", "trance (main floor)": "Trance (Main Floor)", "psy-trance": "Psy-Trance",
+    "psytrance": "Psy-Trance", "drum & bass": "Drum & Bass", "drum and bass": "Drum & Bass", "dnb": "Drum & Bass",
+    "dubstep": "Dubstep", "breaks / breakbeat / uk bass": "Breaks / Breakbeat / UK Bass", "breaks": "Breaks / Breakbeat / UK Bass",
+    "dance / electro pop": "Dance / Electro Pop", "dance / pop": "Dance / Electro Pop", "electro pop": "Dance / Electro Pop",
+    "afro / latin": "Afro / Latin", "latin house": "Afro / Latin", "mainstage": "Mainstage", "big room": "Mainstage",
+    "hip-hop": "Hip-Hop", "hip hop": "Hip-Hop", "reggaeton": "Reggaeton", "pop": "Pop", "r&b": "R&B",
+}
+# Demasiado amplios para elegir emisora: se envian pero quedan por revisar.
+_GENEROS_AMPLIOS = {"electronic", "electronica", "electrónica", "dance", "edm", "club", "other", "otros",
+                    "unknown", "desconocido", "various", "misc", "music", "genre", "general"}
+# ID3v1 numerico mas comun en musica de club: (n) -> nombre.
+_ID3V1 = {"13": "pop", "18": "techno", "26": "dance", "31": "trance", "35": "house", "52": "electronic",
+          "98": "electronica", "127": "drum & bass"}
+
+
+def leer_etiquetas(path: str) -> dict:
+    """Etiquetas del contenedor (ID3, Vorbis, MP4) con ffmpeg, en minusculas."""
+    try:
+        p = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-f", "ffmetadata", "-"],
+                           capture_output=True, text=True, timeout=30)
+    except Exception:
+        return {}
+    out = {}
+    for linea in (p.stdout or "").splitlines():
+        if "=" in linea and not linea.startswith(";"):
+            k, v = linea.split("=", 1)
+            out.setdefault(k.strip().lower(), v.strip())
+    return out
+
+
+def genero_de_etiqueta(crudo):
+    """(genero, confianza) a partir de la etiqueta; (None, 0.0) si no hay nada util."""
+    if not crudo:
+        return None, 0.0
+    texto = crudo.strip()
+    m = re.fullmatch(r"\(?(\d{1,3})\)?", texto)
+    if m:
+        texto = _ID3V1.get(m.group(1), "")
+    # Varios generos en una etiqueta ("Tech House; House"): el primero reconocido.
+    partes = [x.strip() for x in re.split(r"[;|/,]\s*(?=[A-Za-z])|\x00", texto) if x.strip()] or [texto]
+    for cand in [texto] + partes:
+        clave = re.sub(r"\s+", " ", cand.lower()).strip()
+        if clave in _GENEROS_BEATPORT:
+            return _GENEROS_BEATPORT[clave], 0.95
+    clave = re.sub(r"\s+", " ", texto.lower()).strip()
+    if not clave or clave in _GENEROS_AMPLIOS:
+        return (texto.title() if clave else None), (0.3 if clave else 0.0)
+    return texto[:60], 0.6  # genero desconocido para nosotros: se respeta, por revisar
+
+
+def detectar_genero(path: str) -> dict:
+    """Bloque de genero para worker-result (etapa A: etiquetas)."""
+    tags = leer_etiquetas(path)
+    genero, conf = genero_de_etiqueta(tags.get("genre") or tags.get("tcon"))
+    out = {"genre_detected": genero, "genre_confidence": round(conf, 2),
+           "genre_source": "etiqueta" if genero else None}
+    if conf < GENERO_UMBRAL_REVISAR:
+        out["genero_por_revisar"] = True
+    return out
+
+
+class ArchivoMuyGrande(RuntimeError):
+    """El original supera MAX_TRACK_MB: no se baja (protege la RAM de la replica)."""
+
+
 def download_audio(audio_url: str) -> str:
-    r = requests.get(audio_url, timeout=120)
-    r.raise_for_status()
+    """Baja el original a un temporal, por partes y con tope de MAX_TRACK_MB."""
+    tope = MAX_TRACK_MB * 1024 * 1024
     ext = os.path.splitext(audio_url.split("?")[0])[1] or ".audio"
-    tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
-    tmp.write(r.content)
-    tmp.close()
+    with requests.get(audio_url, timeout=120, stream=True) as r:
+        r.raise_for_status()
+        largo = int(r.headers.get("content-length") or 0)
+        if largo > tope:
+            raise ArchivoMuyGrande(f"archivo de {largo // (1024 * 1024)} MB (tope {MAX_TRACK_MB} MB)")
+        tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+        n = 0
+        try:
+            for parte in r.iter_content(chunk_size=1024 * 1024):
+                n += len(parte)
+                if n > tope:
+                    raise ArchivoMuyGrande(f"archivo de mas de {MAX_TRACK_MB} MB")
+                tmp.write(parte)
+        except BaseException:
+            tmp.close()
+            os.remove(tmp.name)
+            raise
+        tmp.close()
     return tmp.name
 
 
@@ -1599,23 +1708,30 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
         if not audio_url:
             send_result(job_id, track_id, "error", error="track sin audio")
             return
-        tmp = download_audio(audio_url)
-        # Tope por trabajo: si algo se cuelga, falla este tema y la replica sigue con la cola.
+        # Tope por TRABAJO completo (no solo el analisis): por debajo del plazo de 8 min del
+        # claim, asi ninguna otra replica lo retoma mientras este sigue (carga con 5 replicas).
         import signal
         def _tope(_s, _f):
-            raise TimeoutError(f"analisis mas largo que {TOPE_ANALISIS_S // 60} min (se corta para no trabar la cola)")
+            raise TimeoutError(f"trabajo mas largo que {TOPE_TRABAJO_S // 60} min (se corta para no trabar la cola)")
         signal.signal(signal.SIGALRM, _tope)
-        signal.alarm(TOPE_ANALISIS_S)
+        signal.alarm(TOPE_TRABAJO_S)
+        tmp = download_audio(audio_url)
         try:
             result = analyze(tmp, bpm_seed=track.get("bpm"))
         except AudioMudo as e:
-            signal.alarm(0)
             send_result(job_id, track_id, "done", result={"pista_vacia": True, "analysis_flags": ["silencio"]})
             print(f"[job {job_id}] {e}: marcada como pista vacía", flush=True)
             return
-        finally:
-            signal.alarm(0)
         # CM1-bis: loudness restaurado (la v5 lo habia perdido — regresion detectada 18-ago)
+        # Genero (antes de convertir: las etiquetas viven en el original).
+        try:
+            gen = detectar_genero(tmp)
+            result.update({k: v for k, v in gen.items() if k != "genero_por_revisar"})
+            if gen.get("genero_por_revisar"):
+                result["analysis_flags"] = list(result.get("analysis_flags") or []) + ["genero_por_revisar"]
+            print(f"[job {job_id}] genero: {gen.get('genre_detected')} ({gen.get('genre_confidence')})", flush=True)
+        except Exception as e:
+            print(f"[job {job_id}] genero: fallo ({e})", flush=True)
         lufs = compute_loudness_lufs(tmp)
         if lufs is not None:
             result["loudness_lufs"] = lufs
@@ -1679,6 +1795,8 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
         n_cues = len(result.get("cue_points") or [])
         print(f"[job {job_id}] OK — cues={n_cues} energy={result['energy']}", flush=True)
     except Exception as e:
+        import signal
+        signal.alarm(0)  # que el tope no corte el aviso de error
         traceback.print_exc()
         try:
             send_result(job_id, track_id, "error", error=str(e))
@@ -1686,6 +1804,8 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
             pass
         print(f"[job {job_id}] FALLO: {e}", flush=True)
     finally:
+        import signal
+        signal.alarm(0)
         if tmp and os.path.exists(tmp):
             try:
                 os.remove(tmp)
@@ -2322,7 +2442,7 @@ def liberar_memoria():
 
 def main():
     filtrar_salida()
-    print("DeepMancho worker iniciado (v7.6: el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.6.4: tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     global EXAMEN_CM2_APROBADO

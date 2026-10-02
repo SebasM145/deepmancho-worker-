@@ -8,6 +8,19 @@
 - Causa del que quedaba: librosa da **80,75 = 2/3 · 123**. Solo se probaba duplicar (161,5 → 174,33). Ahora `semillas_candidatas` prueba las octavas (×1, ×2, ×½…) y además ×1,5, ×2/3, ×4/3 y ×0,75, siempre entre 90 y 180 BPM. Una semilla que no es octava solo gana si su rejilla puntúa **≥ 10 % más** que la mejor octava: Right Thing +26 % (correcta) y Day 'N' Nite +1,6 % (incorrecta, se descarta).
 - Ojo: el umbral sale de estos 7 temas. Se confirma con el reanálisis en producción (#206).
 
+## 7.6.3 (2-oct-2026) — GÉNERO DETECTADO, ETAPA A: ETIQUETAS
+- Para la subida sin ordenar (~1.000 temas; cada género alimenta su emisora): el análisis lee la etiqueta de género del **original** (ID3 `TCON`, Vorbis, MP4) con ffmpeg y la lleva al nombre de Beatport que usa la Biblioteca.
+- Envía `genre_detected`, `genre_confidence` y `genre_source='etiqueta'` por worker-result. Confianza 0,95 si el género se reconoce; 0,6 si no lo conocemos (se respeta); 0,3 si es demasiado amplio («Electronic», «Dance»). Con menos de 0,7, o sin etiqueta, suma la bandera `genero_por_revisar` a `analysis_flags`.
+- La etapa B (clasificador por audio para los temas sin etiqueta) llega con el catálogo etiquetado.
+- Pruebas: `tests/test_genero.py`. Con los 7 temas del golden set: 7 de 7 leídos.
+
+## 7.6.2 (2-oct-2026) — LISTO PARA LA CARGA MASIVA (~1.000 temas, 5 réplicas)
+- **Tope por trabajo de 7 min** (`TOPE_TRABAJO_S`, por defecto 420) para todo el trabajo: descarga, análisis, CM2, rendición, master y subidas. Antes solo el análisis tenía tope, de 10 min, y `claim_analysis_job` retoma un `processing` a los **8 min**: un tema lento lo podía tomar otra réplica a la vez. El `for update skip locked` del reclamo ya era correcto.
+- **`MAX_TRACK_MB`** (por defecto 250): el original se baja por partes a disco (antes `r.content`, entero en RAM) y se rechaza si pasa el tope, por `content-length` o al ir bajando, sin dejar el temporal.
+- **grid_verifier 1.1.2:** `no_anchor` deja de ser «determinista». Es una carrera: la verificación se encola al subir, antes del ancla, y otra vez cuando el análisis termina. Ahora se reporta `esperando_analisis:no_anchor`.
+- stems_worker 1.23.2: solo la versión de su log de arranque, para que este despliegue también incluya stems (la 7.6.1 se saltó por las watch paths).
+- Pruebas: `tests/test_carga_masiva.py`.
+
 ## Registros sin URLs firmadas (2-oct-2026) — W6 · stems_worker 1.23.1 · grid_verifier 1.1.1
 - Los errores de `requests`/`urllib` traen la URL completa («404 … for url: https://…?token=eyJ…»). Terminaban en los registros de Railway (tracebacks de `stems-worker`, auditoría §2) y en el `error` que se guarda en la base.
 - `sin_firma()` tapa `token=`, `signature=`, `X-Amz-Signature=`, `X-Amz-Credential=`, `X-Amz-Security-Token=`, `apikey=` y cualquier JWT (`eyJ….….…`). Se aplica a **todo lo que se imprime** (print, `log` y `traceback.print_exc`, envolviendo stdout y stderr al arrancar) y al `error` que va a `worker-result`, `stems-result`, `loops-result`, `render-result` y `grid-verify-result`.
