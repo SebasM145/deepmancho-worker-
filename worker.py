@@ -867,6 +867,11 @@ SILENCIO_PICO = 1e-4      # ~ -80 dBFS
 TOPE_ANALISIS_S = 600     # un analisis nunca puede tomar mas de 10 min
 
 
+def entero_js(x: float) -> int:
+    """Math.round de JavaScript: ,5 hacia arriba (worker-result redondea así el bpm)."""
+    return int(math.floor(float(x) + 0.5))
+
+
 def analyze(path: str, bpm_seed=None) -> dict:
     y, sr = librosa.load(path, sr=SR, mono=True, duration=MAX_DURATION)
     if y.size == 0:
@@ -932,11 +937,13 @@ def analyze(path: str, bpm_seed=None) -> dict:
             bpm_fino, resid_ms, n_beats = refine_bpm(y22, sr22, bpm_ref)
             if bpm_fino:
                 out["bpm_precise"] = bpm_fino
-                out["bpm_fine"] = round(bpm_fino - round(bpm_ref), 3)
-                # El entero que acompaña a bpm_fine: worker-result guarda round(bpm) + bpm_fine.
-                # Con semilla, detect_grid puede dar otro entero (125,26 con semilla 124) y el
-                # tempo efectivo quedaba 125,009 en vez de 124,009.
-                out["bpm"] = float(round(bpm_ref))
+                # bpm_fine va contra el MISMO entero que usa worker-result. Sin semilla, ese
+                # entero es Math.round(bpm) de JS (redondea ,5 hacia arriba; el round de
+                # Python redondea al par: 124,5 daba 124 aquí y 125 allá, un BPM corrido).
+                # Con semilla (solo llega con el BPM bloqueado), worker-result no toca `bpm`
+                # y usa bpm_precise; `bpm` sigue siendo la medida propia de detect_grid,
+                # que es la que audita la etiqueta (bpm_detected / bpm_etiqueta_difiere).
+                out["bpm_fine"] = round(bpm_fino - entero_js(bpm_ref), 3)
                 out["tempo_residual_ms"] = resid_ms
                 out["tempo_stability"] = clasificar_tempo(resid_ms)
                 print(f"    v7 bpm {bpm_ref} → {bpm_fino} (resid {resid_ms} ms, {n_beats} beats, {out['tempo_stability']})", flush=True)
@@ -1876,7 +1883,7 @@ def liberar_memoria():
 
 
 def main():
-    print("DeepMancho worker iniciado (v7.5.3: CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.5.4: tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     global EXAMEN_CM2_APROBADO
