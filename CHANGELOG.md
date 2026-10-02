@@ -5,7 +5,8 @@
 - En producción se veía como `v7 bpm 121.42 → 121.44 (resid 104.9 ms, variable)`: el tempo pegado al borde de la búsqueda y la rejilla marcada como «variable».
 - Ahora la búsqueda gruesa es de ±8 % de la semilla (mínimo ±4 BPM), que cubre el salto entre dos valores vecinos hasta ~180 BPM. Cuesta ~30 % más en ese paso (20 s → 26 s en un tema de 6 min).
 - No cambia nada para los temas con BPM previo: el v7 sigue afinando alrededor de ese BPM.
-- Pruebas: `tests/test_tempo_sin_semilla.py` (4 de 8 fallan con el código anterior).
+- **Tempo efectivo coherente** (`worker.py`): con BPM sembrado (reanálisis o tema con BPM sin bloquear), `analyze` mandaba el `bpm` de `detect_grid` —que ignora la semilla— junto al `bpm_fine` calculado sobre la semilla. `worker-result` guarda `round(bpm) + bpm_fine`: con semilla 124 y detección 125,26 quedaba 125,009 en vez de 124,009. Ahora, si el v7 afina el tempo, `bpm` es el entero de la referencia.
+- Pruebas: `tests/test_tempo_sin_semilla.py` (4 de 8 fallan con el código anterior) y `tests/test_tempo_coherente.py`.
 
 
 

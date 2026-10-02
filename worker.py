@@ -933,6 +933,10 @@ def analyze(path: str, bpm_seed=None) -> dict:
             if bpm_fino:
                 out["bpm_precise"] = bpm_fino
                 out["bpm_fine"] = round(bpm_fino - round(bpm_ref), 3)
+                # El entero que acompaña a bpm_fine: worker-result guarda round(bpm) + bpm_fine.
+                # Con semilla, detect_grid puede dar otro entero (125,26 con semilla 124) y el
+                # tempo efectivo quedaba 125,009 en vez de 124,009.
+                out["bpm"] = float(round(bpm_ref))
                 out["tempo_residual_ms"] = resid_ms
                 out["tempo_stability"] = clasificar_tempo(resid_ms)
                 print(f"    v7 bpm {bpm_ref} → {bpm_fino} (resid {resid_ms} ms, {n_beats} beats, {out['tempo_stability']})", flush=True)
