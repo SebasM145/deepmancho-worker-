@@ -31,7 +31,7 @@ Valores de referencia: `OMP_NUM_THREADS=5`, `DEMUCS_JOBS=4`, `DEMUCS_OVERLAP=0.1
 
 ## Desplegar una versión
 1. Cambiar el código y subir `VERSION`.
-2. Correr las pruebas locales (`pytest`).
+2. Correr las pruebas locales (`pytest`). La acción `Pruebas` (`.github/workflows/pruebas.yml`) corre `ruff` y `pytest` en cada PR; no hace falta torch ni demucs.
 3. Anotar en `CHANGELOG.md`.
 4. Subir a `main`: Railway redespliega **solo** el servicio cuyo archivo cambió.
 5. Verificar en los registros de Railway y en la plataforma (la cola avanza).
