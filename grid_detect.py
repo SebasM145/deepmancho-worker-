@@ -28,6 +28,7 @@ import librosa
 HOP = 512
 ONSET_FOOT_FRACTION = 0.35   # centro de la meseta estable (0.20-0.50 dan igual)
 SR_ANALYSIS = 22050
+SEED_MARGIN = 0.08          # búsqueda de tempo: ±8 % alrededor de la semilla de librosa
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -77,9 +78,14 @@ def detect_tempo(y, sr, seed_bpm=None, env=None):
         while seed_bpm > 180:
             seed_bpm /= 2
 
-    # búsqueda gruesa ±4 BPM
+    # búsqueda gruesa ±8 % de la semilla (antes ±4 BPM). La semilla de librosa sale
+    # cuantizada (a 11025 Hz y hop 512 solo da 99,4 · 107,7 · 117,5 · 129,2 · 143,6…)
+    # y con ±4 BPM quedaban tempos imposibles de encontrar: 121,5–125,1 y 133,2–139,5.
+    # Un tema de 124 sin etiqueta salía 125,3 (visto en producción como «121.42 … variable»).
+    # ±8 % cubre la mitad del salto entre dos valores vecinos hasta ~180 BPM.
+    margen = max(4.0, seed_bpm * SEED_MARGIN)
     best = (seed_bpm, -1e9)
-    for bpm in np.arange(seed_bpm - 4.0, seed_bpm + 4.0, 0.05):
+    for bpm in np.arange(seed_bpm - margen, seed_bpm + margen, 0.05):
         if not (60 <= bpm <= 200):
             continue
         p = 60.0 / bpm

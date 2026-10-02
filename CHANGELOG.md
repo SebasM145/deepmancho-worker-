@@ -1,5 +1,12 @@
 # Historial de versiones · worker.py (análisis)
 
+## grid_detect (2-oct-2026) — TEMPO CORRECTO SIN BPM PREVIO
+- Un tema que llega sin BPM (sin etiqueta) toma el tempo de `detect_tempo`. La semilla de librosa sale cuantizada (a 11025 Hz y hop 512: 99,4 · 107,7 · 117,5 · 129,2 · 143,6…) y la búsqueda era de ±4 BPM alrededor de ella, así que **121,5–125,1 y 133,2–139,5 BPM no se podían encontrar**. Un tema de 124 salía 125,3; uno de 135, 125,3; uno de 6 min a 124, 128,7.
+- En producción se veía como `v7 bpm 121.42 → 121.44 (resid 104.9 ms, variable)`: el tempo pegado al borde de la búsqueda y la rejilla marcada como «variable».
+- Ahora la búsqueda gruesa es de ±8 % de la semilla (mínimo ±4 BPM), que cubre el salto entre dos valores vecinos hasta ~180 BPM. Cuesta ~30 % más en ese paso (20 s → 26 s en un tema de 6 min).
+- No cambia nada para los temas con BPM previo: el v7 sigue afinando alrededor de ese BPM.
+- Pruebas: `tests/test_tempo_sin_semilla.py` (4 de 8 fallan con el código anterior).
+
 
 
 ## Espera creciente en los tres workers (30-sep-2026) — W2 · stems_worker 1.22.4
