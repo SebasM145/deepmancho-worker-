@@ -1,5 +1,13 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.4 (2-oct-2026) — TEMPO: LA SEMILLA DE 2/3 (#206, segunda parte)
+- Medido con el golden set **sin BPM previo** (7 temas de 122–124 BPM):
+  - antes de #10: **0 de 7** correctos (115 · 121,4 · 115 · 125,3 · 121,4 · 131,75 · 164);
+  - con #10: **6 de 7** (falla «Right Thing», 123 → 174,33);
+  - ahora: **7 de 7** exactos y 6 de 7 con tempo «constante».
+- Causa del que quedaba: librosa da **80,75 = 2/3 · 123**. Solo se probaba duplicar (161,5 → 174,33). Ahora `semillas_candidatas` prueba las octavas (×1, ×2, ×½…) y además ×1,5, ×2/3, ×4/3 y ×0,75, siempre entre 90 y 180 BPM. Una semilla que no es octava solo gana si su rejilla puntúa **≥ 10 % más** que la mejor octava: Right Thing +26 % (correcta) y Day 'N' Nite +1,6 % (incorrecta, se descarta).
+- Ojo: el umbral sale de estos 7 temas. Se confirma con el reanálisis en producción (#206).
+
 ## Registros sin URLs firmadas (2-oct-2026) — W6 · stems_worker 1.23.1 · grid_verifier 1.1.1
 - Los errores de `requests`/`urllib` traen la URL completa («404 … for url: https://…?token=eyJ…»). Terminaban en los registros de Railway (tracebacks de `stems-worker`, auditoría §2) y en el `error` que se guarda en la base.
 - `sin_firma()` tapa `token=`, `signature=`, `X-Amz-Signature=`, `X-Amz-Credential=`, `X-Amz-Security-Token=`, `apikey=` y cualquier JWT (`eyJ….….…`). Se aplica a **todo lo que se imprime** (print, `log` y `traceback.print_exc`, envolviendo stdout y stderr al arrancar) y al `error` que va a `worker-result`, `stems-result`, `loops-result`, `render-result` y `grid-verify-result`.

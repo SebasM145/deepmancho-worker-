@@ -60,3 +60,14 @@ def test_ancla_dentro_del_primer_beat():
     assert round(bpm) == 124
     assert 0 <= ancla_ms < 60000 / 124
     assert abs(ancla_ms - 250) <= 15
+
+
+def test_semillas_incluyen_tres_medios():
+    """#206, 2-oct: «Right Thing» (123) da 80,75 en librosa = 2/3 · 123. Solo duplicando
+    (161,5) se llegaba a 174,33; ×1,5 (121,1) tiene que estar entre las candidatas."""
+    import grid_detect
+    octavas, otras = grid_detect.semillas_candidatas(80.75)
+    assert any(abs(o - 161.5) < 0.1 for o in octavas)
+    assert any(abs(o - 121.1) < 0.2 for o in otras)
+    assert all(90 <= c <= 180 for c in octavas + otras)
+    assert grid_detect.semillas_candidatas(124.0)[0][0] == 124.0  # la semilla buena sigue primera
