@@ -2,6 +2,12 @@
 
 
 
+## 7.6.2 (2-oct-2026) — LISTO PARA LA CARGA MASIVA (~1.000 temas, 5 réplicas)
+- **Tope por trabajo de 7 min** (`TOPE_TRABAJO_S`, por defecto 420) para todo el trabajo: descarga, análisis, CM2, rendición, master y subidas. Antes solo el análisis tenía tope, de 10 min, y `claim_analysis_job` retoma un `processing` a los **8 min**: un tema lento lo podía tomar otra réplica a la vez. El `for update skip locked` del reclamo ya era correcto.
+- **`MAX_TRACK_MB`** (por defecto 250): el original se baja por partes a disco (antes `r.content`, entero en RAM) y se rechaza si pasa el tope, por `content-length` o al ir bajando, sin dejar el temporal.
+- **grid_verifier 1.1.2:** `no_anchor` deja de ser «determinista». Es una carrera: la verificación se encola al subir, antes del ancla, y otra vez cuando el análisis termina. Ahora se reporta `esperando_analisis:no_anchor`.
+- Pruebas: `tests/test_carga_masiva.py`.
+
 ## Espera creciente en los tres workers (30-sep-2026) — W2 · stems_worker 1.22.4
 - Con la cola vacía, la espera arranca en `POLL_INTERVAL_SECONDS`, se duplica en cada vuelta sin trabajo hasta `POLL_MAX_SECONDS` y vuelve al inicio apenas llega un trabajo. Los errores de red también esperan más, con ±20 % para que las réplicas no choquen.
 - Topes: análisis y stems 120 s; verificador 300 s (nadie lo espera en pantalla).
