@@ -1,5 +1,12 @@
 # Historial de versiones · worker.py (análisis)
 
+## Registros sin URLs firmadas (2-oct-2026) — W6 · stems_worker 1.23.1 · grid_verifier 1.1.1
+- Los errores de `requests`/`urllib` traen la URL completa («404 … for url: https://…?token=eyJ…»). Terminaban en los registros de Railway (tracebacks de `stems-worker`, auditoría §2) y en el `error` que se guarda en la base.
+- `sin_firma()` tapa `token=`, `signature=`, `X-Amz-Signature=`, `X-Amz-Credential=`, `X-Amz-Security-Token=`, `apikey=` y cualquier JWT (`eyJ….….…`). Se aplica a **todo lo que se imprime** (print, `log` y `traceback.print_exc`, envolviendo stdout y stderr al arrancar) y al `error` que va a `worker-result`, `stems-result`, `loops-result`, `render-result` y `grid-verify-result`.
+- Pendiente: el `error` de `set-render` (`render_set` en `worker.py`) se tapa en el registro pero no en lo que se manda; se deja para no chocar con el PR #9, que reescribe esa función.
+- Copia idéntica en los tres archivos (cada imagen copia solo el suyo); una prueba exige que no se separen.
+- Pruebas: `tests/test_sin_firma.py`.
+
 
 
 ## Espera creciente en los tres workers (30-sep-2026) — W2 · stems_worker 1.22.4
