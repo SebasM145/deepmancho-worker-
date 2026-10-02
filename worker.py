@@ -26,6 +26,7 @@ import math
 import random
 import json
 import tempfile
+import shutil
 import traceback
 import subprocess
 import gc
@@ -1722,9 +1723,9 @@ def _cue(cues, label, default=None):
     return default
 
 
-def render_set(job, tracks, upload_url, result_path):
-    """Mezcla el set completo y lo sube. Devuelve (duracion_s, tracklist)."""
-    tmpdir = tempfile.mkdtemp(prefix="dm_set_")
+def _mezcla_libre(tracks, tmpdir):
+    """Metodo anterior (sin plan): tempo unico del set, cruces de XFADE_BARS sobre los cues
+    MIX-IN/MIX-OUT. Solo para trabajos sin `spec.transiciones` (sets viejos)."""
     salida = np.zeros((0, 2), dtype=np.float32)
     tracklist, bpm_set, fin_ant, fase_ant = [], None, 0, 0.0
 
@@ -1795,8 +1796,11 @@ def render_set(job, tracks, upload_url, result_path):
         print(f"    transicion {bars} compases en {ini/SET_SR/60:.1f} min", flush=True)
         fin_ant = len(salida) - max(0, len(audio) - int((mix_out - mix_in) / 1000.0 * SET_SR))
         fase_ant = fase
+    return salida, tracklist
 
-    # Masterizado: loudness parejo + techo de true peak
+
+def _masterizar_y_subir(salida, tmpdir, upload_url, result_path):
+    """Loudness parejo + techo de true peak, MP3 256k y subida. Devuelve la duracion en s."""
     try:
         import pyloudnorm as pyln
         lufs = pyln.Meter(SET_SR).integrated_loudness(salida.mean(axis=1))
@@ -1824,7 +1828,261 @@ def render_set(job, tracks, upload_url, result_path):
     up.raise_for_status()
     dur = len(salida) / SET_SR
     print(f"  subido: {result_path} — {dur/60:.1f} min", flush=True)
-    return dur, tracklist
+    return dur
+
+
+
+
+# ----------------------------------------------------------------------------
+# #143 · El set sigue el PLAN revisado por el DJ (spec.transiciones)
+# ----------------------------------------------------------------------------
+# «Convertir en set» arma cada transicion con el mismo planificador que suena en
+# las listas (planTransition del navegador) y la manda en spec.transiciones. Aqui
+# se reproduce lo mismo offline, con las mismas cifras que el navegador:
+#   * cada tema suena a su tempo propio; la entrante va a `rate` durante la mezcla
+#     y vuelve a 1 en `release_seg` (rampa lineal: se renderiza con el promedio);
+#   * ganancias equal-power con el punto medio en `asimetria` (mixGainsAt);
+#   * graves: shelf en 120 Hz. Con swap: entrante -12 dB hasta `graves_swap_en`
+#     y la saliente cae a -12 dB desde ahi (rampa de 1/4 de ventana). Sin swap:
+#     entrante -6 dB -> 0 dB;
+#   * eco: 1 beat de retardo, realimentacion 0,45, la seca cae en medio beat y la
+#     cola dura 8 beats (echoOutSettings); la entrante cae en el downbeat;
+#   * corte y encadenado: la entrante arranca justo despues.
+SHELF_HZ = 120.0
+BASS_IN_START_DB, BASS_SWAP_IN_DB, BASS_OUT_END_DB = -6.0, -12.0, -12.0
+ECO_FEEDBACK, ECO_WET = 0.45, 0.7
+TIPOS_TRANSICION = ("mezcla", "eco", "corte", "encadenado")
+
+
+def _id_de(tr):
+    return tr.get("id") or tr.get("track_id")
+
+
+def plan_valido(tracks, transiciones):
+    """True si hay una transicion por par seguido, en el mismo orden que los temas."""
+    if not isinstance(transiciones, list) or len(tracks) < 2 or len(transiciones) != len(tracks) - 1:
+        return False
+    for k, t in enumerate(transiciones):
+        if not isinstance(t, dict) or t.get("tipo") not in TIPOS_TRANSICION:
+            return False
+        if t.get("desde") != _id_de(tracks[k]) or t.get("hasta") != _id_de(tracks[k + 1]):
+            return False
+    return True
+
+
+def _num(v, defecto=None):
+    try:
+        x = float(v)
+        return x if math.isfinite(x) else defecto
+    except (TypeError, ValueError):
+        return defecto
+
+
+def ganancias_mezcla(t, asimetria=0.6):
+    """Equal-power con el punto medio corrido (mixGainsAt). t en 0..1 (array)."""
+    a = min(0.95, max(0.05, asimetria))
+    t = np.clip(t, 0.0, 1.0)
+    p = np.where(t <= a, 0.5 * t / a, 0.5 + 0.5 * (t - a) / (1 - a))
+    return np.cos(p * np.pi / 2), np.sin(p * np.pi / 2)
+
+
+def _rampa_despues(t, en):
+    a = min(0.95, max(0.05, en))
+    largo = min(0.25, 1 - a) or 1e-6
+    return np.where(t <= a, 0.0, np.minimum(1.0, (t - a) / largo))
+
+
+def curvas_graves(t, swap, swap_en):
+    """dB del shelf de graves (entrante, saliente) en cada t (buildCurves)."""
+    if swap:
+        return BASS_SWAP_IN_DB * (1 - _rampa_despues(t, swap_en)), BASS_OUT_END_DB * _rampa_despues(t, swap_en)
+    return BASS_IN_START_DB * (1 - t), np.zeros_like(t)
+
+
+def _graves(x, db):
+    """Aplica `db` (array por muestra) a la banda bajo SHELF_HZ (graves + resto = senal)."""
+    if not np.any(db):
+        return x
+    from scipy.signal import butter, sosfiltfilt
+    sos = butter(2, SHELF_HZ, btype="low", fs=SET_SR, output="sos")
+    bajo = sosfiltfilt(sos, x, axis=0).astype(np.float32)
+    g = (10.0 ** (db / 20.0)).astype(np.float32)[:, None]
+    return (x - bajo) + bajo * g
+
+
+def _estirar_pcm(x, tempo, tmpdir):
+    """Time-stretch de un bloque PCM (tempo > 1 acorta) preservando el tono."""
+    if abs(tempo - 1.0) < 1e-4 or len(x) == 0:
+        return x
+    src = os.path.join(tmpdir, f"bloque_{abs(hash((len(x), tempo)))}.f32")
+    x.astype(np.float32).tofile(src)
+    for filtro in (f"rubberband=tempo={tempo:.6f}", f"atempo={tempo:.6f}"):
+        try:
+            out = subprocess.run(
+                ["ffmpeg", "-v", "error", "-f", "f32le", "-ar", str(SET_SR), "-ac", "2", "-i", src,
+                 "-af", filtro, "-f", "f32le", "-ar", str(SET_SR), "-ac", "2", "-"],
+                capture_output=True, check=True).stdout
+            return np.frombuffer(out, dtype=np.float32).reshape(-1, 2).copy()
+        except subprocess.CalledProcessError:
+            continue
+    return x
+
+
+def _unir(a, b, n=int(0.01 * SET_SR)):
+    """Pega dos bloques con un cruce de 10 ms (sin clic entre tramos estirados)."""
+    n = min(n, len(a), len(b))
+    if n <= 0:
+        return np.vstack([a, b])
+    t = np.linspace(0.0, 1.0, n, dtype=np.float32)[:, None]
+    return np.vstack([a[:-n], a[-n:] * (1 - t) + b[:n] * t, b[n:]])
+
+
+def linea_entrante(audio, entrada_seg, dur_seg, rate, release_seg, tmpdir):
+    """Audio de la entrante tal como suena desde que entra: `dur_seg` a `rate`, la
+    rampa de vuelta a 1 en `release_seg` y el resto a su tempo. Devuelve (pcm, tramos)
+    con tramos = [(seg_del_tema, seg_de_la_linea, rate)] para ubicar puntos del tema."""
+    sr = SET_SR
+    pos = int(max(0.0, entrada_seg) * sr)
+    if not rate or abs(rate - 1.0) < 1e-4 or dur_seg <= 0:
+        return audio[pos:], [(entrada_seg, 0.0, 1.0)]
+    rel = max(0.0, release_seg or 0.0)
+    medio = (1.0 + rate) / 2.0
+    n1 = int(dur_seg * rate * sr)
+    n2 = int(rel * medio * sr)
+    tramo1 = _estirar_pcm(audio[pos:pos + n1], rate, tmpdir)
+    tramo2 = _estirar_pcm(audio[pos + n1:pos + n1 + n2], medio, tmpdir)
+    resto = audio[pos + n1 + n2:]
+    pcm = _unir(_unir(tramo1, tramo2), resto)
+    tramos = [(entrada_seg, 0.0, rate),
+              (entrada_seg + dur_seg * rate, dur_seg, medio),
+              (entrada_seg + dur_seg * rate + rel * medio, dur_seg + rel, 1.0)]
+    return pcm, tramos
+
+
+def seg_en_linea(tramos, seg_tema):
+    """Segundo de la linea (salida) en que suena `seg_tema` del tema."""
+    base_t, base_l, r = tramos[0]
+    for t0, l0, rr in tramos:
+        if seg_tema >= t0:
+            base_t, base_l, r = t0, l0, rr
+    return base_l + (seg_tema - base_t) / r
+
+
+def fin_util(audio, umbral_db=-60.0):
+    """Ultima muestra con senal (sin la cola de silencio)."""
+    env = np.max(np.abs(audio), axis=1) if len(audio) else np.zeros(0)
+    vivas = np.nonzero(env > 10 ** (umbral_db / 20.0))[0]
+    return int(vivas[-1]) + 1 if len(vivas) else len(audio)
+
+
+def cola_eco(seca, bpm):
+    """Cola del eco a tempo (echoOut.ts): repeticiones cada beat con realimentacion 0,45
+    de lo que la saliente toca en el medio beat del envio; la cola dura 8 beats."""
+    beat = 60.0 / bpm if bpm and bpm > 0 else 0.5
+    d = int(beat * SET_SR)
+    envio = seca  # lo que entra al eco: la saliente desde el downbeat, medio beat
+    cola = np.zeros((int(beat * 8 * SET_SR) + len(envio), 2), dtype=np.float32)
+    g = 1.0
+    for k in range(1, 64):
+        ini = k * d
+        if ini >= len(cola) or g < 1e-3:
+            break
+        fin = min(len(cola), ini + len(envio))
+        cola[ini:fin] += envio[:fin - ini] * g
+        g *= ECO_FEEDBACK
+    cola *= ECO_WET
+    n_off = int(len(cola) * 0.25)  # ultimo cuarto: el retorno baja a 0
+    if n_off:
+        cola[-n_off:] *= np.linspace(1.0, 0.0, n_off, dtype=np.float32)[:, None]
+    return cola
+
+
+def _mezcla_plan(tracks, transiciones, tmpdir):
+    """El set con el plan de cada transicion. Devuelve (salida, tracklist)."""
+    sr = SET_SR
+    salida = np.zeros((0, 2), dtype=np.float32)
+    tracklist = []
+    ini_linea, tramos_linea = 0, [(0.0, 0.0, 1.0)]  # donde arranca la linea del tema actual
+    for i, tr in enumerate(tracks):
+        print(f"  [{i+1}/{len(tracks)}] {tr.get('title') or '?'}", flush=True)
+        r = requests.get(tr["audio_url"], timeout=300)
+        r.raise_for_status()
+        p = os.path.join(tmpdir, f"{i}.audio")
+        with open(p, "wb") as f:
+            f.write(r.content)
+        audio = _decode_pcm(p)
+        if i == 0:
+            salida = audio
+            tracklist.append({"position": 1, "start_seconds": 0, **_tl(tr)})
+            continue
+
+        t = transiciones[i - 1]
+        tipo = t["tipo"]
+        ant = tracks[i - 1]
+        bpm_ant = _num(ant.get("bpm"), 0) + _num(ant.get("bpm_fine"), 0)
+        salida_seg = _num(t.get("salida_seg"))
+        if salida_seg is None:  # al final util de la saliente
+            corte = fin_util(salida[ini_linea:]) + ini_linea
+        else:
+            corte = ini_linea + int(seg_en_linea(tramos_linea, salida_seg) * sr)
+        corte = max(ini_linea, min(corte, len(salida)))
+        entrada = _num(t.get("entrada_seg"), 0.0)
+
+        if tipo == "mezcla":
+            dur = max(0.0, _num(t.get("duracion_seg"), 0.0))
+            linea, tramos = linea_entrante(audio, entrada, dur, _num(t.get("rate")),
+                                           _num(t.get("release_seg"), 0.0), tmpdir)
+            n = max(1, min(int(dur * sr), len(linea), len(salida) - corte))
+            x = np.linspace(0.0, 1.0, n)
+            g_out, g_in = ganancias_mezcla(x, _num(t.get("asimetria"), 0.6))
+            db_in, db_out = curvas_graves(x, bool(t.get("graves_swap")), _num(t.get("graves_swap_en"), 0.5))
+            sale = _graves(salida[corte:corte + n], db_out) * g_out[:, None].astype(np.float32)
+            entra = _graves(linea[:n], db_in) * g_in[:, None].astype(np.float32)
+            salida = np.vstack([salida[:corte], sale + entra, linea[n:]])
+            print(f"    mezcla {t.get('compases') or 0} compases ({dur:.1f} s, rate {_num(t.get('rate'), 1.0):.4f}) "
+                  f"en {corte/sr/60:.1f} min", flush=True)
+        else:
+            pos = int(max(0.0, entrada) * sr)
+            linea, tramos = audio[pos:], [(entrada, 0.0, 1.0)]
+            if tipo == "eco":
+                n_seca = min(int(60.0 / (bpm_ant or 120.0) / 2 * sr), len(salida) - corte)
+                seca = salida[corte:corte + n_seca] * np.linspace(1.0, 0.0, n_seca, dtype=np.float32)[:, None]
+                cola = cola_eco(salida[corte:corte + n_seca], bpm_ant)
+                base = linea.copy()
+                base[:len(seca)] += seca[:len(base)]
+                m = min(len(cola), len(base))
+                base[:m] += cola[:m]
+                salida = np.vstack([salida[:corte], base])
+            else:  # corte o encadenado: 30 ms de salida para no hacer clic
+                n_f = min(int(0.03 * sr), corte - ini_linea)
+                if n_f > 0:
+                    salida[corte - n_f:corte] *= np.linspace(1.0, 0.0, n_f, dtype=np.float32)[:, None]
+                salida = np.vstack([salida[:corte], linea])
+            print(f"    {tipo} en {corte/sr/60:.1f} min ({t.get('razon') or 'sin razon'})", flush=True)
+
+        tracklist.append({"position": i + 1, "start_seconds": int(corte / sr), **_tl(tr)})
+        ini_linea, tramos_linea = corte, tramos
+    return salida, tracklist
+
+
+def render_set(job, tracks, upload_url, result_path):
+    """Mezcla el set completo y lo sube. Devuelve (duracion_s, tracklist).
+    Con `spec.transiciones` valido sigue el plan revisado por el DJ (#143); si no,
+    el metodo anterior."""
+    tmpdir = tempfile.mkdtemp(prefix="dm_set_")
+    try:
+        transiciones = ((job or {}).get("spec") or {}).get("transiciones")
+        if plan_valido(tracks, transiciones):
+            print(f"  plan del DJ: {len(transiciones)} transiciones (" +
+                  ", ".join(t["tipo"] for t in transiciones) + ")", flush=True)
+            salida, tracklist = _mezcla_plan(tracks, transiciones, tmpdir)
+        else:
+            if transiciones:
+                print("  spec.transiciones no coincide con los temas: metodo anterior", flush=True)
+            salida, tracklist = _mezcla_libre(tracks, tmpdir)
+        return _masterizar_y_subir(salida, tmpdir, upload_url, result_path), tracklist
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _tl(tr):

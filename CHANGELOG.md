@@ -2,6 +2,17 @@
 
 
 
+## 7.6 (2-oct-2026) — EL SET SIGUE EL PLAN DEL DJ (#143)
+- «Convertir en set» manda en `spec.transiciones` el plan de cada par, sacado del mismo planificador que suena en las listas. Antes `render_set` lo ignoraba: estiraba todo el set a un solo tempo y cruzaba 16 compases fijos, sin eco ni corte.
+- Ahora sigue el plan con las cifras del navegador:
+  - cada tema suena a su tempo; la entrante va a `rate` durante la mezcla y vuelve a su tempo en `release_seg`;
+  - ganancias equal-power con `asimetria`; graves con shelf de 120 Hz (swap −12 dB en `graves_swap_en`, o −6 → 0 dB sin swap);
+  - eco a tempo (1 beat, realimentación 0,45, cola de 8 beats); corte y encadenado (al final útil si `salida_seg` es null).
+- Si `spec.transiciones` no coincide con los temas (orden, cantidad o tipo), usa el método anterior: los sets viejos no cambian.
+- El temporal `dm_set_*` se borra siempre (antes nunca se borraba).
+- Sigue apagado si `ENABLE_SET_RENDER` no está en Railway.
+- Pruebas: `tests/test_set_plan.py` (corte, encadenado, eco, mezcla con temas sintéticos a 124 y 126 BPM: la entrante suena a 124 durante la mezcla).
+
 ## Espera creciente en los tres workers (30-sep-2026) — W2 · stems_worker 1.22.4
 - Con la cola vacía, la espera arranca en `POLL_INTERVAL_SECONDS`, se duplica en cada vuelta sin trabajo hasta `POLL_MAX_SECONDS` y vuelve al inicio apenas llega un trabajo. Los errores de red también esperan más, con ±20 % para que las réplicas no choquen.
 - Topes: análisis y stems 120 s; verificador 300 s (nadie lo espera en pantalla).
