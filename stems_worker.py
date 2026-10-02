@@ -35,6 +35,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import signal
 import subprocess
@@ -63,7 +64,7 @@ os.environ.setdefault("OMP_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
-VERSION = "1.23.0"
+VERSION = "1.23.2"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -96,6 +97,40 @@ def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
 
 
+# ── Registros sin firmas (W6, 2-oct-2026) ────────────────────────────────────
+# Los errores de requests/urllib traen la URL firmada completa ("…for url: https://…?token=eyJ…")
+# y terminaban en los registros de Railway y en el `error` que se guarda en la base.
+# Copia idéntica en worker.py, stems_worker.py y grid_verifier.py: cada imagen copia solo su archivo.
+_FIRMAS = re.compile(
+    r"(?i)((?:token|signature|x-amz-signature|x-amz-credential|x-amz-security-token|apikey)=)[^&\s'\"]+"
+    r"|eyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]+"
+)
+
+
+def sin_firma(texto) -> str:
+    """El texto con los tokens, firmas y JWT tapados (`token=***`)."""
+    return _FIRMAS.sub(lambda m: (m.group(1) + "***") if m.group(1) else "***", str(texto))
+
+
+class _SalidaSinFirmas:
+    def __init__(self, salida):
+        self._salida = salida
+
+    def write(self, texto):
+        return self._salida.write(sin_firma(texto))
+
+    def __getattr__(self, nombre):
+        return getattr(self._salida, nombre)
+
+
+def filtrar_salida():
+    """Tapa firmas en todo lo que se imprime (print, log y traceback.print_exc)."""
+    if not isinstance(sys.stdout, _SalidaSinFirmas):
+        sys.stdout = _SalidaSinFirmas(sys.stdout)
+    if not isinstance(sys.stderr, _SalidaSinFirmas):
+        sys.stderr = _SalidaSinFirmas(sys.stderr)
+
+
 # ----------------------------------------------------------------------------- API
 def claim():
     r = requests.post(f"{API}/stems-next", headers=HEADERS, json={}, timeout=60)
@@ -106,7 +141,8 @@ def claim():
 
 
 def report(job_id: str, ok: bool, stems=None, patterns=None, error: str | None = None):
-    body = {"job_id": job_id, "ok": ok, "stems": stems or {}, "patterns": patterns or {}, "error": error}
+    body = {"job_id": job_id, "ok": ok, "stems": stems or {}, "patterns": patterns or {},
+            "error": sin_firma(error) if error else error}
     r = requests.post(f"{API}/stems-result", headers=HEADERS, json=body, timeout=120)
     if not r.ok:
         log("stems-result respondió", r.status_code, r.text[:300])
@@ -1629,7 +1665,7 @@ def claim_loops():
 def report_loops(job_id: str, ok: bool, loops=None, error: str | None = None):
     body = {"job_id": job_id, "ok": ok, "loops": loops or []}
     if error:
-        body["error"] = error[:500]
+        body["error"] = sin_firma(error)[:500]
     r = requests.post(f"{API}/loops-result", headers=HEADERS, json=body, timeout=120)
     r.raise_for_status()
     return r.json()
@@ -1809,7 +1845,7 @@ def claim_render():
 
 
 def report_render(job_id: str, ok: bool, medidas=None, error: str | None = None):
-    body = {"job_id": job_id, "ok": ok, **({"medidas": medidas} if medidas else {}), **({"error": error[:900]} if error else {})}
+    body = {"job_id": job_id, "ok": ok, **({"medidas": medidas} if medidas else {}), **({"error": sin_firma(error)[:900]} if error else {})}
     requests.post(f"{API}/render-result", headers=HEADERS, json=body, timeout=60).raise_for_status()
 
 
@@ -1868,6 +1904,7 @@ def process_render(d: dict):
 
 
 def main():
+    filtrar_salida()
     signal.signal(signal.SIGTERM, _on_shutdown)
     signal.signal(signal.SIGINT, _on_shutdown)
     log(f"stems_worker v{VERSION} listo · motor {elegir_motor()} · modelo {MODEL} · segmento {SEGMENT}s · jobs {JOBS} · overlap {OVERLAP} · hilos {os.environ.get('OMP_NUM_THREADS')} · sondeo cada {POLL}s (hasta {POLL_MAX:.0f}s con la cola vacía)")
