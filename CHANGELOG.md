@@ -3,9 +3,38 @@
 ## Registros sin URLs firmadas (2-oct-2026) — W6 · stems_worker 1.23.1 · grid_verifier 1.1.1
 - Los errores de `requests`/`urllib` traen la URL completa («404 … for url: https://…?token=eyJ…»). Terminaban en los registros de Railway (tracebacks de `stems-worker`, auditoría §2) y en el `error` que se guarda en la base.
 - `sin_firma()` tapa `token=`, `signature=`, `X-Amz-Signature=`, `X-Amz-Credential=`, `X-Amz-Security-Token=`, `apikey=` y cualquier JWT (`eyJ….….…`). Se aplica a **todo lo que se imprime** (print, `log` y `traceback.print_exc`, envolviendo stdout y stderr al arrancar) y al `error` que va a `worker-result`, `stems-result`, `loops-result`, `render-result` y `grid-verify-result`.
-- Pendiente: el `error` de `set-render` (`render_set` en `worker.py`) se tapa en el registro pero no en lo que se manda; se deja para no chocar con el PR #9, que reescribe esa función.
+- El `error` que `render_set` manda a `set-render` lo limpia `_sin_firmas` (7.6, #9).
 - Copia idéntica en los tres archivos (cada imagen copia solo el suyo); una prueba exige que no se separen.
 - Pruebas: `tests/test_sin_firma.py`.
+
+## 7.6.1 (2-oct-2026) — COPIAS DE ESCUCHA SIN ETIQUETAS (#265, privacidad)
+- La copia de escucha (MP3 192k) se genera **sin metadatos** (`-map_metadata -1`, sin ID3v1/ID3v2, sin capítulos) y **sin portada embebida** (`-map 0:a:0`). La radio y el catálogo la sirven a anónimos, y el visitante nunca debe ver el título ni el artista reales.
+- El master MP3 320k de descarga (dueño o comprador) conserva sus etiquetas.
+- **Reproceso de las copias existentes**, en tandas por la cola `stream-limpiar` (`next` / `result` / `fail`): se baja la copia, se quitan las etiquetas **sin re-codificar** (mismo audio y mismo timeline: rejilla y cues siguen valiendo) y se sube a la **misma ruta**. El worker no escribe en la base. Corre solo con la cola de análisis vacía; si la función todavía no existe (404), se omite.
+- Medido con 3 copias reales de producción: traían `TIT2`; después, ninguna etiqueta, con la misma duración (393,64 → 393,64 s) y ~400 bytes menos.
+- Pruebas: `tests/test_stream_sin_etiquetas.py`.
+
+## 7.6 (2-oct-2026) — EL SET SIGUE EL PLAN DEL DJ (#143)
+- «Convertir en set» manda en `spec.transiciones` el plan de cada par, sacado del mismo planificador que suena en las listas. Antes `render_set` lo ignoraba: estiraba todo el set a un solo tempo y cruzaba 16 compases fijos, sin eco ni corte.
+- Ahora sigue el plan con las cifras del navegador:
+  - cada tema suena a su tempo; la entrante va a `rate` durante la mezcla y vuelve a su tempo en `release_seg`;
+  - ganancias equal-power con `asimetria`; graves con shelf de 120 Hz (swap −12 dB en `graves_swap_en`, o −6 → 0 dB sin swap);
+  - eco a tempo (1 beat, realimentación 0,45, cola de 8 beats); corte y encadenado (al final útil si `salida_seg` es null).
+- Si `spec.transiciones` no coincide con los temas (orden, cantidad o tipo), usa el método anterior: los sets viejos no cambian.
+- Si una mezcla no se puede igualar en tempo (fallan rubberband y atempo), lo avisa en el log y esa transición pasa con eco en el mismo compás: nunca se cruzan dos tempos sin igualar, igual que en el planificador.
+- Una descarga que falla deja solo el código HTTP y el host: la URL firmada no llega al log ni a `set_render_jobs.error`.
+- El temporal `dm_set_*` se borra siempre (antes nunca se borraba).
+- Sigue apagado si `ENABLE_SET_RENDER` no está en Railway.
+- Pruebas: `tests/test_set_plan.py` (corte, encadenado, eco, mezcla con temas sintéticos a 124 y 126 BPM: la entrante suena a 124 durante la mezcla).
+
+## 7.5.4 (2-oct-2026) — TEMPO CORRECTO SIN BPM PREVIO
+- Un tema que llega sin BPM (sin etiqueta) toma el tempo de `detect_tempo`. La semilla de librosa sale cuantizada (a 11025 Hz y hop 512: 99,4 · 107,7 · 117,5 · 129,2 · 143,6…) y la búsqueda era de ±4 BPM alrededor de ella, así que **121,5–125,1 y 133,2–139,5 BPM no se podían encontrar**. Un tema de 124 salía 125,3; uno de 135, 125,3; uno de 6 min a 124, 128,7.
+- En producción se veía como `v7 bpm 121.42 → 121.44 (resid 104.9 ms, variable)`: el tempo pegado al borde de la búsqueda y la rejilla marcada como «variable».
+- Ahora la búsqueda gruesa es de ±8 % de la semilla (mínimo ±4 BPM), que cubre el salto entre dos valores vecinos hasta ~180 BPM. Cuesta ~30 % más en ese paso (20 s → 26 s en un tema de 6 min).
+- No cambia nada para los temas con BPM previo: el v7 sigue afinando alrededor de ese BPM.
+- **Tempo efectivo coherente** (`worker.py`): `bpm_fine` se calcula contra el mismo entero que usa `worker-result`. Sin BPM previo, ese entero es `Math.round(bpm)` de JS, que redondea ,5 hacia arriba; el `round` de Python redondea al par (124,5 → 124 aquí y 125 allá), y el tempo guardado quedaba 1 BPM corrido.
+- **Con BPM bloqueado** (etiqueta, manual o `bpm_tag`; es el único caso en que `worker-next` manda semilla), `bpm` sigue siendo la medida propia de `detect_grid`. `worker-result` no toca el entero bloqueado: usa `bpm_precise` para el decimal y compara `bpm` con la etiqueta para la bandera `bpm_etiqueta_difiere`. Un primer intento de este PR mandaba el entero de la semilla y apagaba esa bandera para siempre (lo vio el integrador).
+- Pruebas: `tests/test_tempo_sin_semilla.py` (4 de 8 fallan con el código anterior) y `tests/test_tempo_coherente.py` (replica `decidirTempo` y la bandera de `worker-result`).
 
 
 
