@@ -1,5 +1,13 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.4 (2-oct-2026) — TEMPO: LA SEMILLA DE 2/3 (#206, segunda parte)
+- Medido con el golden set **sin BPM previo** (7 temas de 122–124 BPM):
+  - antes de #10: **0 de 7** correctos (115 · 121,4 · 115 · 125,3 · 121,4 · 131,75 · 164);
+  - con #10: **6 de 7** (falla «Right Thing», 123 → 174,33);
+  - ahora: **7 de 7** exactos y 6 de 7 con tempo «constante».
+- Causa del que quedaba: librosa da **80,75 = 2/3 · 123**. Solo se probaba duplicar (161,5 → 174,33). Ahora `semillas_candidatas` prueba las octavas (×1, ×2, ×½…) y además ×1,5, ×2/3, ×4/3 y ×0,75, siempre entre 90 y 180 BPM. Una semilla que no es octava solo gana si su rejilla puntúa **≥ 10 % más** que la mejor octava: Right Thing +26 % (correcta) y Day 'N' Nite +1,6 % (incorrecta, se descarta).
+- Ojo: el umbral sale de estos 7 temas. Se confirma con el reanálisis en producción (#206).
+
 ## 7.6.3 (2-oct-2026) — GÉNERO DETECTADO, ETAPA A: ETIQUETAS
 - Para la subida sin ordenar (~1.000 temas; cada género alimenta su emisora): el análisis lee la etiqueta de género del **original** (ID3 `TCON`, Vorbis, MP4) con ffmpeg y la lleva al nombre de Beatport que usa la Biblioteca.
 - Envía `genre_detected`, `genre_confidence` y `genre_source='etiqueta'` por worker-result. Confianza 0,95 si el género se reconoce; 0,6 si no lo conocemos (se respeta); 0,3 si es demasiado amplio («Electronic», «Dance»). Con menos de 0,7, o sin etiqueta, suma la bandera `genero_por_revisar` a `analysis_flags`.

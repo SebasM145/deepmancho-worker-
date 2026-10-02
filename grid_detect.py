@@ -56,6 +56,51 @@ def _grid_score(env, sr, period_s, phase_s, dur_s):
     return float(np.mean([np.max(env[a:b]) for a, b in zip(lo, hi)]))
 
 
+OCTAVAS = (1.0, 2.0, 0.5, 4.0, 0.25)
+PROPORCIONES = (1.5, 2 / 3, 4 / 3, 0.75)
+# Una semilla que no es octava solo gana si su rejilla puntua al menos 10 % mas que la
+# mejor octava (golden set 2-oct: Right Thing +26 % con x1,5 y es correcta; Day 'N' Nite
+# +1,6 % con x0,75 y es incorrecta).
+VENTAJA_PROPORCION = 1.10
+
+
+def semillas_candidatas(cruda):
+    """Semillas a probar a partir de la de librosa, todas entre 90 y 180 BPM.
+
+    librosa cae en sub/super armónicos: el doble y la mitad (corregidos desde siempre)
+    y también 2/3 o 3/4 del tempo real. Ejemplo del 2-oct: «Right Thing» (123 BPM)
+    da 80,75 = 2/3 · 123. Solo con duplicar salía 161,5 → 174,33. Con ×1,5 entra 121
+    y la puntuación de la rejilla elige 123. Devuelve (octavas, otras_proporciones).
+    """
+    octavas, otras = [], []
+    for f in OCTAVAS + PROPORCIONES:
+        c = cruda * f
+        if 90 <= c <= 180 and all(abs(c - o) / o > 0.03 for o in octavas + otras):
+            (octavas if f in OCTAVAS else otras).append(c)
+    if not octavas:  # muy fuera de rango: la corrección de octava de siempre
+        c = cruda
+        while c < 90:
+            c *= 2
+        while c > 180:
+            c /= 2
+        octavas = [c]
+    return octavas, otras
+
+
+def _busqueda_gruesa(env, sr, dur_s, semilla):
+    """Mejor (bpm, puntuación) en ±8 % de la semilla, paso 0,05."""
+    margen = max(4.0, semilla * SEED_MARGIN)
+    best = (semilla, -1e9)
+    for bpm in np.arange(semilla - margen, semilla + margen, 0.05):
+        if not (60 <= bpm <= 200):
+            continue
+        p = 60.0 / bpm
+        sc = max(_grid_score(env, sr, p, ph, dur_s) for ph in np.arange(0, p, p / 8))
+        if sc > best[1]:
+            best = (bpm, sc)
+    return best
+
+
 def detect_tempo(y, sr, seed_bpm=None, env=None):
     """
     Tempo por ajuste global sobre toda la pista, con redondeo a entero
@@ -65,34 +110,31 @@ def detect_tempo(y, sr, seed_bpm=None, env=None):
         env = _onset_env(y, sr)
     dur_s = len(y) / sr
 
+    semillas = [seed_bpm]
     if seed_bpm is None or not (60 <= seed_bpm <= 200):
         t, _ = librosa.beat.beat_track(y=y, sr=sr, trim=False)
-        seed_bpm = float(np.atleast_1d(t)[0]) if np.atleast_1d(t).size else 126.0
-        # Con silencio librosa devuelve 0 y el «while < 90: *= 2» de abajo no terminaba nunca
-        # (colgó las 3 réplicas el 30-sep con pistas de piano mudas).
-        if not np.isfinite(seed_bpm) or seed_bpm <= 0:
-            seed_bpm = 126.0
-        # corrección de octava: librosa cae en sub/super armónicos
-        while seed_bpm < 90:
-            seed_bpm *= 2
-        while seed_bpm > 180:
-            seed_bpm /= 2
+        cruda = float(np.atleast_1d(t)[0]) if np.atleast_1d(t).size else 126.0
+        # Con silencio librosa devuelve 0 (colgó las 3 réplicas el 30-sep con pistas mudas).
+        if not np.isfinite(cruda) or cruda <= 0:
+            cruda = 126.0
+        semillas, otras = semillas_candidatas(cruda)
+    else:
+        otras = []
 
-    # búsqueda gruesa ±8 % de la semilla (antes ±4 BPM). La semilla de librosa sale
-    # cuantizada (a 11025 Hz y hop 512 solo da 99,4 · 107,7 · 117,5 · 129,2 · 143,6…)
+    # búsqueda gruesa ±8 % alrededor de cada semilla (antes ±4 BPM). La semilla de librosa
+    # sale cuantizada (a 11025 Hz y hop 512 solo da 99,4 · 107,7 · 117,5 · 129,2 · 143,6…)
     # y con ±4 BPM quedaban tempos imposibles de encontrar: 121,5–125,1 y 133,2–139,5.
     # Un tema de 124 sin etiqueta salía 125,3 (visto en producción como «121.42 … variable»).
     # ±8 % cubre la mitad del salto entre dos valores vecinos hasta ~180 BPM.
-    margen = max(4.0, seed_bpm * SEED_MARGIN)
-    best = (seed_bpm, -1e9)
-    for bpm in np.arange(seed_bpm - margen, seed_bpm + margen, 0.05):
-        if not (60 <= bpm <= 200):
-            continue
-        p = 60.0 / bpm
-        s = max(_grid_score(env, sr, p, ph, dur_s)
-                for ph in np.arange(0, p, p / 8))
-        if s > best[1]:
-            best = (bpm, s)
+    best = (semillas[0], -1e9)
+    for semilla in semillas:
+        cand = _busqueda_gruesa(env, sr, dur_s, semilla)
+        if cand[1] > best[1]:
+            best = cand
+    for semilla in otras:
+        cand = _busqueda_gruesa(env, sr, dur_s, semilla)
+        if cand[1] > best[1] * VENTAJA_PROPORCION:
+            best = (cand[0], cand[1] / VENTAJA_PROPORCION)
 
     # refinamiento fino
     coarse = best[0]
