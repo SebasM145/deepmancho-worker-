@@ -1,5 +1,11 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.7 (3-oct-2026) — TEMPO MÁS RÁPIDO, MISMO RESULTADO (carga masiva)
+- El 60 % de `analyze` se iba en un bucle de Python de `grid_detect._grid_score`: unas 10.700 llamadas en un tema de 10 min, cada una sacando el máximo de una ventana de 3 cuadros golpe por golpe. Ahora la ventana se calcula una sola vez (`maximum_filter1d`) y cada llamada es una indexación de numpy.
+- **Mismo resultado, bit a bit:** con el tema sintético de 10 min y 8 tempos de 98 a 172 BPM, `detect_grid` da lo mismo que antes, y los puntajes son idénticos (hay una prueba).
+- Medido en local, con un solo hilo y en tiempo de CPU: `detect_grid` baja de 19,8 s a 0,6 s, y `analyze` de **35 s a 18 s** con un tema de 10 min.
+- **Tope por trabajo (`TOPE_TRABAJO_S`=420):** no hace falta subirlo, ni partir el análisis, ni bajar la resolución. Aunque Railway vaya 3 veces más lento, un tema de 10 min queda en ~1 min de análisis (~2 min antes de este cambio). La cifra de 140 s que se dio en #22 incluía la compilación inicial de numba y la CPU compartida con otras pruebas. Se confirma con el log de #22 (`OK en N s`) en la primera tanda.
+
 ## 7.6.6 (3-oct-2026) — CARGA MASIVA: TIEMPOS A LA VISTA Y SIN REINTENTOS INÚTILES
 - **El log dice cuánto tardó cada trabajo:** `OK en 212 s (tema de 412 s)` o `FALLO en 3 s: …`. Sirve para ajustar `TOPE_TRABAJO_S` (420 s) con datos reales. En un Apple M4, `analyze` tarda 140 s con un tema de 10 min. En Railway la CPU suele ir 2 a 3 veces más lenta, así que un tema largo podría acercarse al tope. Hay que medirlo en la primera tanda.
 - **Archivo muy grande = `determinista:`** (como en grid_verifier): `worker-result` hoy reintenta todo error hasta 3 veces, aunque el archivo siga pesando lo mismo. Con el prefijo, Funciones puede cerrarlo al primer intento. Mientras tanto se comporta igual: 3 intentos, cada uno rechazado por `content-length`, sin descargar.

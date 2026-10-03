@@ -42,8 +42,18 @@ def _onset_env(y, sr):
     return env / m if m > 0 else env
 
 
-def _grid_score(env, sr, period_s, phase_s, dur_s):
-    """Energía de onsets que cae sobre una rejilla (período, fase)."""
+def _max3(env):
+    """env3[f] = max(env[f-1 .. f+1]), recortado en los bordes: la ventana de _grid_score."""
+    from scipy.ndimage import maximum_filter1d
+    return maximum_filter1d(env, size=3, mode="nearest")
+
+
+def _grid_score(env, sr, period_s, phase_s, dur_s, env3=None):
+    """Energía de onsets que cae sobre una rejilla (período, fase).
+
+    Mismo resultado que el máximo de env[f-1:f+2] golpe por golpe, pero con la
+    ventana precalculada (`env3`): ese bucle de Python era el 60 % de `analyze`
+    (10.700 llamadas en un tema de 10 min)."""
     n = int((dur_s - phase_s) / period_s)
     if n < 16:
         return -1e9
@@ -51,9 +61,9 @@ def _grid_score(env, sr, period_s, phase_s, dur_s):
     frames = frames[(frames >= 0) & (frames < len(env))]
     if len(frames) < 16:
         return -1e9
-    lo = np.maximum(frames - 1, 0)
-    hi = np.minimum(frames + 2, len(env))
-    return float(np.mean([np.max(env[a:b]) for a, b in zip(lo, hi)]))
+    if env3 is None:
+        env3 = _max3(env)
+    return float(np.mean(env3[frames]))
 
 
 OCTAVAS = (1.0, 2.0, 0.5, 4.0, 0.25)
@@ -87,15 +97,17 @@ def semillas_candidatas(cruda):
     return octavas, otras
 
 
-def _busqueda_gruesa(env, sr, dur_s, semilla):
+def _busqueda_gruesa(env, sr, dur_s, semilla, env3=None):
     """Mejor (bpm, puntuación) en ±8 % de la semilla, paso 0,05."""
+    if env3 is None:
+        env3 = _max3(env)
     margen = max(4.0, semilla * SEED_MARGIN)
     best = (semilla, -1e9)
     for bpm in np.arange(semilla - margen, semilla + margen, 0.05):
         if not (60 <= bpm <= 200):
             continue
         p = 60.0 / bpm
-        sc = max(_grid_score(env, sr, p, ph, dur_s) for ph in np.arange(0, p, p / 8))
+        sc = max(_grid_score(env, sr, p, ph, dur_s, env3) for ph in np.arange(0, p, p / 8))
         if sc > best[1]:
             best = (bpm, sc)
     return best
@@ -109,6 +121,7 @@ def detect_tempo(y, sr, seed_bpm=None, env=None):
     if env is None:
         env = _onset_env(y, sr)
     dur_s = len(y) / sr
+    env3 = _max3(env)
 
     semillas = [seed_bpm]
     if seed_bpm is None or not (60 <= seed_bpm <= 200):
@@ -128,11 +141,11 @@ def detect_tempo(y, sr, seed_bpm=None, env=None):
     # ±8 % cubre la mitad del salto entre dos valores vecinos hasta ~180 BPM.
     best = (semillas[0], -1e9)
     for semilla in semillas:
-        cand = _busqueda_gruesa(env, sr, dur_s, semilla)
+        cand = _busqueda_gruesa(env, sr, dur_s, semilla, env3)
         if cand[1] > best[1]:
             best = cand
     for semilla in otras:
-        cand = _busqueda_gruesa(env, sr, dur_s, semilla)
+        cand = _busqueda_gruesa(env, sr, dur_s, semilla, env3)
         if cand[1] > best[1] * VENTAJA_PROPORCION:
             best = (cand[0], cand[1] / VENTAJA_PROPORCION)
 
@@ -141,7 +154,7 @@ def detect_tempo(y, sr, seed_bpm=None, env=None):
     best_f = (coarse, -1e9)
     for bpm in np.arange(coarse - 0.06, coarse + 0.06, 0.004):
         p = 60.0 / bpm
-        s = max(_grid_score(env, sr, p, ph, dur_s)
+        s = max(_grid_score(env, sr, p, ph, dur_s, env3)
                 for ph in np.arange(0, p, p / 16))
         if s > best_f[1]:
             best_f = (bpm, s)

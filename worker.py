@@ -2474,7 +2474,7 @@ def liberar_memoria():
 
 def main():
     filtrar_salida()
-    print("DeepMancho worker iniciado (v7.6.6: tiempo por trabajo en el log y archivo muy grande como falla determinista; energy_v2 aparte (#248); tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.6.7: tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     global EXAMEN_CM2_APROBADO
