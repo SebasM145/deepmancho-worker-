@@ -6,6 +6,14 @@
 - Los demás errores (red, tope de tiempo) se siguen reintentando.
 - Pruebas: 3 nuevas en `tests/test_carga_masiva.py` (con el código anterior fallan 2).
 
+## 7.6.5 (3-oct-2026) — ENERGÍA SIN SATURAR, COMO CAMPO APARTE (#248)
+- La energía 1-10 (`energy`) se satura: con un groove sintético masterizado de −16,5 a −3,5 LUFS da **8 siempre**. Con los 7 temas del golden set da 7 u 8.
+- El análisis manda además **`energy_v2`** (de `analizador_v8.energia_v2`: LUFS estéreo de −20 a −6, agudos absolutos y golpes por segundo). En el mismo groove va de **5 a 7**. **`energy` no cambia**: la v2 no está calibrada y cambiarla a ciegas mueve las curvas de las listas y la radio.
+- `worker-result` ignora los campos que no conoce: hasta que Funciones agregue la columna, `energy_v2` solo queda en el log (`energia: 8 (v2: 6)`). Con la columna, se comparan las dos en el catálogo real antes de decidir.
+- Se mide en la misma carga a 44,1 kHz que ya se hacía para `loudness_lufs` (ahora en estéreo). `loudness_lufs` da el mismo valor. Costo, medido en local: **+2 s** por tema de 7 min y +300 MB en ese paso, por debajo del pico de `analyze` (4,5 GB con un tema de 10 min): el pico del trabajo no sube.
+- El Dockerfile del análisis ahora copia `analizador_v8.py` (antes no estaba en la imagen).
+- Pruebas: `tests/test_energia_v2.py` (con el código anterior fallan 2 de 4; la prueba del trabajo completo comprueba que `energy` sale intacta).
+
 ## 7.6.4 (2-oct-2026) — TEMPO: LA SEMILLA DE 2/3 (#206, segunda parte)
 - Medido con el golden set **sin BPM previo** (7 temas de 122–124 BPM):
   - antes de #10: **0 de 7** correctos (115 · 121,4 · 115 · 125,3 · 121,4 · 131,75 · 164);
