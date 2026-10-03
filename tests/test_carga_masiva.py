@@ -74,3 +74,36 @@ def test_un_trabajo_colgado_se_corta_y_avisa(monkeypatch):
 def test_no_anchor_es_carrera_no_falla_definitiva():
     assert gv.codigo_error(RuntimeError("no_anchor")) == "esperando_analisis:no_anchor"
     assert not gv.codigo_error(RuntimeError("no_anchor")).startswith("determinista:")
+
+
+def test_archivo_muy_grande_va_como_determinista(monkeypatch, capsys):
+    enviados = []
+    def grande(url):
+        raise worker.ArchivoMuyGrande("archivo de 300 MB (tope 250 MB)")
+    monkeypatch.setattr(worker, "download_audio", grande)
+    monkeypatch.setattr(worker, "send_result", lambda *a, **k: enviados.append((a, k)))
+    worker.process_job({"id": "j", "track_id": "t"}, {}, "http://x/a.wav")
+    assert enviados[0][1]["error"] == "determinista:archivo de 300 MB (tope 250 MB)"
+    assert "FALLO en 0 s" in capsys.readouterr().out
+
+
+def test_otros_errores_siguen_reintentandose(monkeypatch):
+    enviados = []
+    def red(url):
+        raise worker.requests.ConnectionError("sin red")
+    monkeypatch.setattr(worker, "download_audio", red)
+    monkeypatch.setattr(worker, "send_result", lambda *a, **k: enviados.append((a, k)))
+    worker.process_job({"id": "j", "track_id": "t"}, {}, "http://x/a.wav")
+    assert not enviados[0][1]["error"].startswith("determinista:")
+
+
+def test_el_log_dice_cuanto_tardo_el_trabajo(monkeypatch, capsys, tmp_path):
+    p = tmp_path / "a.wav"
+    p.write_bytes(b"x")
+    monkeypatch.setattr(worker, "download_audio", lambda url: str(p))
+    monkeypatch.setattr(worker, "analyze", lambda path, bpm_seed=None: {"energy": 7, "duration_seconds": 412})
+    monkeypatch.setattr(worker, "detectar_genero", lambda path: {})
+    monkeypatch.setattr(worker, "medir_sonoridad", lambda path: {})
+    monkeypatch.setattr(worker, "send_result", lambda *a, **k: None)
+    worker.process_job({"id": "j", "track_id": "t"}, {"artist": "a", "title": "b"}, "http://x/a.wav")
+    assert "OK en 0 s (tema de 412 s)" in capsys.readouterr().out

@@ -1730,6 +1730,7 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
     track_id = job["track_id"]
     print(f"[job {job_id}] track {track_id} — analizando...", flush=True)
     tmp = None
+    t0 = time.time()
     try:
         if not audio_url:
             send_result(job_id, track_id, "error", error="track sin audio")
@@ -1819,16 +1820,21 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
                 print(f"[job {job_id}] identificado: {ident['artist']} — {ident['title']}", flush=True)
         send_result(job_id, track_id, "done", result=result)
         n_cues = len(result.get("cue_points") or [])
-        print(f"[job {job_id}] OK — cues={n_cues} energy={result['energy']}", flush=True)
+        # El tiempo total sirve para ajustar TOPE_TRABAJO_S con datos de Railway (carga masiva).
+        print(f"[job {job_id}] OK en {time.time() - t0:.0f} s (tema de {result.get('duration_seconds') or '?'} s) "
+              f"— cues={n_cues} energy={result['energy']}", flush=True)
     except Exception as e:
         import signal
         signal.alarm(0)  # que el tope no corte el aviso de error
         traceback.print_exc()
+        # «determinista:» = reintentar da lo mismo (como en grid_verifier). worker-result
+        # hoy reintenta todo error hasta 3 veces; con este prefijo puede cerrarlo de una.
+        error = f"determinista:{e}" if isinstance(e, ArchivoMuyGrande) else str(e)
         try:
-            send_result(job_id, track_id, "error", error=str(e))
+            send_result(job_id, track_id, "error", error=error)
         except Exception:
             pass
-        print(f"[job {job_id}] FALLO: {e}", flush=True)
+        print(f"[job {job_id}] FALLO en {time.time() - t0:.0f} s: {error}", flush=True)
     finally:
         import signal
         signal.alarm(0)
@@ -2468,7 +2474,7 @@ def liberar_memoria():
 
 def main():
     filtrar_salida()
-    print("DeepMancho worker iniciado (v7.6.5: energy_v2 aparte (#248); tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.6.6: tiempo por trabajo en el log y archivo muy grande como falla determinista; energy_v2 aparte (#248); tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     global EXAMEN_CM2_APROBADO

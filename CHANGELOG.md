@@ -1,5 +1,11 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.6 (3-oct-2026) — CARGA MASIVA: TIEMPOS A LA VISTA Y SIN REINTENTOS INÚTILES
+- **El log dice cuánto tardó cada trabajo:** `OK en 212 s (tema de 412 s)` o `FALLO en 3 s: …`. Sirve para ajustar `TOPE_TRABAJO_S` (420 s) con datos reales. En un Apple M4, `analyze` tarda 140 s con un tema de 10 min. En Railway la CPU suele ir 2 a 3 veces más lenta, así que un tema largo podría acercarse al tope. Hay que medirlo en la primera tanda.
+- **Archivo muy grande = `determinista:`** (como en grid_verifier): `worker-result` hoy reintenta todo error hasta 3 veces, aunque el archivo siga pesando lo mismo. Con el prefijo, Funciones puede cerrarlo al primer intento. Mientras tanto se comporta igual: 3 intentos, cada uno rechazado por `content-length`, sin descargar.
+- Los demás errores (red, tope de tiempo) se siguen reintentando.
+- Pruebas: 3 nuevas en `tests/test_carga_masiva.py` (con el código anterior fallan 2).
+
 ## 7.6.5 (3-oct-2026) — ENERGÍA SIN SATURAR, COMO CAMPO APARTE (#248)
 - La energía 1-10 (`energy`) se satura: con un groove sintético masterizado de −16,5 a −3,5 LUFS da **8 siempre**. Con los 7 temas del golden set da 7 u 8.
 - El análisis manda además **`energy_v2`** (de `analizador_v8.energia_v2`: LUFS estéreo de −20 a −6, agudos absolutos y golpes por segundo). En el mismo groove va de **5 a 7**. **`energy` no cambia**: la v2 no está calibrada y cambiarla a ciegas mueve las curvas de las listas y la radio.
