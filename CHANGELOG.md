@@ -1,5 +1,11 @@
 # Historial de versiones · worker.py (análisis)
 
+## Errores sin firma en la limpieza de copias y en los sets (3-oct-2026) — W6 · sin versión propia
+- Entra con la versión siguiente del worker que se mezcle (no cambia el banner, para no chocar con #21, #22 y #24).
+- `stream-limpiar` (#265) mandaba `str(e)` tal cual a la base. Ahora pasa por `sin_firma`.
+- `set-render` (#143) usaba solo `_sin_firmas`, que busca `https://…?…`. Con un error de conexión, requests escribe «Max retries exceeded with url: /storage/v1/object/sign/…?token=eyJ…», sin host, y el token pasaba. Ahora se aplica `sin_firma` encima.
+- Pruebas: `tests/test_errores_sin_firma.py` (sin el arreglo fallan 3 de 5).
+
 ## 7.6.7 (3-oct-2026) — TEMPO MÁS RÁPIDO, MISMO RESULTADO (carga masiva)
 - El 60 % de `analyze` se iba en un bucle de Python de `grid_detect._grid_score`: unas 10.700 llamadas en un tema de 10 min, cada una sacando el máximo de una ventana de 3 cuadros golpe por golpe. Ahora la ventana se calcula una sola vez (`maximum_filter1d`) y cada llamada es una indexación de numpy.
 - **Mismo resultado, bit a bit:** con el tema sintético de 10 min y 8 tempos de 98 a 172 BPM, `detect_grid` da lo mismo que antes, y los puntajes son idénticos (hay una prueba).
