@@ -1,5 +1,10 @@
 # Historial de versiones · worker.py (análisis)
 
+## Nota (3-oct-2026) — escala de `loudness_lufs` (Refs dj-connect#320, sin cambio de código)
+- `loudness_lufs` está en escala **mono**, ≈3,8 dB por debajo de BS.1770 estéreo. Los objetivos −12,5 de la app y de la radio están en esa escala.
+- El MP3 de escucha no sale más fuerte que el original: −8,6 contra −8,4 LUFS en «Weekend's Started». Los picos de más de 0 dBFS vienen de masters calientes y los cubren los limitadores.
+- **Decisión B:** no cambiar la escala antes de la carga de Germán. El cambio completo (PR #29 + objetivos + reanálisis en silencio) va después del lanzamiento. Ver README, «Escala de `loudness_lufs`».
+
 ## 7.6.8 (3-oct-2026) — EXAMEN CM2 CON GOLDEN SET SINTÉTICO (#573)
 - El examen CM2 medía 6 temas del catálogo. Al pasar a la papelera, su audio quedó solo en el proyecto viejo, así que `stream-track` daba 404 y el examen salía **NO APROBADO** en cada arranque: CM2 no escribía anclas.
 - Ahora el golden set es **sintético**: 6 temas generados con BPM (122–128) y fase de bombo conocidos y codificados con `make_rendition`, el mismo MP3 que oye el DJ. Así se mide el ancla sobre la rendición, **sin red y sin depender de la música de nadie**.

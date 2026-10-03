@@ -43,3 +43,10 @@ pip install -r requirements-stems.txt
 python banco_separacion.py temas/*.mp3 --salida banco --tempos tempos.csv   # tempos.csv: archivo,bpm,ancla_ms (opcional)
 ```
 Deja `resultados.csv`, `resumen.txt`, las pistas por motor y `escucha_ciega/<tema>/A|B` (la clave está en `clave_ciega.json`: escuchar antes de abrirla).
+
+## Escala de `loudness_lufs` (importante)
+El análisis guarda `loudness_lufs` medido sobre la **mezcla en mono**. Queda ≈3,8 dB por debajo de BS.1770 en estéreo, que es lo que da cualquier medidor: «Weekend's Started» mide −8,4 LUFS y la base dice −12,2. Los objetivos de normalización de la app (`soundChain.ts`) y de la radio (`radio-queue-next`), −12,5, están en esa misma escala (≈ −9 LUFS reales).
+
+**El MP3 de escucha no toca la ganancia:** copia el audio tal cual, como dice el estándar de la plataforma. Si un master viene caliente, sus picos pasan de 0 dBFS (+2,9 dBTP en ese tema). Los cubren los limitadores de la app y de `radio.liq`.
+
+Pasar a BS.1770 es el PR #29 (7.6.9), que se mezcla junto con los dos objetivos a ≈ −9 y un reanálisis en silencio, en un solo despliegue y después del lanzamiento (decisión B del 3-oct, Refs dj-connect#320).
