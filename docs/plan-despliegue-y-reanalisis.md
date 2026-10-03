@@ -11,9 +11,12 @@ Preparado en la noche del 2→3-oct-2026 (rol Workers), a pedido del integrador.
 | Género por etiqueta, etapa A | main (#16) | análisis 7.6.3 | `deepmancho-worker-` |
 | `energy_v2` aparte (#248) | **PR #21** | análisis 7.6.5 | `deepmancho-worker-` |
 | Tiempo por trabajo en el log y archivo muy grande como determinista | **PR #22** | análisis 7.6.6 | `deepmancho-worker-` |
+| Tempo más rápido con el mismo resultado (`analyze` 35 → 18 s de CPU en un tema de 10 min) | **PR #24** | análisis 7.6.7 | `deepmancho-worker-` |
+| Reanálisis en silencio (`analysis_jobs.origen`) | **plataforma #404** | SQL | — |
+| Columna `music_tracks.energy_v2` | **plataforma #405** | SQL | — |
 | Pista casi vacía en `stem_quality` | PR #20 | stems 1.23.3 | `stems-worker` |
 
-**Orden recomendado:** #21 → #22 (chocan solo en el banner y el CHANGELOG) → un solo redespliegue de los tres servicios. #20 puede ir en el mismo redespliegue de stems.
+**Orden recomendado:** SQL de #404 y #405 (pruebas revertidas en cada PR) → #21 → #22 → #24 (chocan solo en el banner y el CHANGELOG) → un solo redespliegue de los tres servicios. #20 puede ir en el mismo redespliegue de stems.
 
 **Antes de redesplegar:** confirmar en Railway qué versión arrancó por última vez (la primera línea del log: `DeepMancho worker iniciado (vX…)`). Si es anterior a 7.6.2, este despliegue trae también la carga masiva y el género.
 
@@ -59,21 +62,21 @@ El reanálisis **no pisa** la rejilla manual (`grid_source='manual'`) ni los cue
 
 ### Paso 3 · encolar
 ```sql
-insert into analysis_jobs (track_id, status)
-select r.id, 'pending' from respaldo_reanalisis_206 r
+insert into analysis_jobs (track_id, status, origen)
+select r.id, 'pending', 'reanalisis' from respaldo_reanalisis_206 r
 where not exists (select 1 from analysis_jobs a
                   where a.track_id = r.id and a.status in ('pending', 'processing'));
 ```
 - Con la clave de servicio (editor SQL), el disparador `cobrar_reanalisis` **no cobra créditos** al DJ (`auth.uid()` es nulo).
 - `worker-next` no manda semilla para estos temas: el tempo se mide de cero, que es justo lo que arregla #206.
-- **Ojo, avisa a los DJ:** cada trabajo abre la «tanda» del DJ (`analisis_abrir_tanda`). Cuando termina, si son 2 o más temas, le llega **«N canciones analizadas»** (`notify_on_analysis_job_fin`). Es un mensaje a usuarios: **el integrador decide** si sale así (es cierto: sus temas quedaron mejor analizados) o si antes se apaga ese aviso para este reanálisis (Funciones).
+- **En silencio** (decisión del integrador, 3-oct): con `origen='reanalisis'` no se abre la tanda ni se manda «N canciones analizadas» (plataforma #404). **Requiere aplicar #404 antes de encolar**: sin esa migración, la columna `origen` no existe y el insert falla, que es lo seguro.
 - **No mezclarlo con la carga masiva:** la cola es por orden de llegada. Encolar el reanálisis **después** de la carga de ~1.000 temas, o en tandas de 100.
 
 ### Cuánto cuesta
-- **Tiempo de CPU:** medido en local (Apple M4), `analyze` tarda 140 s con un tema de 10 min, y el resto del trabajo suma unos 5 s. En Railway hay que esperar **2 a 3 veces más**. Para un tema promedio de 6–7 min: **~3–4 min por tema y réplica**.
-  - 100 temas con 5 réplicas: **~1 h**. 500 temas: **~6 h**.
+- **Tiempo de CPU:** medido en local (Apple M4, 1 hilo), `analyze` gasta 35 s de CPU con un tema de 10 min, y **18 s con #24**. En Railway hay que esperar hasta 3 veces más. Para un tema promedio de 6–7 min, con #24: **~40 s por tema y réplica**.
+  - 100 temas con 5 réplicas: **~15 min**. 1.000 temas: **~2–3 h**.
   - El dato real sale del log de #22 (`OK en N s`): medir con las primeras 20 y recalcular.
-- **Plata (precios de lista de Railway: US$20 por vCPU al mes y US$10 por GB al mes; verificar el plan que se contrate):** ~3,5 min de 1 vCPU y ~2 GB de promedio ≈ **US$0,003 por tema**. 1.000 temas ≈ **US$3**. Bajar los originales de Supabase: ~15 MB por tema, ~15 GB por cada 1.000 temas (dentro de la cuota del plan, o ~US$1,35 si se pasa).
+- **Plata (precios de lista de Railway: US$20 por vCPU al mes y US$10 por GB al mes; verificar el plan que se contrate):** ~1 min de 1 vCPU y ~2 GB de promedio ≈ **US$0,001 por tema**. 1.000 temas ≈ **US$1**. Bajar los originales de Supabase: ~15 MB por tema, ~15 GB por cada 1.000 temas (dentro de la cuota del plan, o ~US$1,35 si se pasa).
 - **ElevenLabs y créditos de DJ:** cero. El reconocimiento por huella solo corre si al tema le falta artista o título.
 
 ### Paso 4 · comparar y cerrar #206
@@ -111,7 +114,7 @@ Si algo sale mal, vuelve atrás con un `update … from respaldo_reanalisis_206`
 - [ ] En la app, el tema muestra su BPM, su tonalidad, los cues y la rejilla alineada al bombo.
 
 **Carga masiva (primera tanda de 20–50 temas):**
-- [ ] El N más alto de `OK en N s`: si pasa de ~350 s, hay que subir `TOPE_TRABAJO_S` (que no llegue a los 8 min del reclamo) o bajar `MAX_DURATION`, antes de seguir.
+- [ ] El N más alto de `OK en N s` (con #24 se espera ~1 min en un tema de 10 min): si pasa de ~350 s, hay que subir `TOPE_TRABAJO_S` (que no llegue a los 8 min del reclamo) o bajar `MAX_DURATION`, antes de seguir.
 - [ ] No hay `trabajo mas largo que 7 min` en el log.
 - [ ] Las memorias de las réplicas en Railway no se acercan al límite (el pico de `analyze` con un tema de 10 min es ~4,5 GB, medido en local).
 - [ ] `select status, count(*) from analysis_jobs where created_at > now() - interval '2 hours' group by 1;` sin `error` acumulándose.
