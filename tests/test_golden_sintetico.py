@@ -54,7 +54,8 @@ def test_los_temas_traen_las_trampas():
 def test_examen_aprueba_sin_red(sin_red, capsys):
     assert worker.golden_exam() is True
     out = capsys.readouterr().out
-    assert out.count("✅") == len(worker.GOLDEN_PAIRS) == 3
+    pares = [linea for linea in out.splitlines() if "] Par " in linea]
+    assert len(pares) == len(worker.GOLDEN_PAIRS) == 3 and all("✅" in p for p in pares)
     assert "RESULTADO: APROBADO" in out
 
 
