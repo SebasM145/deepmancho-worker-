@@ -71,3 +71,20 @@ def test_semillas_incluyen_tres_medios():
     assert any(abs(o - 121.1) < 0.2 for o in otras)
     assert all(90 <= c <= 180 for c in octavas + otras)
     assert grid_detect.semillas_candidatas(124.0)[0][0] == 124.0  # la semilla buena sigue primera
+
+
+def test_puntaje_vectorizado_igual_al_original():
+    """_grid_score con la ventana precalculada da exactamente lo mismo que el bucle original."""
+    import grid_detect as gd
+    rng = np.random.default_rng(5)
+    env = rng.random(3000)
+    env3 = gd._max3(env)
+    for period in (0.4, 0.4839, 0.5):
+        for phase in np.linspace(0, 0.39, 7):
+            n = int((60.0 - phase) / period)
+            frames = np.round((phase + np.arange(n) * period) * 11025 / gd.HOP).astype(int)
+            frames = frames[(frames >= 0) & (frames < len(env))]
+            lo, hi = np.maximum(frames - 1, 0), np.minimum(frames + 2, len(env))
+            original = float(np.mean([np.max(env[a:b]) for a, b in zip(lo, hi)]))
+            assert gd._grid_score(env, 11025, period, phase, 60.0, env3) == original
+            assert gd._grid_score(env, 11025, period, phase, 60.0) == original
