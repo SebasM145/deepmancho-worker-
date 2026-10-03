@@ -165,41 +165,74 @@ ANCHOR_SR = 22050    # SR del análisis de ancla (independiente del SR=11025 gen
 ANCHOR_HOP = 128     # ~5.8 ms por frame de onset a 22050 Hz
 ANCHOR_TOL_MS = 10.0 # criterio del examen (error relativo por par)
 
-# Golden set — anclas validadas por oído + telemetría (18-ago-2026).
-# gold_ms = first_beat_detected_ms vigente en la base tras la calibración manual.
-GOLDEN_TRACKS = [
-    # (track_id, titulo, bpm, gold_ancla_ms_MOD_BEAT)
-    # RECALIBRADO 23-ago-2026 con la metodologia certificada de
-    # docs/golden-set-mixer.md (banda de kick 35-130 Hz Butterworth + envolvente
-    # de Hilbert + ataque al 25% entre piso y pico, 90 s desde el 35% del track),
-    # medido de forma INDEPENDIENTE del worker. Los gold anteriores (81/128/238/
-    # 158/398/372) venian de la metodologia vieja basada en el PICO y resultaron
-    # dispersos (-140 a +170 ms), no un corrimiento constante: eran la regla
-    # equivocada. Validacion cruzada: el detector de la v7.2 coincidio con la
-    # medicion independiente en 5 de 6 tracks dentro de +-5 ms.
-    ("b411743d-de03-4190-b6fe-f44aa6685ba8", "Make It Hot (Mustafa Ismaeel Rmx)", 122.0, 12),
-    ("a16963a1-0d15-4354-80e5-ba27500dd7b1", "Blame (Claptone Extended Mix)",     122.0, 57),
-    ("4cc427fb-03a6-4165-8ca3-2025b6ebe779", "No Time for Tears (Original Mix)",  122.0, 98),
-    ("7d377de8-6562-416d-8b0b-97317f9b6c7f", "Slip Away (Original Mix)",          122.0, 41),
-    ("cfaaaa0e-26d1-4e96-ab3c-8a5a49f34f07", "Right Thing (Instrumental)",        123.0, 43),
-    # RETIRADO del examen: "Till There Was You (Vanilla Ace)" (b3f57c3c) tiene
-    # jitter p90 de 14.6 ms y tempo real ~123.04 (deriva): su propia fase depende
-    # del BPM asumido, asi que RECHAZA los criterios del golden set y no sirve
-    # como referencia. Reponer el tercer par cuando se certifique un reemplazo.
+# Golden set SINTÉTICO (#573, 3-oct-2026). Antes eran 6 temas del catálogo (calibrados
+# por oído el 23-ago, ver docs/golden-set-mixer.md); al pasar a la papelera y quedar su
+# audio solo en el proyecto viejo, stream-track daba 404 y el examen salía NO APROBADO en
+# cada arranque. Ahora cada tema se GENERA con BPM y fase de bombo conocidos y se codifica
+# con make_rendition (el mismo MP3 que oye el DJ), así que el examen sigue midiendo el
+# ancla sobre la rendición sin depender de la música de nadie ni de la red.
+# Cada tema trae trampas de música real: intro y break sin bombo, bajo a contratiempo
+# DENTRO de la banda del bombo (35-130 Hz), clap en 2 y 4, hi-hats y ruido de fondo.
+# El oro es el arranque del bombo (su primera muestra), módulo el período de beat.
+GOLDEN_SINTETICO = [
+    # (nombre, bpm, fase_ms, kick_hz_ini, caida_kick, nivel_bajo)
+    ("sintético 122 · bombo seco",        122.0,  12.0, 160.0, 14.0, 0.30),
+    ("sintético 122 · bombo largo",       122.0,  57.0, 120.0,  8.0, 0.35),
+    ("sintético 124 · bajo fuerte",       124.0,  98.0, 150.0, 12.0, 0.55),
+    ("sintético 124 · bombo grave",       124.0,  41.0,  90.0, 10.0, 0.30),
+    ("sintético 128 · fase tardía",       128.0, 371.0, 170.0, 16.0, 0.40),
+    ("sintético 123 · casi sin ataque",   123.0, 203.0, 100.0,  6.0, 0.45),
 ]
 
 # El ancla del examen se compara MODULO el periodo de beat: el valor absoluto que
 # reporta el worker (p. ej. 16284.3 ms) es el mismo ancla + n*beat.
-GOLDEN_PAIRS = [(0, 1), (2, 3)]  # indices (deck A, deck B); el orden fija el signo.
-# El tercer par quedo pendiente al retirar "Till There Was You" (dato malo).
+GOLDEN_PAIRS = [(0, 1), (2, 3), (4, 5)]  # indices (deck A, deck B); el orden fija el signo.
 
-# Prueba CIEGA (v6.2): tracks jamas calibrados por oido. El examen imprime sus
-# anclas calculadas (no hay gold contra el cual comparar); se escriben a mano
-# via SQL y el DJ las valida alineando por rejilla en el mixer.
-BLIND_TRACKS = [
-    ("a83916eb-2333-43e8-b131-77071032db59", "This Sound (Extended Mix)",  124.0),
-    ("cf7f1585-f6cf-451a-bf12-e4ebe01c8d89", "Day 'N' Nite (Extended Mix)", 124.0),
-]
+
+def tema_golden(bpm, fase_ms, kick_hz, caida, nivel_bajo, dur_s=120.0, sr=44100, semilla=0):
+    """Tema 4x4 sintético en estéreo float32 con el bombo arrancando en fase_ms + n*beat.
+    8 compases de intro y 8 de break (compases 40-47) sin bombo."""
+    rng = np.random.default_rng(semilla)
+    n = int(dur_s * sr)
+    t = np.arange(n) / sr
+    beat = 60.0 / bpm
+    x = np.zeros(n, dtype=np.float64)
+    largo = int(0.35 * sr)
+    tk = np.arange(largo) / sr
+    ataque = np.minimum(1.0, tk / 0.002)                       # 2 ms de subida
+    f = 45.0 + (kick_hz - 45.0) * np.exp(-tk * 30.0)           # barrido de tono del bombo
+    bombo = np.sin(2 * np.pi * np.cumsum(f) / sr) * np.exp(-tk * caida) * ataque
+    largo_c = int(0.12 * sr)
+    clap = rng.standard_normal(largo_c) * np.exp(-np.arange(largo_c) / sr * 35.0)
+    clap = clap - np.convolve(clap, np.ones(9) / 9, mode="same")  # sin graves
+    largo_h = int(0.05 * sr)
+    hat = rng.standard_normal(largo_h) * np.exp(-np.arange(largo_h) / sr * 90.0)
+    hat = hat - np.convolve(hat, np.ones(5) / 5, mode="same")
+    k = 0
+    while True:
+        t0 = fase_ms / 1000.0 + k * beat
+        i0 = int(round(t0 * sr))
+        if i0 >= n:
+            break
+        compas = k // 4
+        sin_bombo = compas < 8 or 40 <= compas < 48
+        if not sin_bombo and i0 >= 0:
+            m = min(largo, n - i0); x[i0:i0 + m] += 0.9 * bombo[:m]
+        if k % 4 in (1, 3) and compas >= 4 and i0 >= 0:            # clap en 2 y 4
+            m = min(largo_c, n - i0); x[i0:i0 + m] += 0.25 * clap[:m]
+        ih = int(round((t0 + beat / 2) * sr))                      # hi-hat y bajo a contratiempo
+        if 0 <= ih < n:
+            m = min(largo_h, n - ih); x[ih:ih + m] += 0.12 * hat[:m]
+            if compas >= 8:
+                lb = min(int(beat / 2 * sr * 0.9), n - ih)
+                tb = np.arange(lb) / sr
+                x[ih:ih + lb] += nivel_bajo * np.sin(2 * np.pi * 55.0 * tb) * np.minimum(1.0, tb / 0.01) \
+                    * np.minimum(1.0, (lb / sr - tb) / 0.01)
+        k += 1
+    x += 0.003 * rng.standard_normal(n)                          # piso de ruido (~ -50 dB)
+    x = 0.9 * x / max(1e-9, float(np.max(np.abs(x))))
+    return np.stack([x, x * 0.97], axis=1).astype(np.float32)
+
 
 # ----------------------------------------------------------------------------
 # Estándar de 8 cues (debe coincidir con src/lib/djCueStandard.ts)
@@ -1463,25 +1496,47 @@ def _wrap(x: float, T: float) -> float:
     return x - T if x > T / 2 else x
 
 
+def ancla_golden(i: int) -> dict:
+    """Genera el tema sintético i, lo pasa por make_rendition (el MP3 de escucha) y mide
+    su ancla con compute_anchor. Los temporales se borran aunque falle."""
+    import soundfile as sf
+    nombre, bpm, fase, kick_hz, caida, bajo = GOLDEN_SINTETICO[i]
+    wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+    mp3 = None
+    try:
+        sf.write(wav, tema_golden(bpm, fase, kick_hz, caida, bajo, semilla=i), 44100)
+        mp3 = make_rendition(wav)
+        if not mp3:
+            raise RuntimeError("make_rendition no generó el MP3")
+        return compute_anchor(mp3, bpm)
+    finally:
+        for f in (wav, mp3):
+            if f and os.path.exists(f):
+                os.remove(f)
+
+
 def golden_exam():
-    """Examen del golden set. Solo LEE audio e imprime; NUNCA escribe en la base.
-    Gate: |error relativo| <= ANCHOR_TOL_MS en los 3 pares -> APROBADO."""
-    print("[CM2 EXAMEN] arrancando examen del golden set (6 tracks, solo lectura)...", flush=True)
+    """Examen del golden set sintético (#573). Solo genera audio local y mide; NUNCA
+    escribe en la base ni usa la red. Gate: |error relativo| <= ANCHOR_TOL_MS en los
+    3 pares -> APROBADO. Además imprime el error absoluto de cada tema contra su oro."""
+    print(f"[CM2 EXAMEN] arrancando examen del golden set sintético ({len(GOLDEN_SINTETICO)} temas, sin red)...", flush=True)
     resultados = {}
-    for i, (tid, title, bpm, gold) in enumerate(GOLDEN_TRACKS):
+    for i, (title, bpm, gold, *_resto) in enumerate(GOLDEN_SINTETICO):
         try:
-            res = ancla_de_rendicion(tid, bpm)
+            res = ancla_golden(i)
             res["gold"] = gold; res["bpm"] = bpm
             resultados[i] = res
+            T = 60000.0 / bpm
+            abs_err = _wrap(float(res["ancla_ms"]) - gold, T)
             flag = " ⚠ residuo alto" if res["residuo_ms"] > 8 else ""
-            print(f"[CM2 EXAMEN] {title}: ancla={res['ancla_ms']}ms "
+            print(f"[CM2 EXAMEN] {title}: ancla={res['ancla_ms']}ms (oro {gold} ms, error {abs_err:+.1f} ms) "
                   f"bpm_real={res['bpm_real']} residuo={res['residuo_ms']}ms{flag}", flush=True)
         except Exception as e:
             print(f"[CM2 EXAMEN] {title}: FALLO al analizar ({e})", flush=True)
     aprobado = True
     for a, b in GOLDEN_PAIRS:
-        if a not in resultados or b in (None,) or b not in resultados:
-            print(f"[CM2 EXAMEN] Par {GOLDEN_TRACKS[a][1]} × {GOLDEN_TRACKS[b][1]}: SIN DATOS", flush=True)
+        if a not in resultados or b not in resultados:
+            print(f"[CM2 EXAMEN] Par {GOLDEN_SINTETICO[a][0]} × {GOLDEN_SINTETICO[b][0]}: SIN DATOS", flush=True)
             aprobado = False
             continue
         A, B = resultados[a], resultados[b]
@@ -1489,15 +1544,8 @@ def golden_exam():
         err = _wrap((B["ancla_ms"] - A["ancla_ms"]) - (B["gold"] - A["gold"]), T)
         ok = abs(err) <= ANCHOR_TOL_MS
         aprobado = aprobado and ok
-        print(f"[CM2 EXAMEN] Par {GOLDEN_TRACKS[a][1]} × {GOLDEN_TRACKS[b][1]}: "
+        print(f"[CM2 EXAMEN] Par {GOLDEN_SINTETICO[a][0]} × {GOLDEN_SINTETICO[b][0]}: "
               f"error {err:+.1f} ms {'✅' if ok else '❌'}", flush=True)
-    for tid, title, bpm in BLIND_TRACKS:
-        try:
-            res = ancla_de_rendicion(tid, bpm)
-            print(f"[CM2 CIEGA] {title}: ancla={res['ancla_ms']}ms "
-                  f"bpm_real={res['bpm_real']} residuo={res['residuo_ms']}ms", flush=True)
-        except Exception as e:
-            print(f"[CM2 CIEGA] {title}: FALLO ({e})", flush=True)
     print(f"[CM2 EXAMEN] RESULTADO: {'APROBADO ✅' if aprobado else 'NO APROBADO ❌'}"
           f" (criterio ±{ANCHOR_TOL_MS} ms por par)", flush=True)
     if aprobado and not ENABLE_ANCHOR_BACKFILL:
@@ -2475,7 +2523,7 @@ def liberar_memoria():
 
 def main():
     filtrar_salida()
-    print("DeepMancho worker iniciado (v7.6.7: tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.6.8: examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     global EXAMEN_CM2_APROBADO
