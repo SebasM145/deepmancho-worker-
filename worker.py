@@ -2386,9 +2386,9 @@ def poll_limpiar_streams() -> bool:
             print(f"[limpiar-stream] {job['track_id']}: ya estaba limpia", flush=True)
         _limpiar_api("result", {"job_id": job["id"], "path": path, "bytes": n})
     except Exception as e:
-        print(f"[limpiar-stream] {job.get('track_id')}: fallo ({str(e)[:200]})", flush=True)
+        print(f"[limpiar-stream] {job.get('track_id')}: fallo ({sin_firma(e)[:200]})", flush=True)
         try:
-            _limpiar_api("fail", {"job_id": job["id"], "error": str(e)[:500]})
+            _limpiar_api("fail", {"job_id": job["id"], "error": sin_firma(e)[:500]})
         except Exception:
             pass
     finally:
@@ -2422,7 +2422,8 @@ def poll_set_render():
     except Exception as e:
         traceback.print_exc()
         try:
-            _set_api("fail", {"job_id": job["id"], "error": _sin_firmas(str(e))[:2000]})
+            # _sin_firmas solo ve URLs con https://; requests dice «with url: /ruta?token=…».
+            _set_api("fail", {"job_id": job["id"], "error": sin_firma(_sin_firmas(str(e)))[:2000]})
         except Exception:
             pass
     return True

@@ -1,5 +1,11 @@
 # Historial de versiones · worker.py (análisis)
 
+## Errores sin firma en la limpieza de copias y en los sets (3-oct-2026) — W6 · sin versión propia
+- Entra con la versión siguiente del worker que se mezcle (no cambia el banner, para no chocar con #21, #22 y #24).
+- `stream-limpiar` (#265) mandaba `str(e)` tal cual a la base. Ahora pasa por `sin_firma`.
+- `set-render` (#143) usaba solo `_sin_firmas`, que busca `https://…?…`. Con un error de conexión, requests escribe «Max retries exceeded with url: /storage/v1/object/sign/…?token=eyJ…», sin host, y el token pasaba. Ahora se aplica `sin_firma` encima.
+- Pruebas: `tests/test_errores_sin_firma.py` (sin el arreglo fallan 3 de 5).
+
 ## 7.6.4 (2-oct-2026) — TEMPO: LA SEMILLA DE 2/3 (#206, segunda parte)
 - Medido con el golden set **sin BPM previo** (7 temas de 122–124 BPM):
   - antes de #10: **0 de 7** correctos (115 · 121,4 · 115 · 125,3 · 121,4 · 131,75 · 164);
