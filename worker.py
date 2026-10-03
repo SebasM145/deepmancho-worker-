@@ -1540,8 +1540,12 @@ def golden_exam():
             aprobado = False
             continue
         A, B = resultados[a], resultados[b]
-        T = 60000.0 / ((A["bpm"] + B["bpm"]) / 2.0)
-        err = _wrap((B["ancla_ms"] - A["ancla_ms"]) - (B["gold"] - A["gold"]), T)
+        # Error de cada tema contra su oro, plegado a SU período, y después la resta: con el
+        # mismo BPM da lo mismo que la fórmula de antes, y con BPM distintos sigue siendo
+        # correcta (comparar anclas absolutas con un período promedio no lo era).
+        eA = _wrap(float(A["ancla_ms"]) - A["gold"], 60000.0 / A["bpm"])
+        eB = _wrap(float(B["ancla_ms"]) - B["gold"], 60000.0 / B["bpm"])
+        err = eB - eA
         ok = abs(err) <= ANCHOR_TOL_MS
         aprobado = aprobado and ok
         print(f"[CM2 EXAMEN] Par {GOLDEN_SINTETICO[a][0]} × {GOLDEN_SINTETICO[b][0]}: "

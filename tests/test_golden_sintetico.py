@@ -78,3 +78,13 @@ def test_examen_sin_ffmpeg_no_aprueba(sin_red, monkeypatch):
     """Si no se puede codificar el MP3, no hay examen aprobado (CM2 no escribe nada)."""
     monkeypatch.setattr(worker, "make_rendition", lambda *a, **k: None)
     assert worker.golden_exam() is False
+
+
+def test_par_con_bpm_distintos_compara_cada_tema_con_su_periodo(monkeypatch, capsys):
+    """Regresión: el par 128 × 123 BPM daba +132 ms con anclas perfectas (período promedio)."""
+    def perfecta(i):
+        nombre, bpm, fase, *_ = worker.GOLDEN_SINTETICO[i]
+        return {"ancla_ms": fase + 120 * 60000.0 / bpm - 6.0, "bpm_real": bpm, "residuo_ms": 1.0}
+    monkeypatch.setattr(worker, "ancla_golden", perfecta)
+    assert worker.golden_exam() is True
+    assert "error +0.0 ms ✅" in capsys.readouterr().out
