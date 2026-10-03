@@ -1,5 +1,9 @@
 # Historial de versiones · worker.py (análisis)
 
+## stems_worker 1.23.3 (3-oct-2026) — UNA PISTA CASI VACÍA YA NO DESAPARECE DE LA CALIDAD
+- `_envolvente` devolvía **2 valores** cuando la pista dura menos de 80 ms, y `calidad_pistas` espera 3. El `ValueError` se tragaba como «no se pudo leer» y la pista **faltaba** en `stem_quality`, en vez de salir como `vacia`. Ahora devuelve las 3 salidas y la pista queda `vacia`.
+- Pruebas: `tests/test_calidad_pistas.py` (también fija la filtración del fuerte al débil).
+
 ## Errores sin firma en la limpieza de copias y en los sets (3-oct-2026) — W6 · sin versión propia
 - Entra con la versión siguiente del worker que se mezcle (no cambia el banner, para no chocar con #21, #22 y #24).
 - `stream-limpiar` (#265) mandaba `str(e)` tal cual a la base. Ahora pasa por `sin_firma`.
