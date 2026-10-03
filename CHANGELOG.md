@@ -1,5 +1,13 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.8 (3-oct-2026) — EXAMEN CM2 CON GOLDEN SET SINTÉTICO (#573)
+- El examen CM2 medía 6 temas del catálogo. Al pasar a la papelera, su audio quedó solo en el proyecto viejo, así que `stream-track` daba 404 y el examen salía **NO APROBADO** en cada arranque: CM2 no escribía anclas.
+- Ahora el golden set es **sintético**: 6 temas generados con BPM (122–128) y fase de bombo conocidos y codificados con `make_rendition`, el mismo MP3 que oye el DJ. Así se mide el ancla sobre la rendición, **sin red y sin depender de la música de nadie**.
+- Cada tema trae trampas de música real: intro y break sin bombo, bajo a contratiempo dentro de la banda del bombo (35–130 Hz), clap en 2 y 4, hi-hats y ruido de fondo. **Vuelve el tercer par**, que estaba retirado.
+- Medido sin codificar: el detector adelanta 4–7 ms en todos los temas (el filtro de fase cero). Los pares quedan a ≤ 3 ms, dentro del criterio de ±10 ms. El examen imprime además el error absoluto de cada tema contra su oro.
+- Se retira la prueba ciega (This Sound y Day 'N' Nite, también en la papelera).
+- Pruebas: `tests/test_golden_sintetico.py`. Aprueba sin red, **reprueba si el ancla de un tema se corre 25 ms** y reprueba si no se puede codificar.
+
 ## stems_worker 1.23.3 (3-oct-2026) — UNA PISTA CASI VACÍA YA NO DESAPARECE DE LA CALIDAD
 - `_envolvente` devolvía **2 valores** cuando la pista dura menos de 80 ms, y `calidad_pistas` espera 3. El `ValueError` se tragaba como «no se pudo leer» y la pista **faltaba** en `stem_quality`, en vez de salir como `vacia`. Ahora devuelve las 3 salidas y la pista queda `vacia`.
 - Pruebas: `tests/test_calidad_pistas.py` (también fija la filtración del fuerte al débil).
