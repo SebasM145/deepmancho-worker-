@@ -1,5 +1,7 @@
 # Cuando vuelva el plan de Railway: despliegue, reanálisis y verificación
 
+> El punto 5 es la lista paso a paso para el día del plan (los cuatro servicios).
+
 Preparado en la noche del 2→3-oct-2026 (rol Workers), a pedido del integrador. Railway está sin plan: hasta que se active, nada de esto corre. **Todo lo de este documento lo hace el integrador de día.** El SQL de abajo es para la base de producción.
 
 ## 1. Qué está en `main` y qué espera en PR
@@ -122,3 +124,61 @@ Si algo sale mal, vuelve atrás con un `update … from respaldo_reanalisis_206`
 - [ ] Los temas en `error` con `determinista:archivo de …` son archivos de más de `MAX_TRACK_MB` (250). Esos se resuben en MP3.
 
 **Reanálisis de #206:** el punto 2, pasos 1 a 4.
+
+## 5. El día del plan: los cuatro servicios en una sola tanda
+
+Lo armé desde el repo, sin consultar Railway: de noche está prohibido, y leer las variables expondría secretos. Los nombres de las variables salen de la auditoría del 29-sep. Según #30, los tres workers siguen con la compilación del **1-oct** (análisis en #8, stems 1.23.0 y verificador 1.1.0). Con la prueba vencida, puede que ninguno esté corriendo.
+
+### Qué hay en `main` sin desplegar
+| Servicio | En Railway (1-oct) | En `main` | Qué trae |
+|---|---|---|---|
+| `grid-verifier` | 1.1.0 | **1.1.2** | Registros sin URLs firmadas; `no_anchor` pasa a ser una carrera y no una falla («esperando_analisis»); usa `MAX_TRACK_MB`. |
+| `deepmancho-worker-` (análisis) | 7.5.3 + W2 | **7.6.4** (+ #21/#22/#24 si se mezclan: 7.6.7) | Tempo #206; el set sigue el plan (#143, apagado); copias de escucha sin etiquetas (#265); registros sin firmas; tope por trabajo y `MAX_TRACK_MB`; género por etiqueta. |
+| `stems-worker` | 1.23.0 | **1.23.2** (+ #20: 1.23.3) | Registros sin firmas; solo la versión. |
+| `music-generator` | Function del 29-sep (sin repo) | — | Nada que desplegar: solo volver a arrancarlo. |
+
+### Variables
+- **Ninguna obligatoria nueva.** `MAX_TRACK_MB` (250) y `TOPE_TRABAJO_S` (420) tienen valor por defecto en el código.
+- **`stems-worker`: borrar `NO_CACHE` antes de compilar.** Con ella, cada compilación reinstala torch.
+- **`music-generator`: tiene que tener su propia `ELEVENLABS_API_KEY`.** La auditoría del 29-sep no la vio, y desde F0-02 `/music/claim` ya no entrega la clave: sin ella, cada canción larga falla con «sin clave de ElevenLabs».
+- **Se quedan como están (apagadas):** `ENABLE_SET_RENDER` (se enciende después de medir la RAM con un set de 2 h), `ENABLE_ANCHOR_BACKFILL` y `GRID_VERIFY_APPLY`.
+- **Watch paths del análisis:** agregar `analizador_v8.py`. #21 lo copia a la imagen, y sin eso un cambio solo en ese archivo no redespliega.
+
+### Orden (una sola tanda)
+**0. Antes de desplegar:**
+- plan activo;
+- `NO_CACHE` borrada;
+- watch path de `analizador_v8.py` agregada;
+- SQL #404 y #405 aplicados (ya lo hizo el integrador);
+- opcional: mezclar #21 → #22 → #24 en el repo del worker.
+
+Como los pushes sin plan no crearon despliegues, en cada servicio hay que usar **«Deploy latest commit»**.
+
+**1. `grid-verifier`.** Es la compilación más liviana (numpy y scipy): confirma que el plan compila.
+- [ ] El log arranca con `1.1.2-py` y sin traceback.
+- [ ] Toma trabajos, o espera creciente si la cola está vacía.
+- [ ] Un tema sin ancla sale `esperando_analisis:no_anchor`, no `determinista:`.
+
+**2. `deepmancho-worker-` (análisis).** Es lo crítico para la carga masiva.
+- [ ] Banner `v7.6.4`, o `v7.6.7` si entraron #21, #22 y #24.
+- [ ] No aparece `[limpiar-stream] la funcion stream-limpiar no existe todavia`. Si aparece, hay que reiniciar una vez después de desplegar `stream-limpiar`.
+- [ ] Prueba con 1 tema sin etiqueta de BPM: `v7 bpm X → Y (…, constante)` con Y correcto, cues y rejilla en la app, `genero: …` y, con #22, `OK en N s` muy por debajo de 420.
+- [ ] Ningún `token=eyJ` en los registros.
+- [ ] Réplicas: las que se decidan para la carga (3 a 5). El pico medido de `analyze` es 4,5 GB con un tema de 10 min: revisar que el límite de RAM por réplica del plan alcance.
+
+**3. `stems-worker`.** Es la compilación más pesada (torch y modelos): sin `NO_CACHE`, usa la caché.
+- [ ] Banner `1.23.2` (o `1.23.3`) y sin traceback.
+- [ ] Separar un tema de prueba termina y trae todas las pistas en `stem_quality`.
+- [ ] Ningún `token=eyJ` en los registros.
+- [ ] Mirar la RAM durante la separación (htdemucs_6s).
+
+**4. `music-generator`.** Solo volver a arrancarlo.
+- [ ] El log dice `music-generator escuchando en … · clave de Railway`.
+- [ ] `GET /health` responde `configurado: true` y `clave: "railway"`. Si dice `temporal-plataforma`, falta la `ELEVENLABS_API_KEY` (secreto: lo pone el integrador).
+- [ ] Una canción de prueba de más de 90 s desde el Estudio termina, o queda en `music/fail` con un error legible.
+
+### Después de la tanda
+1. Carga masiva: primera tanda de 20–50 temas y revisar la lista del punto 4 de este documento. Recién entonces, el resto.
+2. Reanálisis de #206 (punto 2), en silencio (`origen='reanalisis'`), **después** de la carga.
+3. `ENABLE_SET_RENDER=true`, después de medir un set de 2 h.
+4. Servicio `radio` (#320, Mezclador): aparte, con su propia lista.
