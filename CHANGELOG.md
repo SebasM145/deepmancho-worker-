@@ -1,5 +1,11 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.7 (3-oct-2026) — TEMPO MÁS RÁPIDO, MISMO RESULTADO (carga masiva)
+- El 60 % de `analyze` se iba en un bucle de Python de `grid_detect._grid_score`: unas 10.700 llamadas en un tema de 10 min, cada una sacando el máximo de una ventana de 3 cuadros golpe por golpe. Ahora la ventana se calcula una sola vez (`maximum_filter1d`) y cada llamada es una indexación de numpy.
+- **Mismo resultado, bit a bit:** con el tema sintético de 10 min y 8 tempos de 98 a 172 BPM, `detect_grid` da lo mismo que antes, y los puntajes son idénticos (hay una prueba).
+- Medido en local, con un solo hilo y en tiempo de CPU: `detect_grid` baja de 19,8 s a 0,6 s, y `analyze` de **35 s a 18 s** con un tema de 10 min.
+- **Tope por trabajo (`TOPE_TRABAJO_S`=420):** no hace falta subirlo, ni partir el análisis, ni bajar la resolución. Aunque Railway vaya 3 veces más lento, un tema de 10 min queda en ~1 min de análisis (~2 min antes de este cambio). La cifra de 140 s que se dio en #22 incluía la compilación inicial de numba y la CPU compartida con otras pruebas. Se confirma con el log de #22 (`OK en N s`) en la primera tanda.
+
 ## 7.6.4 (2-oct-2026) — TEMPO: LA SEMILLA DE 2/3 (#206, segunda parte)
 - Medido con el golden set **sin BPM previo** (7 temas de 122–124 BPM):
   - antes de #10: **0 de 7** correctos (115 · 121,4 · 115 · 125,3 · 121,4 · 131,75 · 164);
