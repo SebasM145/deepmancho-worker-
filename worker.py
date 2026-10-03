@@ -1154,23 +1154,49 @@ def fingerprint_identify(path: str):
 def compute_loudness_lufs(path: str):
     """LUFS integrado del archivo. None si pyloudnorm no está o el audio falla.
     Nunca rompe el job: la ausencia de loudness no debe frenar el análisis."""
+    return medir_sonoridad(path).get("loudness_lufs")
+
+
+def medir_sonoridad(path: str) -> dict:
+    """`loudness_lufs` (como siempre: LUFS del audio en mono) y `energy_v2` (#248).
+
+    energy_v2 es la energía 1-10 sin saturar de analizador_v8 (LUFS estéreo de -20 a
+    -6, agudos absolutos y golpes por segundo). Va como CAMPO APARTE: `energy` no
+    cambia hasta calibrarla con la referencia del dueño. Con las dos en el catálogo
+    real se comparan antes de decidir. Se mide sobre la misma carga a 44,1 kHz que
+    ya se hacía para el LUFS (en estéreo: el doble de RAM durante este paso)."""
     try:
         import pyloudnorm  # dependencia: pyloudnorm>=0.1 (requirements)
     except ImportError:
         print("WARN CM1: pyloudnorm no instalado; loudness_lufs no se calcula", flush=True)
-        return None
+        return {}
+    out = {}
     try:
-        y44, sr44 = librosa.load(path, sr=44100, mono=True, duration=MAX_DURATION)
-        if y44.size == 0:
-            return None
+        y, sr44 = librosa.load(path, sr=44100, mono=False, duration=MAX_DURATION)
+        y = np.atleast_2d(y)
+        if y.size == 0:
+            return {}
+        mono = y.mean(axis=0)  # lo mismo que librosa.load(mono=True)
         meter = pyloudnorm.Meter(sr44)
-        lufs = float(meter.integrated_loudness(y44))
-        if not np.isfinite(lufs):
-            return None
-        return round(lufs, 2)
+        lufs = float(meter.integrated_loudness(mono))
+        if np.isfinite(lufs):
+            out["loudness_lufs"] = round(lufs, 2)
+        try:
+            import analizador_v8 as v8
+            estereo = np.ascontiguousarray(v8._estereo(y.T))
+            mezcla = {"lufs_integrado": v8._r(meter.integrated_loudness(estereo), 1),
+                      "tercios_db": v8.tercios_de_octava(mono, sr44)}
+            golpes = librosa.onset.onset_detect(y=mono, sr=sr44, units="time")
+            dur_s = len(mono) / sr44
+            e2 = v8.energia_v2(mezcla, len(golpes) / dur_s if dur_s > 0 else None)
+            if e2 is not None:
+                out["energy_v2"] = e2
+        except Exception as e:
+            print(f"WARN energy_v2 (no bloquea): {e}", flush=True)
+        return out
     except Exception:
         traceback.print_exc()
-        return None
+        return out
 
 
 # ----------------------------------------------------------------------------
@@ -1704,6 +1730,7 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
     track_id = job["track_id"]
     print(f"[job {job_id}] track {track_id} — analizando...", flush=True)
     tmp = None
+    t0 = time.time()
     try:
         if not audio_url:
             send_result(job_id, track_id, "error", error="track sin audio")
@@ -1732,9 +1759,9 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
             print(f"[job {job_id}] genero: {gen.get('genre_detected')} ({gen.get('genre_confidence')})", flush=True)
         except Exception as e:
             print(f"[job {job_id}] genero: fallo ({e})", flush=True)
-        lufs = compute_loudness_lufs(tmp)
-        if lufs is not None:
-            result["loudness_lufs"] = lufs
+        result.update(medir_sonoridad(tmp))
+        if result.get("energy_v2") is not None:
+            print(f"[job {job_id}] energia: {result.get('energy')} (v2: {result['energy_v2']})", flush=True)
         # CM2 (solo con ENABLE_ANCHOR_BACKFILL=true y examen aprobado): ancla de
         # precision sobre la RENDITION (lo que oye el DJ), nunca sobre el master.
         # Escribe SOLO first_beat_detected_ms; jamas first_beat_offset_ms ni _source.
@@ -1793,16 +1820,21 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
                 print(f"[job {job_id}] identificado: {ident['artist']} — {ident['title']}", flush=True)
         send_result(job_id, track_id, "done", result=result)
         n_cues = len(result.get("cue_points") or [])
-        print(f"[job {job_id}] OK — cues={n_cues} energy={result['energy']}", flush=True)
+        # El tiempo total sirve para ajustar TOPE_TRABAJO_S con datos de Railway (carga masiva).
+        print(f"[job {job_id}] OK en {time.time() - t0:.0f} s (tema de {result.get('duration_seconds') or '?'} s) "
+              f"— cues={n_cues} energy={result['energy']}", flush=True)
     except Exception as e:
         import signal
         signal.alarm(0)  # que el tope no corte el aviso de error
         traceback.print_exc()
+        # «determinista:» = reintentar da lo mismo (como en grid_verifier). worker-result
+        # hoy reintenta todo error hasta 3 veces; con este prefijo puede cerrarlo de una.
+        error = f"determinista:{e}" if isinstance(e, ArchivoMuyGrande) else str(e)
         try:
-            send_result(job_id, track_id, "error", error=str(e))
+            send_result(job_id, track_id, "error", error=error)
         except Exception:
             pass
-        print(f"[job {job_id}] FALLO: {e}", flush=True)
+        print(f"[job {job_id}] FALLO en {time.time() - t0:.0f} s: {error}", flush=True)
     finally:
         import signal
         signal.alarm(0)
@@ -2386,9 +2418,9 @@ def poll_limpiar_streams() -> bool:
             print(f"[limpiar-stream] {job['track_id']}: ya estaba limpia", flush=True)
         _limpiar_api("result", {"job_id": job["id"], "path": path, "bytes": n})
     except Exception as e:
-        print(f"[limpiar-stream] {job.get('track_id')}: fallo ({str(e)[:200]})", flush=True)
+        print(f"[limpiar-stream] {job.get('track_id')}: fallo ({sin_firma(e)[:200]})", flush=True)
         try:
-            _limpiar_api("fail", {"job_id": job["id"], "error": str(e)[:500]})
+            _limpiar_api("fail", {"job_id": job["id"], "error": sin_firma(e)[:500]})
         except Exception:
             pass
     finally:
@@ -2422,7 +2454,8 @@ def poll_set_render():
     except Exception as e:
         traceback.print_exc()
         try:
-            _set_api("fail", {"job_id": job["id"], "error": _sin_firmas(str(e))[:2000]})
+            # _sin_firmas solo ve URLs con https://; requests dice «with url: /ruta?token=…».
+            _set_api("fail", {"job_id": job["id"], "error": sin_firma(_sin_firmas(str(e)))[:2000]})
         except Exception:
             pass
     return True
@@ -2442,7 +2475,7 @@ def liberar_memoria():
 
 def main():
     filtrar_salida()
-    print("DeepMancho worker iniciado (v7.6.4: tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.6.7: tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     global EXAMEN_CM2_APROBADO
