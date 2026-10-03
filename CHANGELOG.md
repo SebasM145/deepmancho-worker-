@@ -1,5 +1,9 @@
 # Historial de versiones · worker.py (análisis)
 
+## stems_worker 1.23.3 (3-oct-2026) — UNA PISTA CASI VACÍA YA NO DESAPARECE DE LA CALIDAD
+- `_envolvente` devolvía **2 valores** cuando la pista dura menos de 80 ms, y `calidad_pistas` espera 3. El `ValueError` se tragaba como «no se pudo leer» y la pista **faltaba** en `stem_quality`, en vez de salir como `vacia`. Ahora devuelve las 3 salidas y la pista queda `vacia`.
+- Pruebas: `tests/test_calidad_pistas.py` (también fija la filtración del fuerte al débil).
+
 ## 7.6.4 (2-oct-2026) — TEMPO: LA SEMILLA DE 2/3 (#206, segunda parte)
 - Medido con el golden set **sin BPM previo** (7 temas de 122–124 BPM):
   - antes de #10: **0 de 7** correctos (115 · 121,4 · 115 · 125,3 · 121,4 · 131,75 · 164);

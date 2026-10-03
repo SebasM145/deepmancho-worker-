@@ -65,7 +65,7 @@ os.environ.setdefault("MKL_NUM_THREADS", os.environ.get("TORCH_THREADS", "6"))
 MAX_MB = int(os.environ.get("MAX_TRACK_MB", "60"))
 HEADERS = {"x-worker-secret": SECRET, "Content-Type": "application/json"}
 # Railway solo despliega pushes de un solo padre (squash); los merge commits no disparan nada.
-VERSION = "1.23.2"
+VERSION = "1.23.3"
 STEP_DIV = 4  # 16 pasos por compás de 4/4
 
 
@@ -1132,7 +1132,7 @@ def _envolvente(y, sr, ventana_ms=20):
     n = max(1, int(sr * ventana_ms / 1000))
     total = len(y) // n
     if total < 4:
-        return np.zeros(4), 0.0
+        return np.zeros(4), 0.0, 0.0     # mismas 3 salidas: con 2, la pista desaparecía del informe
     e = np.sqrt((y[: total * n].reshape(total, n) ** 2).mean(axis=1) + 1e-12)
     # Se devuelve el PICO (una batería es fuerte pero suena poco tiempo: con el
     # promedio parecía débil) y cuánto FLUCTÚA (std/media): un piano sostenido
