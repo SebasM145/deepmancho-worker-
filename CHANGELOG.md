@@ -1,5 +1,20 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.9 (3-oct-2026) — `loudness_lufs` EN LA ESCALA ESTÁNDAR (BS.1770, estéreo) · Refs #320
+- **Lo que se reportó:** «Weekend's Started» da −8,6 LUFS y +2,9 dBFS en su MP3 de escucha, contra `loudness_lufs` = −12,2.
+- **Lo que se midió:**
+  - **El MP3 no sube el volumen.** El original WAV da −8,4 LUFS y el MP3 −8,6.
+  - **La diferencia es de escala:** `loudness_lufs` se medía sobre la mezcla en **mono** (−12,2), 3,8 dB por debajo de BS.1770 en estéreo.
+  - Los picos vienen del master: +0,9 dBTP, con 2.502 muestras ya a 0 dBFS. La codificación MP3 los lleva a +2,9.
+- **Cambio:** `loudness_lufs` = LUFS integrado BS.1770 en estéreo, lo mismo que mide cualquier medidor. El log muestra las dos escalas durante la transición (`LUFS -8.4 (escala mono de antes: -12.2)`).
+- **Va junto con:** los objetivos de normalización calibrados en la escala vieja. Pasan de −12,5 a ≈ −9 en el mismo despliegue:
+  - `TARGET_LUFS` de `src/lib/audio/soundChain.ts` (app);
+  - `TARGET_LUFS` de `radio-queue-next` (radio).
+
+  Si no se mueven, todo lo analizado con la 7.6.9 suena ~3,5 dB más bajo.
+- **Picos:** el MP3 sigue sin ganancia ni limitador, como dice el estándar (`audioConverter.ts` y aquí). La reproducción normaliza y le devolvería al archivo cualquier ganancia que se le quite. El techo va al final de la cadena: la app ya tiene limitador (−3 dB, 20:1) y la radio lo suma en `radio.liq` (Mezclador).
+- Pruebas: un seno de 1 kHz a −20 dBFS en L y R mide −20 LUFS; con la escala mono daba −23. Otra prueba compara contra pyloudnorm en estéreo.
+
 ## 7.6.8 (3-oct-2026) — EXAMEN CM2 CON GOLDEN SET SINTÉTICO (#573)
 - El examen CM2 medía 6 temas del catálogo. Al pasar a la papelera, su audio quedó solo en el proyecto viejo, así que `stream-track` daba 404 y el examen salía **NO APROBADO** en cada arranque: CM2 no escribía anclas.
 - Ahora el golden set es **sintético**: 6 temas generados con BPM (122–128) y fase de bombo conocidos y codificados con `make_rendition`, el mismo MP3 que oye el DJ. Así se mide el ancla sobre la rendición, **sin red y sin depender de la música de nadie**.

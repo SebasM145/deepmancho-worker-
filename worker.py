@@ -1191,7 +1191,13 @@ def compute_loudness_lufs(path: str):
 
 
 def medir_sonoridad(path: str) -> dict:
-    """`loudness_lufs` (como siempre: LUFS del audio en mono) y `energy_v2` (#248).
+    """`loudness_lufs` (BS.1770 en ESTÉREO, 7.6.9) y `energy_v2` (#248).
+
+    Hasta la 7.6.8, `loudness_lufs` se medía sobre la mezcla en MONO: daba 3–4 dB menos
+    que cualquier medidor estándar (Weekend's Started: −12,2 «mono» contra −8,4 LUFS
+    reales). No era que el MP3 sonara más fuerte; era otra escala (#320). Los objetivos de
+    normalización de la app y de la radio (−12,5) estaban calibrados en la escala mono:
+    pasan a ≈ −9 en el mismo despliegue (ver CHANGELOG 7.6.9).
 
     energy_v2 es la energía 1-10 sin saturar de analizador_v8 (LUFS estéreo de -20 a
     -6, agudos absolutos y golpes por segundo). Va como CAMPO APARTE: `energy` no
@@ -1211,13 +1217,15 @@ def medir_sonoridad(path: str) -> dict:
             return {}
         mono = y.mean(axis=0)  # lo mismo que librosa.load(mono=True)
         meter = pyloudnorm.Meter(sr44)
-        lufs = float(meter.integrated_loudness(mono))
+        import analizador_v8 as v8
+        estereo = np.ascontiguousarray(v8._estereo(y.T))
+        lufs = float(meter.integrated_loudness(estereo))       # BS.1770: L + R
         if np.isfinite(lufs):
             out["loudness_lufs"] = round(lufs, 2)
+            lufs_mono = float(meter.integrated_loudness(mono))
+            print(f"    LUFS {lufs:.1f} (escala mono de antes: {lufs_mono:.1f})", flush=True)
         try:
-            import analizador_v8 as v8
-            estereo = np.ascontiguousarray(v8._estereo(y.T))
-            mezcla = {"lufs_integrado": v8._r(meter.integrated_loudness(estereo), 1),
+            mezcla = {"lufs_integrado": v8._r(lufs, 1) if np.isfinite(lufs) else None,
                       "tercios_db": v8.tercios_de_octava(mono, sr44)}
             golpes = librosa.onset.onset_detect(y=mono, sr=sr44, units="time")
             dur_s = len(mono) / sr44
@@ -2527,7 +2535,7 @@ def liberar_memoria():
 
 def main():
     filtrar_salida()
-    print("DeepMancho worker iniciado (v7.6.8: examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.6.9: loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     global EXAMEN_CM2_APROBADO
