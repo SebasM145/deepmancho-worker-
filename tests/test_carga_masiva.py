@@ -103,7 +103,7 @@ def test_el_log_dice_cuanto_tardo_el_trabajo(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(worker, "download_audio", lambda url: str(p))
     monkeypatch.setattr(worker, "analyze", lambda path, bpm_seed=None: {"energy": 7, "duration_seconds": 412})
     monkeypatch.setattr(worker, "detectar_genero", lambda path: {})
-    monkeypatch.setattr(worker, "compute_loudness_lufs", lambda path: None)
+    monkeypatch.setattr(worker, "medir_sonoridad", lambda path: {})
     monkeypatch.setattr(worker, "send_result", lambda *a, **k: None)
     worker.process_job({"id": "j", "track_id": "t"}, {"artist": "a", "title": "b"}, "http://x/a.wav")
     assert "OK en 0 s (tema de 412 s)" in capsys.readouterr().out
