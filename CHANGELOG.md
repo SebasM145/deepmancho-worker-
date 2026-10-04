@@ -15,6 +15,9 @@
 - **Picos:** el MP3 sigue sin ganancia ni limitador, como dice el estándar (`audioConverter.ts` y aquí). La reproducción normaliza y le devolvería al archivo cualquier ganancia que se le quite. El techo va al final de la cadena: la app ya tiene limitador (−3 dB, 20:1) y la radio lo suma en `radio.liq` (Mezclador).
 - Pruebas: un seno de 1 kHz a −20 dBFS en L y R mide −20 LUFS; con la escala mono daba −23. Otra prueba compara contra pyloudnorm en estéreo.
 
+## Nota (3-oct-2026) — escala de `loudness_lufs`: primero B, después A el mismo día
+- Primero se decidió B (documentar la escala mono, PR #30). Luego Germán pidió A antes del lanzamiento: la 7.6.9 de arriba, con los objetivos de la app y la radio movidos a −9 en el mismo despliegue y el reanálisis en silencio.
+
 ## 7.6.8 (3-oct-2026) — EXAMEN CM2 CON GOLDEN SET SINTÉTICO (#573)
 - El examen CM2 medía 6 temas del catálogo. Al pasar a la papelera, su audio quedó solo en el proyecto viejo, así que `stream-track` daba 404 y el examen salía **NO APROBADO** en cada arranque: CM2 no escribía anclas.
 - Ahora el golden set es **sintético**: 6 temas generados con BPM (122–128) y fase de bombo conocidos y codificados con `make_rendition`, el mismo MP3 que oye el DJ. Así se mide el ancla sobre la rendición, **sin red y sin depender de la música de nadie**.
