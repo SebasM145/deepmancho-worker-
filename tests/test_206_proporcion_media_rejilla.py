@@ -37,6 +37,15 @@ def test_dos_tercios_explicada_por_la_media_rejilla():
     assert gd.explicada_por_media_rejilla(92.0, 138.0)
 
 
+def test_la_octava_de_dos_tercios_la_explica_el_tempo_real():
+    # Si librosa da 90,7 (2/3 de 136), la octava es 90,7 y 136 es la proporción ×1,5:
+    # los golpes de 90,7 caen sobre la media rejilla de 136, no al revés.
+    assert gd.explicada_por_media_rejilla(90.67, 136.0)
+    assert not gd.explicada_por_media_rejilla(136.0, 90.67)
+    # Day 'N' Nite (2-oct, ×0,75 incorrecta): la octava NO la explica la candidata, sigue el 10 %.
+    assert not gd.explicada_por_media_rejilla(124.0, 124.0 * 0.75)
+
+
 def test_las_proporciones_buenas_siguen_compitiendo():
     # «Right Thing» (2-oct): la octava de 80,75 se iba a 174,33; ×1,5 da 121 → 123, que es el bueno.
     assert not gd.explicada_por_media_rejilla(123.0, 174.33)

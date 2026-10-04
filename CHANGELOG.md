@@ -2,7 +2,8 @@
 
 ## 7.6.12 (4-oct-2026) — 136 BPM SIN ETIQUETA YA NO SALE A 2/3 · Refs dj-connect#206
 - **Qué pasaba:** un tema sin BPM en la etiqueta a 136, con bombo en cada tiempo y hi-hat a contratiempo, salía **90,54** (`tempo_stability` «desconocido»). La semilla ×2/3 de 7.6.9 (#17) entraba en la búsqueda (90,7 ≥ 90), y su rejilla de 1,5 tiempos = **3 medios tiempos** caía siempre sobre un golpe (bombo, hi-hat, bombo…): puntuaba más del 10 % sobre el tempo real.
-- **Arreglo (`grid_detect.explicada_por_media_rejilla`):** una proporción cuyo período es un múltiplo entero del **medio tiempo** de la mejor octava no compite, porque todo lo que puntúa ya lo explica la octava. «Right Thing» (123 contra la octava 174,33: 2,835 medios tiempos) y los ×4/3 y ×0,75 (1,5 y 2,667) siguen compitiendo como antes.
+- **Causa medida en el CI:** librosa ya propone **90,7** (2/3 de 136), que queda como «octava»; 136 entra como la proporción ×1,5 y perdía porque tenía que ganar por más de un 10 % (`VENTAJA_PROPORCION`), y las dos rejillas pegan sobre golpes.
+- **Arreglo (`grid_detect.explicada_por_media_rejilla`):** si los golpes de la octava caen sobre la rejilla de **medio tiempo** de la proporción (90,7 cada 1,5 tiempos = 3 medios tiempos de 136), la proporción los explica todos y además pega en cada tiempo: le basta igualar a la octava, sin el 10 %. En el sentido contrario (una proporción explicada por la media rejilla de la octava) la proporción no compite. «Right Thing» (123 contra 174,33: 2,835 medios tiempos) y Day 'N' Nite (×0,75 incorrecta) siguen igual: necesitan el 10 %.
 - Lo tomó el Mezclador por la regla anti-bucle (3 intentos de Workers). Pruebas: `tests/test_206_proporcion_media_rejilla.py` y la de punta a punta de #34, `tests/test_206_analisis_completo.py` (7/7).
 
 ## 7.6.11 (4-oct-2026) — TEMAS LARGOS SIN MATAR LA RÉPLICA, Y ETIQUETAS DE BPM FUERA DE RANGO · Refs #206 #573
