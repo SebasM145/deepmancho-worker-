@@ -72,6 +72,28 @@ PROPORCIONES = (1.5, 2 / 3, 4 / 3, 0.75)
 # mejor octava (golden set 2-oct: Right Thing +26 % con x1,5 y es correcta; Day 'N' Nite
 # +1,6 % con x0,75 y es incorrecta).
 VENTAJA_PROPORCION = 1.10
+# #206 (4-oct, 136 BPM sin etiqueta → 90,54): con bombo en cada tiempo y hi-hat a contratiempo
+# hay un golpe cada MEDIO tiempo, y la rejilla de 2/3 del tempo (1,5 tiempos = 3 medios
+# tiempos) cae siempre sobre uno. Esa candidata no aporta nada que la octava no explique.
+TOLERANCIA_MEDIA_REJILLA = 0.01
+
+
+def explicada_por_media_rejilla(cand_bpm, octava_bpm, tol=TOLERANCIA_MEDIA_REJILLA):
+    """¿El período de la candidata es un múltiplo entero del MEDIO tiempo de la octava?
+
+    Si lo es, todos sus golpes caen sobre la rejilla de medio tiempo de la octava: lo que
+    puntúa la candidata ya lo explica la octava y no puede ganarle. Ejemplos:
+      · 136 contra 90,54 (×2/3): 2·136/90,54 = 3,004 medios tiempos → explicada.
+      · «Right Thing» (2-oct): 123 contra 174,33 (la octava de 80,75): 2,835 → compite.
+      · ×4/3 y ×0,75 dan 1,5 y 2,667 medios tiempos → compiten como hasta ahora.
+    """
+    if not (cand_bpm and octava_bpm) or cand_bpm <= 0 or octava_bpm <= 0:
+        return False
+    r = 2.0 * octava_bpm / cand_bpm  # período de la candidata en medios tiempos de la octava
+    k = round(r)
+    return k >= 1 and abs(r - k) <= tol * k
+
+
 
 
 def semillas_candidatas(cruda):
