@@ -9,23 +9,25 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import grid_detect as gd  # noqa: E402
 
-SR = 22050
+SR_ARCHIVO = 44100
 
 
-def con_contratiempo(bpm, dur_s=30, ancla_s=0.25):
-    """Bombo en cada tiempo y hi-hat a contratiempo (el caso que falla)."""
-    t = np.arange(int(SR * dur_s)) / SR
+def con_contratiempo(bpm, dur_s=40, ancla_s=0.25):
+    """El sintético de #108/#573/#34: bombo en cada tiempo, hi-hat a contratiempo y acorde."""
+    t = np.arange(int(SR_ARCHIVO * dur_s)) / SR_ARCHIVO
     y = np.zeros_like(t)
     rng = np.random.default_rng(7)
     beat = 60.0 / bpm
     for k in np.arange(ancla_s, dur_s, beat):
-        i = int(k * SR)
-        n = min(int(0.12 * SR), len(y) - i)
-        tt = np.arange(n) / SR
+        i = int(k * SR_ARCHIVO)
+        n = min(int(0.12 * SR_ARCHIVO), len(y) - i)
+        tt = np.arange(n) / SR_ARCHIVO
         y[i:i + n] += 0.9 * np.sin(2 * np.pi * (50 + 80 * np.exp(-tt * 30)) * tt) * np.exp(-tt * 18)
-        j = int((k + beat / 2) * SR)
-        m = min(int(0.02 * SR), max(0, len(y) - j))
+        j = int((k + beat / 2) * SR_ARCHIVO)
+        m = min(int(0.02 * SR_ARCHIVO), max(0, len(y) - j))
         y[j:j + m] += 0.2 * rng.standard_normal(m)
+    for f in (220.0, 261.63, 329.63):
+        y += 0.08 * np.sin(2 * np.pi * f * t)
     return y.astype(np.float32)
 
 
@@ -47,7 +49,14 @@ def test_las_proporciones_buenas_siguen_compitiendo():
     assert not gd.explicada_por_media_rejilla(None, 124.0)
 
 
-def test_136_con_contratiempo_sin_semilla_da_136():
-    """Falla sin el arreglo: detect_tempo devolvía ~90,5 (2/3 del tempo)."""
-    bpm, _ = gd.detect_tempo(con_contratiempo(136), SR, seed_bpm=None)
+def test_136_con_contratiempo_sin_semilla_da_136(tmp_path):
+    """Falla sin el arreglo: detect_tempo devolvía 90,54 (2/3 del tempo). Se carga como
+    `analyze()`: WAV de 44,1 kHz leído por librosa a 11.025 Hz (worker.SR)."""
+    import librosa
+    import soundfile as sf
+
+    ruta = tmp_path / "sin_etiqueta_136.wav"
+    sf.write(ruta, con_contratiempo(136), SR_ARCHIVO)
+    y, sr = librosa.load(str(ruta), sr=11025, mono=True)
+    bpm, _ = gd.detect_tempo(y, sr, seed_bpm=None)
     assert round(bpm) == 136, bpm
