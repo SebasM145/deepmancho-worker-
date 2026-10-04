@@ -173,12 +173,13 @@ def detect_tempo(y, sr, seed_bpm=None, env=None):
         # compite (el hi-hat a contratiempo la hacía ganar a 2/3 del tempo real).
         if explicada_por_media_rejilla(cand[0], mejor_octava):
             continue
-        # Al revés (el ❌ real de #206): librosa ya propone 2/3 del tempo (90,7 a 136) y queda
-        # como «octava». Sus golpes, cada 1,5 tiempos, caen sobre la media rejilla de la
-        # proporción ×1,5 (136), que los explica todos y además pega en cada tiempo. Esa
-        # proporción no necesita el 10 % de ventaja: le basta igualar a la octava.
+        # Al revés (el ❌ real de #206, medido en el CI): librosa da 92,3 → la octava se ajusta
+        # a 90,60 (puntaje 0,7444) y el tempo real entra como la proporción ×1,5 → 135,70
+        # (0,7427). Los golpes de la octava, cada 1,5 tiempos, caen sobre la media rejilla de
+        # la proporción: ésta los explica todos y además pega en cada tiempo. Se invierte la
+        # carga de la prueba: la octava se queda solo si le gana por la misma VENTAJA.
         if explicada_por_media_rejilla(mejor_octava, cand[0]):
-            if cand[1] >= best[1]:
+            if cand[1] * VENTAJA_PROPORCION >= best[1]:
                 best = cand
             continue
         if cand[1] > best[1] * VENTAJA_PROPORCION:
