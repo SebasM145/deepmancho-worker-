@@ -166,8 +166,13 @@ def detect_tempo(y, sr, seed_bpm=None, env=None):
         cand = _busqueda_gruesa(env, sr, dur_s, semilla, env3)
         if cand[1] > best[1]:
             best = cand
+    mejor_octava = best[0]
     for semilla in otras:
         cand = _busqueda_gruesa(env, sr, dur_s, semilla, env3)
+        # #206: una proporción cuya rejilla cae sobre la de medio tiempo de la octava no
+        # compite (el hi-hat a contratiempo la hacía ganar a 2/3 del tempo real).
+        if explicada_por_media_rejilla(cand[0], mejor_octava):
+            continue
         if cand[1] > best[1] * VENTAJA_PROPORCION:
             best = (cand[0], cand[1] / VENTAJA_PROPORCION)
 

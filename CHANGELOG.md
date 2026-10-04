@@ -1,5 +1,10 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.12 (4-oct-2026) — 136 BPM SIN ETIQUETA YA NO SALE A 2/3 · Refs dj-connect#206
+- **Qué pasaba:** un tema sin BPM en la etiqueta a 136, con bombo en cada tiempo y hi-hat a contratiempo, salía **90,54** (`tempo_stability` «desconocido»). La semilla ×2/3 de 7.6.9 (#17) entraba en la búsqueda (90,7 ≥ 90), y su rejilla de 1,5 tiempos = **3 medios tiempos** caía siempre sobre un golpe (bombo, hi-hat, bombo…): puntuaba más del 10 % sobre el tempo real.
+- **Arreglo (`grid_detect.explicada_por_media_rejilla`):** una proporción cuyo período es un múltiplo entero del **medio tiempo** de la mejor octava no compite, porque todo lo que puntúa ya lo explica la octava. «Right Thing» (123 contra la octava 174,33: 2,835 medios tiempos) y los ×4/3 y ×0,75 (1,5 y 2,667) siguen compitiendo como antes.
+- Lo tomó el Mezclador por la regla anti-bucle (3 intentos de Workers). Pruebas: `tests/test_206_proporcion_media_rejilla.py` y la de punta a punta de #34, `tests/test_206_analisis_completo.py` (7/7).
+
 ## 7.6.11 (4-oct-2026) — TEMAS LARGOS SIN MATAR LA RÉPLICA, Y ETIQUETAS DE BPM FUERA DE RANGO · Refs #206 #573
 - **«Gratitude» (631 s) mató la réplica 3 veces** (08:51, 09:00 y 09:09 UTC): «sin respuesta después de 3 intentos», sin «OK» ni «FALLO» en el log. Medido con el archivo real, `analyze` llegaba a **5,8 GB**. El culpable estaba en `refine_bpm`: `beat_track` estima el tempo con un tempograma de autocorrelación de 384 × ~100.000 cuadros (hop 128 a 22 kHz), que solo él sumaba **+6,6 GB**. La métrica de Railway (suma de réplicas, muestreada cada 60 s) no mostraba ese pico.
 - **Arreglo:** `tempo_por_bloques` calcula el promedio del tempograma por bloques de cuadros (mismo relleno, ventana y normalización que `librosa.feature.tempogram`) y se lo pasa a `librosa.feature.tempo`; `beat_track` recibe ese tempo. **Mismo resultado:** con Gratitude, el tempo (121,5993) y los 1.221 beats son idénticos; también en temas sintéticos de 98 a 174 BPM. **Pico: 5,8 → 2,8 GB.**
