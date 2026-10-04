@@ -49,13 +49,23 @@ def test_la_energia_actual_se_satura_y_la_v2_no(tmp_path):
     assert m_fuerte["energy_v2"] - m_suave["energy_v2"] >= 2            # la v2 los separa
 
 
-def test_loudness_lufs_sigue_igual(tmp_path):
+def test_loudness_lufs_es_bs1770_estereo(tmp_path):
+    """#320: un seno de 1 kHz a −20 dBFS en L y R mide −20 LUFS (BS.1770). La escala mono
+    de antes daba −23 (y en música real, 3–4 dB menos que cualquier medidor)."""
+    t = np.arange(10 * SR) / SR
+    x = 0.1 * np.sin(2 * np.pi * 1000 * t)
+    p = tmp_path / "seno.wav"
+    sf.write(p, np.stack([x, x], axis=1).astype(np.float32), SR)
+    assert worker.compute_loudness_lufs(str(p)) == pytest.approx(-20.0, abs=0.2)
+
+
+def test_loudness_lufs_coincide_con_un_medidor_estandar(tmp_path):
     p = tmp_path / "g.wav"
     sf.write(p, groove(1.0), SR)
-    y44, _ = worker.librosa.load(str(p), sr=44100, mono=True)
+    y, _ = worker.librosa.load(str(p), sr=44100, mono=False)
     import pyloudnorm
-    antes = round(float(pyloudnorm.Meter(44100).integrated_loudness(y44)), 2)
-    assert worker.compute_loudness_lufs(str(p)) == pytest.approx(antes, abs=0.02)
+    estandar = round(float(pyloudnorm.Meter(44100).integrated_loudness(np.ascontiguousarray(y.T))), 2)
+    assert worker.compute_loudness_lufs(str(p)) == pytest.approx(estandar, abs=0.02)
 
 
 def test_sin_audio_no_rompe(tmp_path):
@@ -77,4 +87,4 @@ def test_el_trabajo_manda_energy_v2_sin_tocar_energy(monkeypatch, tmp_path):
     (args, kw), = enviados
     r = kw.get("result") or args[3]
     assert r["energy"] == 8                    # la de siempre, intacta
-    assert 1 <= r["energy_v2"] <= 10 and r["loudness_lufs"] < -6
+    assert 1 <= r["energy_v2"] <= 10 and -7 < r["loudness_lufs"] < -4  # estéreo BS.1770 (en mono daba -8,5)

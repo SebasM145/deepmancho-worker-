@@ -1,9 +1,22 @@
 # Historial de versiones · worker.py (análisis)
 
-## Nota (3-oct-2026) — escala de `loudness_lufs` (Refs dj-connect#320, sin cambio de código)
-- `loudness_lufs` está en escala **mono**, ≈3,8 dB por debajo de BS.1770 estéreo. Los objetivos −12,5 de la app y de la radio están en esa escala.
-- El MP3 de escucha no sale más fuerte que el original: −8,6 contra −8,4 LUFS en «Weekend's Started». Los picos de más de 0 dBFS vienen de masters calientes y los cubren los limitadores.
-- **Decisión B:** no cambiar la escala antes de la carga de Germán. El cambio completo (PR #29 + objetivos + reanálisis en silencio) va después del lanzamiento. Ver README, «Escala de `loudness_lufs`».
+## 7.6.9 (3-oct-2026) — `loudness_lufs` EN LA ESCALA ESTÁNDAR (BS.1770, estéreo) · Refs #320
+- **Lo que se reportó:** «Weekend's Started» da −8,6 LUFS y +2,9 dBFS en su MP3 de escucha, contra `loudness_lufs` = −12,2.
+- **Lo que se midió:**
+  - **El MP3 no sube el volumen.** El original WAV da −8,4 LUFS y el MP3 −8,6.
+  - **La diferencia es de escala:** `loudness_lufs` se medía sobre la mezcla en **mono** (−12,2), 3,8 dB por debajo de BS.1770 en estéreo.
+  - Los picos vienen del master: +0,9 dBTP, con 2.502 muestras ya a 0 dBFS. La codificación MP3 los lleva a +2,9.
+- **Cambio:** `loudness_lufs` = LUFS integrado BS.1770 en estéreo, lo mismo que mide cualquier medidor. El log muestra las dos escalas durante la transición (`LUFS -8.4 (escala mono de antes: -12.2)`).
+- **Va junto con:** los objetivos de normalización calibrados en la escala vieja. Pasan de −12,5 a ≈ −9 en el mismo despliegue:
+  - `TARGET_LUFS` de `src/lib/audio/soundChain.ts` (app);
+  - `TARGET_LUFS` de `radio-queue-next` (radio).
+
+  Si no se mueven, todo lo analizado con la 7.6.9 suena ~3,5 dB más bajo.
+- **Picos:** el MP3 sigue sin ganancia ni limitador, como dice el estándar (`audioConverter.ts` y aquí). La reproducción normaliza y le devolvería al archivo cualquier ganancia que se le quite. El techo va al final de la cadena: la app ya tiene limitador (−3 dB, 20:1) y la radio lo suma en `radio.liq` (Mezclador).
+- Pruebas: un seno de 1 kHz a −20 dBFS en L y R mide −20 LUFS; con la escala mono daba −23. Otra prueba compara contra pyloudnorm en estéreo.
+
+## Nota (3-oct-2026) — escala de `loudness_lufs`: primero B, después A el mismo día
+- Primero se decidió B (documentar la escala mono, PR #30). Luego Germán pidió A antes del lanzamiento: la 7.6.9 de arriba, con los objetivos de la app y la radio movidos a −9 en el mismo despliegue y el reanálisis en silencio.
 
 ## 7.6.8 (3-oct-2026) — EXAMEN CM2 CON GOLDEN SET SINTÉTICO (#573)
 - El examen CM2 medía 6 temas del catálogo. Al pasar a la papelera, su audio quedó solo en el proyecto viejo, así que `stream-track` daba 404 y el examen salía **NO APROBADO** en cada arranque: CM2 no escribía anclas.
