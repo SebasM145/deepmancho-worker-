@@ -717,6 +717,29 @@ RUNWAY_BARS_MIN = 16     # audio mínimo tras MIX-OUT para completar la mezcla
 TEMPO_RESID_MS = 35.0    # residuo robusto (p90) para considerar el tempo constante
 
 
+def tempo_por_bloques(onset_env: np.ndarray, sr: int, hop: int, start_bpm: float, bloque: int = 4096) -> np.ndarray:
+    """librosa.feature.tempo(onset_envelope=..., start_bpm=...) sin armar el tempograma entero.
+
+    beat_track estima el tempo con un tempograma de autocorrelación (384 lags × cada cuadro)
+    y lo promedia en el tiempo. Con hop 128 a 22050 Hz, un tema de 10 min son ~100.000
+    cuadros: ese paso solo sumaba +6,6 GB y mataba la réplica (Gratitude, 631 s, 4-oct-2026).
+    Aquí cada bloque de cuadros sale igual que en librosa.feature.tempogram (relleno
+    'linear_ramp', ventana hann, normalización por cuadro) y se acumula el promedio; el
+    resto (prior y máximo) lo hace librosa.feature.tempo con ese tempograma promedio."""
+    from scipy.signal import get_window
+    win = int(librosa.time_to_frames(8.0, sr=sr, hop_length=hop).item())  # ac_size por defecto
+    n = onset_env.shape[-1]
+    p = np.pad(onset_env, (win // 2, win // 2), mode="linear_ramp", end_values=[0, 0])
+    cuadros = librosa.util.frame(p, frame_length=win, hop_length=1)[:, :n]
+    ventana = get_window("hann", win, fftbins=True)[:, None]
+    acum = np.zeros(win, dtype=np.float64)
+    for k0 in range(0, n, bloque):
+        tg = librosa.autocorrelate(cuadros[:, k0:k0 + bloque] * ventana, axis=-2)
+        acum += librosa.util.normalize(tg, norm=np.inf, axis=-2).sum(axis=1, dtype=np.float64)
+    tg_medio = (acum / max(1, n))[:, None].astype(onset_env.dtype)
+    return librosa.feature.tempo(tg=tg_medio, sr=sr, hop_length=hop, start_bpm=start_bpm)
+
+
 def refine_bpm(y22: np.ndarray, sr22: int, bpm_nominal: float):
     """Refina un BPM nominal (entero) a su valor real con decimales.
 
@@ -730,9 +753,12 @@ def refine_bpm(y22: np.ndarray, sr22: int, bpm_nominal: float):
     try:
         onset_env = librosa.onset.onset_strength(y=y22, sr=sr22, hop_length=HOP_GRID)
         # Anclar la búsqueda al nominal protegido: evita saltos de octava y de tresillo
+        # El tempo del rastreador se estima por bloques (tempo_por_bloques): el mismo valor
+        # que calcula beat_track por dentro, sin el pico de +6,6 GB en temas largos.
+        tempo_ini = tempo_por_bloques(onset_env, sr22, HOP_GRID, float(bpm_nominal))
         _, beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr22,
                                            hop_length=HOP_GRID, trim=False,
-                                           start_bpm=float(bpm_nominal), tightness=200)
+                                           bpm=tempo_ini, tightness=200)
         t = librosa.frames_to_time(beats, sr=sr22, hop_length=HOP_GRID)
         if len(t) < 32:
             return None, None, len(t)
@@ -1785,6 +1811,24 @@ def send_result(job_id: str, track_id: str, status: str, result: dict = None, er
 # ----------------------------------------------------------------------------
 # Main loop
 # ----------------------------------------------------------------------------
+BPM_RANGO = (70.0, 180.0)   # donde vive el tempo de un tema de club (DnB ~174 incluido)
+
+
+def bpm_en_rango(bpm):
+    """Lleva un BPM a su octava dentro de BPM_RANGO (240 → 120, 60 → 120). None si no es válido."""
+    try:
+        b = float(bpm)
+    except (TypeError, ValueError):
+        return None
+    if not (b > 0 and math.isfinite(b)):
+        return None
+    while b >= BPM_RANGO[1]:
+        b /= 2.0
+    while b < BPM_RANGO[0]:
+        b *= 2.0
+    return b
+
+
 class Apagado(Exception):
     """Railway manda SIGTERM al redesplegar o al cambiar la configuración."""
 
@@ -1827,7 +1871,17 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
         signal.alarm(TOPE_TRABAJO_S)
         tmp = download_audio(audio_url)
         try:
-            result = analyze(tmp, bpm_seed=track.get("bpm"))
+            # Etiqueta fuera de rango (4-oct-2026: «Paris» trae TBPM=240): se analiza en su
+            # octava y se avisa. El BPM bloqueado lo sigue protegiendo worker-result.
+            semilla = track.get("bpm")
+            octava = bpm_en_rango(semilla) if semilla else None
+            if octava and abs(octava - float(semilla)) > 1e-6:
+                print(f"[job {job_id}] BPM bloqueado {semilla} fuera de rango: se analiza a {octava:g}", flush=True)
+            else:
+                octava = None
+            result = analyze(tmp, bpm_seed=octava or semilla)
+            if octava:
+                result["analysis_flags"] = list(result.get("analysis_flags") or []) + [f"bpm_etiqueta_octava:{float(semilla):g}→{octava:g}"]
         except AudioMudo as e:
             send_result(job_id, track_id, "done", result={"pista_vacia": True, "analysis_flags": ["silencio"]})
             print(f"[job {job_id}] {e}: marcada como pista vacía", flush=True)
@@ -1850,7 +1904,7 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
         # Escribe SOLO first_beat_detected_ms; jamas first_beat_offset_ms ni _source.
         if cm2_habilitado():
             try:
-                bpm_ref = track.get("bpm") or result.get("bpm")
+                bpm_ref = bpm_en_rango(track.get("bpm") or result.get("bpm"))
                 if bpm_ref and 40 < float(bpm_ref) < 240:
                     anc = ancla_de_rendicion(track_id, float(bpm_ref))
                     if anc["residuo_ms"] <= 8:
@@ -2559,7 +2613,7 @@ def liberar_memoria():
 
 def main():
     filtrar_salida()
-    print("DeepMancho worker iniciado (v7.6.10: SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.6.11: tempo de refine_bpm por bloques, sin pico de memoria en temas largos; SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     global EXAMEN_CM2_APROBADO
