@@ -1,5 +1,11 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.11 (4-oct-2026) — TEMAS LARGOS SIN MATAR LA RÉPLICA, Y ETIQUETAS DE BPM FUERA DE RANGO · Refs #206 #573
+- **«Gratitude» (631 s) mató la réplica 3 veces** (08:51, 09:00 y 09:09 UTC): «sin respuesta después de 3 intentos», sin «OK» ni «FALLO» en el log. Medido con el archivo real, `analyze` llegaba a **5,8 GB**. El culpable estaba en `refine_bpm`: `beat_track` estima el tempo con un tempograma de autocorrelación de 384 × ~100.000 cuadros (hop 128 a 22 kHz), que solo él sumaba **+6,6 GB**. La métrica de Railway (suma de réplicas, muestreada cada 60 s) no mostraba ese pico.
+- **Arreglo:** `tempo_por_bloques` calcula el promedio del tempograma por bloques de cuadros (mismo relleno, ventana y normalización que `librosa.feature.tempogram`) y se lo pasa a `librosa.feature.tempo`; `beat_track` recibe ese tempo. **Mismo resultado:** con Gratitude, el tempo (121,5993) y los 1.221 beats son idénticos; también en temas sintéticos de 98 a 174 BPM. **Pico: 5,8 → 2,8 GB.**
+- **«Paris» trae TBPM=240** y la base lo tomó como BPM bloqueado: se analizaba con semilla 240 y CM2 medía el ancla con ese período (no la escribía). Ahora, si el BPM bloqueado está fuera de 70–180, el análisis y CM2 usan su octava (240 → 120) y se agrega la bandera `bpm_etiqueta_octava:240→120`. **No se pisa el BPM guardado:** el contrato protege lo bloqueado. Corregir el valor guardado es de la plataforma (ver el PR).
+- Pruebas: `tests/test_temas_largos.py`.
+
 ## 7.6.10 (4-oct-2026) — UN REDESPLIEGUE YA NO DEJA TEMAS COLGADOS
 - **Qué pasó:** el reanálisis de #320 se encoló a las 00:12:30, mientras Railway rotaba las réplicas a la 7.6.9. Las réplicas que iban a apagarse tomaron 6 temas a las 00:17 y Railway las cortó segundos después. **No fue falta de memoria:** no hubo error de Python, el corte llegó antes del BPM y los 7,7 GB de la métrica son la **suma** de las réplicas viejas y nuevas mientras se solapaban (en reposo: 0,8 GB entre 5). Los 6 quedaron en `processing` hasta que el reclamo los retomó a los 8 min.
 - **Ahora:** con SIGTERM a mitad de un trabajo, el worker lo devuelve a la cola (`error` → `worker-result` lo pasa a `pending`), borra el temporal y sale. Sin trabajo en curso, sale limpio. En los dos casos deja de pedir temas nuevos.
