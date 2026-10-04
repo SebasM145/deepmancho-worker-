@@ -1785,10 +1785,33 @@ def send_result(job_id: str, track_id: str, status: str, result: dict = None, er
 # ----------------------------------------------------------------------------
 # Main loop
 # ----------------------------------------------------------------------------
+class Apagado(Exception):
+    """Railway manda SIGTERM al redesplegar o al cambiar la configuración."""
+
+
+APAGANDO = False      # tras SIGTERM: terminar lo que se pueda y no pedir más temas
+EN_TRABAJO = False    # hay un trabajo reclamado en curso
+
+
+def _al_apagar(_sig, _frame):
+    """SIGTERM (3-oct-2026): un redespliegue cortaba las réplicas a mitad de un trabajo
+    y el tema quedaba en `processing` hasta que el reclamo lo retomaba a los 8 min (6 temas
+    del reanálisis de #320). Ahora el trabajo en curso se devuelve a la cola al instante
+    (worker-result lo pasa a `pending`) y, sin trabajo, se sale limpio."""
+    global APAGANDO
+    APAGANDO = True
+    if EN_TRABAJO:
+        raise Apagado("reinicio del servicio (SIGTERM): el trabajo vuelve a la cola")
+    print("SIGTERM sin trabajo en curso: salgo", flush=True)
+    sys.exit(0)
+
+
 def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict = None, master_upload: dict = None):
     job_id = job["id"]
     track_id = job["track_id"]
     print(f"[job {job_id}] track {track_id} — analizando...", flush=True)
+    global EN_TRABAJO
+    EN_TRABAJO = True
     tmp = None
     t0 = time.time()
     try:
@@ -1903,6 +1926,7 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
                 os.remove(tmp)
             except Exception:
                 pass
+        EN_TRABAJO = False
 
 
 # ============================================================================
@@ -2535,7 +2559,7 @@ def liberar_memoria():
 
 def main():
     filtrar_salida()
-    print("DeepMancho worker iniciado (v7.6.9: loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.6.10: SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     global EXAMEN_CM2_APROBADO
@@ -2546,9 +2570,14 @@ def main():
             traceback.print_exc()
             print("[CM2 EXAMEN] el examen fallo pero el worker sigue normal", flush=True)
         liberar_memoria()
+    import signal
+    signal.signal(signal.SIGTERM, _al_apagar)
     idle = 0
     espera = Espera(POLL_INTERVAL, POLL_MAX)
     while True:
+        if APAGANDO:
+            print("apagando: no pido más temas", flush=True)
+            sys.exit(0)
         try:
             job, track, audio_url, subidas = next_job()
         except Exception as e:

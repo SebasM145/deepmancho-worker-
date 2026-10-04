@@ -1,5 +1,12 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.10 (4-oct-2026) — UN REDESPLIEGUE YA NO DEJA TEMAS COLGADOS
+- **Qué pasó:** el reanálisis de #320 se encoló a las 00:12:30, mientras Railway rotaba las réplicas a la 7.6.9. Las réplicas que iban a apagarse tomaron 6 temas a las 00:17 y Railway las cortó segundos después. **No fue falta de memoria:** no hubo error de Python, el corte llegó antes del BPM y los 7,7 GB de la métrica son la **suma** de las réplicas viejas y nuevas mientras se solapaban (en reposo: 0,8 GB entre 5). Los 6 quedaron en `processing` hasta que el reclamo los retomó a los 8 min.
+- **Ahora:** con SIGTERM a mitad de un trabajo, el worker lo devuelve a la cola (`error` → `worker-result` lo pasa a `pending`), borra el temporal y sale. Sin trabajo en curso, sale limpio. En los dos casos deja de pedir temas nuevos.
+- **Para que sirva en Railway:** entre SIGTERM y SIGKILL tiene que quedar tiempo. Hay que revisar el tiempo de drenado del servicio (`RAILWAY_DEPLOYMENT_DRAINING_SECONDS`, por ejemplo 15).
+- Cuesta un intento: un tema cortado 3 veces seguidas queda en `error`, y se reintenta desde la Biblioteca.
+- Pruebas: `tests/test_apagado.py`.
+
 ## 7.6.9 (3-oct-2026) — `loudness_lufs` EN LA ESCALA ESTÁNDAR (BS.1770, estéreo) · Refs #320
 - **Lo que se reportó:** «Weekend's Started» da −8,6 LUFS y +2,9 dBFS en su MP3 de escucha, contra `loudness_lufs` = −12,2.
 - **Lo que se midió:**
