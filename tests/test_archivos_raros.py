@@ -17,6 +17,7 @@ import soundfile as sf  # noqa: E402
 import worker  # noqa: E402
 
 hay_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="sin ffmpeg")
+pytestmark = pytest.mark.sondeo_real   # aquí sí se sondea con ffprobe de verdad (ver conftest.py)
 SR = 44100
 
 
@@ -89,8 +90,10 @@ def _procesar(monkeypatch, tmp_path, origen):
 
 
 VALIDOS = ["wav24_96.wav", "tema.aiff", "tema.flac", "cbr.mp3", "vbr.mp3", "tema.m4a", "portada_gigante.mp3"]
-INVALIDOS = ["basura.mp3", "texto.wav", "vacio.mp3", "imagen.mp3", "solo_cabecera.wav"]
-DUDOSOS = ["id3_roto.mp3", "cortado.mp3"]      # según el decodificador: done o error claro, nunca otra cosa
+INVALIDOS = ["texto.wav", "vacio.mp3", "imagen.mp3", "solo_cabecera.wav"]
+# Según el decodificador: done o error claro, nunca otra cosa. «basura.mp3» (bytes al azar) lo
+# decodifica el MP3 como ruido y sale done: límite conocido, no queda colgado ni reintenta.
+DUDOSOS = ["id3_roto.mp3", "cortado.mp3", "basura.mp3"]
 
 
 @hay_ffmpeg

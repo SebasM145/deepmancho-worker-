@@ -1040,7 +1040,7 @@ def analyze(path: str, bpm_seed=None) -> dict:
         print(f"    no se pudo decodificar: {type(e).__name__}: {e}", flush=True)
         raise ArchivoIlegible(MSJ_ILEGIBLE) from None
     if y.size == 0:
-        raise RuntimeError("audio vacío")
+        raise ArchivoIlegible(MSJ_MUY_CORTO)
     if float(np.max(np.abs(y))) < SILENCIO_PICO:
         raise AudioMudo("pista sin audio útil (silencio)")
     # ── Rejilla de compases — metodología derivada de Rekordbox (v5) ──
@@ -1862,13 +1862,14 @@ def sondear_audio(path: str):
     flujos = info.get("streams") or []
     if r.returncode != 0 or not flujos:
         raise ArchivoIlegible(MSJ_ILEGIBLE)
+    crudo = (info.get("format") or {}).get("duration")
     try:
-        dur = float((info.get("format") or {}).get("duration") or 0)
+        dur = float(crudo) if crudo not in (None, "", "N/A") else None
     except (TypeError, ValueError):
-        dur = 0.0
-    if dur and dur < 1.0:
+        dur = None
+    if dur is not None and dur < 1.0:    # 0 incluido: un WAV que es solo la cabecera
         raise ArchivoIlegible(MSJ_MUY_CORTO)
-    return dur or None, flujos[0].get("codec_name")
+    return dur, flujos[0].get("codec_name")
 
 
 class ArchivoMuyGrande(RuntimeError):
