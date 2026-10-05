@@ -36,7 +36,7 @@ import ctypes
 
 import numpy as np
 import librosa
-from grid_detect import detect_grid
+from grid_detect import detect_grid, ataques_de_bombo, fase_de_bombos
 import requests
 
 # ----------------------------------------------------------------------------
@@ -748,8 +748,66 @@ def refine_bpm(y22: np.ndarray, sr22: int, bpm_nominal: float):
     pendiente de la recta da el periodo real; el error del BPM escala con
     1/duración, así que sobre 5-7 min la resolución baja de 0.01 BPM.
 
+    #618: si el rastreador de librosa deja el tema «variable», se repite el ajuste
+    sobre los ataques del bombo (ajuste_por_bombos) y gana el de menor residuo. Los
+    temas que hoy salen «constante» no cambian.
+
     Devuelve (bpm_refinado, residuo_max_ms, n_beats) o (None, None, 0).
     """
+    r = _ajuste_por_rastreador(y22, sr22, bpm_nominal)
+    if r[1] is not None and r[1] <= TEMPO_RESID_MS:
+        return r
+    try:
+        rb = ajuste_por_bombos(y22, sr22, bpm_nominal)
+    except Exception:
+        traceback.print_exc()
+        rb = (None, None, 0)
+    if rb[1] is not None and (r[1] is None or rb[1] < r[1]):
+        print(f"    v7 tempo por bombos: {rb[0]} (resid {rb[1]} ms, {rb[2]} bombos); "
+              f"el rastreador daba {r[0]} (resid {r[1]} ms)", flush=True)
+        return rb
+    return r
+
+
+def ajuste_por_bombos(y22: np.ndarray, sr22: int, bpm_nominal: float):
+    """#618 (4-oct): el mismo ajuste lineal, pero sobre los ataques del bombo.
+
+    El rastreador de librosa sigue la onset envelope de banda ancha: en los temas del
+    Taller (100 BPM exactos, Entrada de 19 s sin bombo, voz y hats) se paseaba por el
+    contratiempo y dejaba un residuo de 136–170 ms, aunque el bombo cae a ~1 ms de una
+    rejilla fija. Aquí se busca el tempo (±1,5 BPM del nominal, paso 0,01) y la fase que
+    juntan más bombos, y la recta se ajusta con los golpes graves sobre la rejilla de medio tiempo.
+    Devuelve (bpm, residuo_p90_ms, n_bombos) o (None, None, n)."""
+    nominal = float(bpm_nominal)
+    t, pesos = ataques_de_bombo(y22, sr22, 60.0 / (nominal + 1.5))
+    if len(t) < 32:
+        return None, None, int(len(t))
+    candidatos = np.arange(nominal - 1.5, nominal + 1.5 + 1e-9, 0.01)
+    junta = [fase_de_bombos(t, pesos, b) for b in candidatos]
+    k = int(np.argmax([j[0] for j in junta]))
+    periodo, fase = 60.0 / float(candidatos[k]), junta[k][1]
+    # La recta va sobre la rejilla de MEDIO tiempo: en house el bajo a contratiempo pega tan
+    # fuerte como el bombo (en el Taller, la mitad de los «bombos» caen a −295 ms de 600) y
+    # también marca el tempo. Fuera solo lo que cae a más de ¼ de medio tiempo (75 ms a 100).
+    medio = periodo / 2.0
+    idx = np.round((t - fase) / medio)
+    ok = np.abs(t - (fase + idx * medio)) < medio * 0.25
+    t, idx = t[ok], idx[ok]
+    if len(t) < 32:
+        return None, None, int(len(t))
+    A = np.vstack([idx, np.ones(len(idx))]).T
+    a, b = np.linalg.lstsq(A, t, rcond=None)[0]
+    if a <= 0:
+        return None, None, int(len(t))
+    bpm_real = 30.0 / a
+    if abs(bpm_real - nominal) > 1.5:
+        return None, None, int(len(t))
+    errs = np.abs(t - (a * idx + b)) * 1000.0
+    return round(bpm_real, 3), round(float(np.percentile(errs, 90)), 1), int(len(t))
+
+
+def _ajuste_por_rastreador(y22: np.ndarray, sr22: int, bpm_nominal: float):
+    """El ajuste de siempre, sobre los beats de librosa.beat.beat_track."""
     try:
         onset_env = librosa.onset.onset_strength(y=y22, sr=sr22, hop_length=HOP_GRID)
         # Anclar la búsqueda al nominal protegido: evita saltos de octava y de tresillo
@@ -933,7 +991,9 @@ def sanity_check(result, dur_ms):
     # protegido), NO el que detect_grid estima por su cuenta: ese puede traer
     # error de octava (se midió 164 en un track de 123) y se descarta igual.
     bpm = result.get("bpm_precise") or result.get("bpm")
-    if bpm and not (100 <= float(bpm) <= 150):
+    # #618: con medio BPM de holgura. Un tema de 100 exactos se mide 99,959 o 99,999 y no
+    # está fuera de rango (salía «bpm_fuera_de_rango:99.959» en los temas del Taller).
+    if bpm and not (99.5 <= float(bpm) <= 150.5):
         problemas.append(f"bpm_fuera_de_rango:{bpm}")
     mi, mo = pos.get("MIX-IN"), pos.get("MIX-OUT")
     if mi is not None and dur_ms:
@@ -2613,7 +2673,7 @@ def liberar_memoria():
 
 def main():
     filtrar_salida()
-    print("DeepMancho worker iniciado (v7.6.12: tempo sin etiqueta a 136 ya no sale a 2/3 (#206); tempo de refine_bpm por bloques, sin pico de memoria en temas largos; SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.6.13: temas del Taller constantes y sin 149, desempate 3:2 por el bombo (#618); tempo sin etiqueta a 136 ya no sale a 2/3 (#206); tempo de refine_bpm por bloques, sin pico de memoria en temas largos; SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     global EXAMEN_CM2_APROBADO
