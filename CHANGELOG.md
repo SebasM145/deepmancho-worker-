@@ -1,5 +1,20 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.15 (5-oct-2026) — ARCHIVOS RAROS: UN MENSAJE CLARO Y SIN REINTENTOS («todo por sistema»)
+- **Antes:** un archivo dañado o que no era audio fallaba al decodificar con un error técnico (`LibsndfileError…`, `NoBackendError`). Se reintentaba 3 veces y terminaba en «sin respuesta después de 3 intentos».
+- **Ahora:**
+  - `sondear_audio` mira el archivo con `ffprobe` antes de cargarlo (rápido, sin decodificar). Sin audio legible, o con menos de 1 s, termina al instante con `determinista:` y un mensaje para el DJ:
+    - «No pudimos leer el audio de este archivo: está dañado o no es un formato de audio. Expórtalo de nuevo en MP3, WAV, AIFF o FLAC y vuelve a subirlo.»
+    - «El archivo dura menos de 1 segundo…»
+  - Si igual falla la decodificación en `analyze`, también es determinista, con el mismo mensaje.
+  - El archivo de más de `MAX_TRACK_MB` también dice en castellano cuánto pesa y qué hacer.
+  - **Más largo que el análisis (10 min, por ejemplo un set):** se analiza como hasta ahora, pero queda la bandera `analisis_parcial:primeros_600_s_de_<total>`.
+- Falta del lado de la plataforma: que `worker-result` cierre en `error` al primer `determinista:` (hoy reintenta hasta 3) y que la Biblioteca muestre el mensaje sin el prefijo.
+- Pruebas: `tests/test_archivos_raros.py`, con archivos hechos con ffmpeg.
+  - **Válidos** (WAV de 24 bits a 96 kHz, AIFF, FLAC, MP3 CBR y VBR, M4A, MP3 con portada de 3000×3000): se analizan.
+  - **Inválidos** (bytes al azar, texto, vacío, imagen, solo cabecera): error claro en menos de 10 s y sin llegar a `analyze`.
+  - **Dudosos** (ID3 con tamaño imposible, MP3 cortado): `done` o error claro, nunca otra cosa.
+
 ## 7.6.14 (5-oct-2026) — EL SET SE ARMA POR TRAMOS A DISCO (#75 C-2)
 - Medido el 5-oct (GitHub Actions, 28 temas reales en largo y BPM, 163 min de set): el render llegaba a **13,97 GB** de RAM, en una réplica de 10 GB. `render_set` armaba el set entero en memoria y cada transición lo copiaba (`np.vstack`), y el máster hacía más copias del set completo.
 - `_mezcla_plan` ahora escribe a disco (`SetEnDisco`, float32 estéreo) todo lo anterior al punto de cada transición. En memoria queda solo el tema que suena. Las cifras de cada transición (mezcla, eco, corte, encadenado) no cambian.

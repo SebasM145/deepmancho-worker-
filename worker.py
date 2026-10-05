@@ -1034,7 +1034,11 @@ def entero_js(x: float) -> int:
 
 
 def analyze(path: str, bpm_seed=None) -> dict:
-    y, sr = librosa.load(path, sr=SR, mono=True, duration=MAX_DURATION)
+    try:
+        y, sr = librosa.load(path, sr=SR, mono=True, duration=MAX_DURATION)
+    except Exception as e:  # el decodificador no puede con el archivo: reintentar da lo mismo
+        print(f"    no se pudo decodificar: {type(e).__name__}: {e}", flush=True)
+        raise ArchivoIlegible(MSJ_ILEGIBLE) from None
     if y.size == 0:
         raise RuntimeError("audio vacío")
     if float(np.max(np.abs(y))) < SILENCIO_PICO:
@@ -1829,6 +1833,44 @@ def detectar_genero(path: str) -> dict:
     return out
 
 
+class ArchivoIlegible(RuntimeError):
+    """El archivo no es un audio que podamos leer (dañado, vacío o de otro tipo). Reintentar da
+    lo mismo: va como `determinista:` con un mensaje que el DJ entiende."""
+
+
+MSJ_ILEGIBLE = ("No pudimos leer el audio de este archivo: está dañado o no es un formato de audio. "
+                "Expórtalo de nuevo en MP3, WAV, AIFF o FLAC y vuelve a subirlo.")
+MSJ_MUY_CORTO = "El archivo dura menos de 1 segundo: no hay audio que analizar. Revisa la exportación y vuelve a subirlo."
+MSJ_MUY_GRANDE = ("El archivo pesa {mb} MB y el máximo es {tope} MB. Súbelo en MP3 320 kbps "
+                  "(o en WAV/AIFF sin pasar de {tope} MB).")
+
+
+def sondear_audio(path: str):
+    """Mira el archivo con ffprobe antes de cargarlo (rápido, sin decodificar). Devuelve
+    (duración_s, códec) o lanza ArchivoIlegible. Sin ffprobe instalado, no sondea (None)."""
+    import shutil
+    if not shutil.which("ffprobe"):
+        return None
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_name:format=duration", "-of", "json", path],
+            capture_output=True, text=True, timeout=60)
+        info = json.loads(r.stdout or "{}")
+    except (subprocess.TimeoutExpired, ValueError):
+        raise ArchivoIlegible(MSJ_ILEGIBLE) from None
+    flujos = info.get("streams") or []
+    if r.returncode != 0 or not flujos:
+        raise ArchivoIlegible(MSJ_ILEGIBLE)
+    try:
+        dur = float((info.get("format") or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    if dur and dur < 1.0:
+        raise ArchivoIlegible(MSJ_MUY_CORTO)
+    return dur or None, flujos[0].get("codec_name")
+
+
 class ArchivoMuyGrande(RuntimeError):
     """El original supera MAX_TRACK_MB: no se baja (protege la RAM de la replica)."""
 
@@ -1841,14 +1883,14 @@ def download_audio(audio_url: str) -> str:
         r.raise_for_status()
         largo = int(r.headers.get("content-length") or 0)
         if largo > tope:
-            raise ArchivoMuyGrande(f"archivo de {largo // (1024 * 1024)} MB (tope {MAX_TRACK_MB} MB)")
+            raise ArchivoMuyGrande(MSJ_MUY_GRANDE.format(mb=largo // (1024 * 1024), tope=MAX_TRACK_MB))
         tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
         n = 0
         try:
             for parte in r.iter_content(chunk_size=1024 * 1024):
                 n += len(parte)
                 if n > tope:
-                    raise ArchivoMuyGrande(f"archivo de mas de {MAX_TRACK_MB} MB")
+                    raise ArchivoMuyGrande(MSJ_MUY_GRANDE.format(mb=f"más de {MAX_TRACK_MB}", tope=MAX_TRACK_MB))
                 tmp.write(parte)
         except BaseException:
             tmp.close()
@@ -1930,6 +1972,10 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
         signal.signal(signal.SIGALRM, _tope)
         signal.alarm(TOPE_TRABAJO_S)
         tmp = download_audio(audio_url)
+        # Archivos raros (vacíos, dañados, de otro tipo): se cortan aquí, con un mensaje para
+        # el DJ, antes de cargarlos en memoria (4-oct-2026, «todo por sistema»).
+        sondeo = sondear_audio(tmp)
+        dur_archivo = sondeo[0] if sondeo else None
         try:
             # Etiqueta fuera de rango (4-oct-2026: «Paris» trae TBPM=240): se analiza en su
             # octava y se avisa. El BPM bloqueado lo sigue protegiendo worker-result.
@@ -1940,6 +1986,9 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
             else:
                 octava = None
             result = analyze(tmp, bpm_seed=octava or semilla)
+            if dur_archivo and dur_archivo > MAX_DURATION + 1:
+                # Más largo que un tema (un set, un podcast): se analizan los primeros 10 min.
+                result["analysis_flags"] = list(result.get("analysis_flags") or []) + [f"analisis_parcial:primeros_{MAX_DURATION}_s_de_{int(dur_archivo)}"]
             if octava:
                 result["analysis_flags"] = list(result.get("analysis_flags") or []) + [f"bpm_etiqueta_octava:{float(semilla):g}→{octava:g}"]
         except AudioMudo as e:
@@ -2026,7 +2075,7 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
         traceback.print_exc()
         # «determinista:» = reintentar da lo mismo (como en grid_verifier). worker-result
         # hoy reintenta todo error hasta 3 veces; con este prefijo puede cerrarlo de una.
-        error = f"determinista:{e}" if isinstance(e, ArchivoMuyGrande) else str(e)
+        error = f"determinista:{e}" if isinstance(e, (ArchivoMuyGrande, ArchivoIlegible)) else str(e)
         try:
             send_result(job_id, track_id, "error", error=error)
         except Exception:
@@ -2774,7 +2823,7 @@ def liberar_memoria():
 
 def main():
     filtrar_salida()
-    print("DeepMancho worker iniciado (v7.6.14: set por tramos a disco, memoria de un solo tema (#75 C-2); temas del Taller constantes y sin 149, desempate 3:2 por el bombo (#618); tempo sin etiqueta a 136 ya no sale a 2/3 (#206); tempo de refine_bpm por bloques, sin pico de memoria en temas largos; SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.6.15: archivos raros terminan con un mensaje claro y sin reintentos; v7.6.14: set por tramos a disco, memoria de un solo tema (#75 C-2); temas del Taller constantes y sin 149, desempate 3:2 por el bombo (#618); tempo sin etiqueta a 136 ya no sale a 2/3 (#206); tempo de refine_bpm por bloques, sin pico de memoria en temas largos; SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     global EXAMEN_CM2_APROBADO
