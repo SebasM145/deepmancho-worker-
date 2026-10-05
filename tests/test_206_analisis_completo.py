@@ -20,17 +20,20 @@ SR = 44100
 FILAS = []
 
 
-def sintetico(bpm, dur_s=40, ancla_s=0.25):
-    """El de #108/#573: bombo en cada tiempo, hi-hat a contratiempo y acorde de La menor."""
+def sintetico(bpm, dur_s=40, ancla_s=0.25, intro_compases=0):
+    """El de #108/#573: bombo en cada tiempo, hi-hat a contratiempo y acorde de La menor.
+    Con `intro_compases`, el bombo entra recien despues (como los temas del Taller, #618)."""
     t = np.arange(int(SR * dur_s)) / SR
     y = np.zeros_like(t)
     rng = np.random.default_rng(7)
     beat = 60.0 / bpm
+    entra_bombo = ancla_s + intro_compases * 4 * beat
     for k in np.arange(ancla_s, dur_s, beat):
         i = int(k * SR)
         n = min(int(0.12 * SR), len(y) - i)
         tt = np.arange(n) / SR
-        y[i:i + n] += 0.9 * np.sin(2 * np.pi * (50 + 80 * np.exp(-tt * 30)) * tt) * np.exp(-tt * 18)
+        if k >= entra_bombo - 1e-9:
+            y[i:i + n] += 0.9 * np.sin(2 * np.pi * (50 + 80 * np.exp(-tt * 30)) * tt) * np.exp(-tt * 18)
         j = int((k + beat / 2) * SR)
         m = min(int(0.02 * SR), max(0, len(y) - j))
         y[j:j + m] += 0.2 * rng.standard_normal(m)
@@ -39,13 +42,14 @@ def sintetico(bpm, dur_s=40, ancla_s=0.25):
     return np.stack([y, y], axis=1).astype(np.float32)
 
 
-@pytest.mark.parametrize("bpm", [122, 123, 124, 125, 134, 136, 138])
-def test_analisis_completo_sin_bpm_previo(bpm, tmp_path):
-    ruta = tmp_path / f"sin_etiqueta_{bpm}.wav"
-    sf.write(ruta, sintetico(bpm), SR)              # WAV sin etiquetas: nada de BPM previo
-    r = worker.analyze(str(ruta), bpm_seed=None)
-    FILAS.append((bpm, r.get("bpm"), r.get("bpm_precise"), r.get("tempo_stability")))
-    warnings.warn(f"#206 esperado={bpm} bpm={r.get('bpm')} bpm_precise={r.get('bpm_precise')} "
+@pytest.mark.parametrize("intro", [0, 8], ids=["con_bombo_desde_el_inicio", "intro_de_8_compases_sin_bombo"])
+@pytest.mark.parametrize("bpm", [122, 123, 124, 125, 134, 135, 136, 137, 138, 139])
+def test_analisis_completo_sin_bpm_previo(bpm, intro, tmp_path):
+    ruta = tmp_path / f"sin_etiqueta_{bpm}_{intro}.wav"
+    sf.write(ruta, sintetico(bpm, dur_s=40 + (intro * 240 / bpm if intro else 0), intro_compases=intro), SR)
+    r = worker.analyze(str(ruta), bpm_seed=None)      # WAV sin etiquetas: nada de BPM previo
+    FILAS.append((bpm, intro, r.get("bpm"), r.get("bpm_precise"), r.get("tempo_stability")))
+    warnings.warn(f"#206 esperado={bpm} intro={intro} bpm={r.get('bpm')} bpm_precise={r.get('bpm_precise')} "
                   f"tempo={r.get('tempo_stability')}")  # se ve en el log de la acción aunque pase
     assert round(float(r["bpm"])) == bpm, r.get("bpm")
     assert r.get("tempo_stability") == "constante"
@@ -56,6 +60,6 @@ def teardown_module(_):
     if not destino or not FILAS:
         return
     with open(destino, "a", encoding="utf-8") as f:
-        f.write("### #206 · análisis completo sin BPM previo\n\n| esperado | bpm | bpm_precise | tempo |\n|---|---|---|---|\n")
+        f.write("### #206 · análisis completo sin BPM previo\n\n| esperado | intro sin bombo | bpm | bpm_precise | tempo |\n|---|---|---|---|---|\n")
         for fila in sorted(FILAS):
-            f.write("| {} | {} | {} | {} |\n".format(*fila))
+            f.write("| {} | {} compases | {} | {} | {} |\n".format(*fila))
