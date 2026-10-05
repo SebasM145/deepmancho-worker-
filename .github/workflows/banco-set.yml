@@ -1,0 +1,32 @@
+# #75 C-2: mide la RAM pico y el tiempo de render_set con un set largo (28 temas reales en largo
+# y BPM, audio sintético). Corre solo cuando cambia el banco o el render, y a pedido. Railway no
+# mira esta carpeta: no redespliega nada.
+name: Banco set largo
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - bancos/banco_set.py
+      - .github/workflows/banco-set.yml
+
+permissions:
+  contents: read
+
+jobs:
+  banco:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: ffmpeg y libsndfile
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg libsndfile1
+      - name: Dependencias
+        run: pip install -r requirements.txt
+      - name: Banco
+        run: /usr/bin/time -v python bancos/banco_set.py 2>&1 | tee banco.log; grep -E "Maximum resident|Elapsed" banco.log
