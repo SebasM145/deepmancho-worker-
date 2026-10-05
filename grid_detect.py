@@ -94,6 +94,97 @@ def explicada_por_media_rejilla(cand_bpm, octava_bpm, tol=TOLERANCIA_MEDIA_REJIL
     return k >= 1 and abs(r - k) <= tol * k
 
 
+# #618 (4-oct): la regla de #206 es simétrica y no sabe cuál de las dos es el tempo. En los
+# temas del Taller (100 BPM, Entrada sin bombo, voz) la octava 99,3 quedó «explicada» por la
+# media rejilla de 148,85 y ganó 149 (con la 7.6.11 daban 99). Lo que las separa es el bombo:
+# en 4×4 pega en cada tiempo, así que casi todos sus ataques caen en la rejilla del tempo real
+# y solo 1 de cada 2 o 3 en la del 3:2. Medido: Taller 100 → 58 y 72 % contra 149 → 39 y 36 %;
+# el sintético de 136 → 100 % contra 90,6 → 34 %.
+TOLERANCIA_BOMBO_S = 0.025   # un ataque a ±25 ms de una línea de la rejilla cuenta como «en rejilla»
+VENTAJA_BOMBO = 1.25         # el bombo decide solo si una rejilla junta 25 % más que la otra
+MIN_BOMBOS = 16
+PISO_GRAVES = 0.1           # banda de bombo por debajo de −20 dB de la señal: no hay bombo
+
+
+def ataques_de_bombo(y, sr, periodo_min_s):
+    """Ataques del bombo (banda 35–130 Hz, envolvente de Hilbert, cruce del 25 % del pico):
+    el mismo método que el ancla CM2 de worker.compute_anchor. Devuelve (tiempos_s, pesos)."""
+    from scipy.signal import butter, sosfiltfilt, hilbert, find_peaks, resample_poly
+    y = np.asarray(y, dtype=np.float32)
+    if y.size < sr:
+        return np.zeros(0), np.zeros(0)
+    nivel = float(np.percentile(np.abs(y), 99))
+    # La banda de 35–130 Hz no necesita más de ~2 kHz de muestreo (0,5 ms de resolución).
+    # A 22 kHz, filtro + Hilbert de un tema de 10,5 min sumaban +1,6 GB; así, ~0,2 GB.
+    q = max(1, int(sr // 2000))
+    if q > 1:
+        y = resample_poly(y, 1, q).astype(np.float64)
+        sr = sr / q
+    else:
+        y = y.astype(np.float64)
+    sos = butter(4, [35.0, 130.0], btype="band", fs=sr, output="sos")
+    env = np.abs(hilbert(sosfiltfilt(sos, y)))
+    w = max(1, int(0.005 * sr))
+    env = np.convolve(env, np.ones(w) / w, mode="same")
+    p99 = float(np.percentile(env, 99))
+    # Sin bombo, el umbral relativo toma como «golpes» las fugas de los hats a la banda de
+    # graves. Con bombo la banda llega al nivel de la señal (1,02–1,12 en los WAV del Taller);
+    # con solo hats queda en 0,007.
+    if p99 <= PISO_GRAVES * nivel:
+        return np.zeros(0), np.zeros(0)
+    pk, props = find_peaks(env, distance=max(1, int(0.45 * periodo_min_s * sr)), height=0.30 * p99)
+    lim = int(0.150 * sr)
+    t = np.empty(len(pk))
+    for i, p in enumerate(pk):
+        th = 0.25 * env[p]
+        j, lo = p, max(0, p - lim)
+        while j > lo and env[j] > th:
+            j -= 1
+        t[i] = j / sr
+    return t, props["peak_heights"].astype(np.float64)
+
+
+def fase_de_bombos(t, pesos, bpm, tol_s=TOLERANCIA_BOMBO_S, paso_fase_s=0.005):
+    """(fracción 0–1 del peso de los bombos a ±tol_s de una rejilla de `bpm`, fase en s) con la
+    fase que más junta."""
+    if len(t) == 0 or not bpm or bpm <= 0:
+        return 0.0, 0.0
+    p = 60.0 / float(bpm)
+    fases = np.arange(0.0, p, paso_fase_s)
+    d = (t[None, :] - fases[:, None]) % p
+    d = np.minimum(d, p - d)
+    junta = ((d <= tol_s) * pesos[None, :]).sum(axis=1)
+    k = int(np.argmax(junta))
+    return float(junta[k] / pesos.sum()), float(fases[k])
+
+
+def bombos_en_rejilla(t, pesos, bpm, tol_s=TOLERANCIA_BOMBO_S):
+    """Fracción (0–1) del peso de los bombos a ±tol_s de una rejilla de `bpm`, con la mejor fase."""
+    return fase_de_bombos(t, pesos, bpm, tol_s)[0]
+
+
+def mejor_rejilla_de_bombos(t, pesos, bpm, margen=0.015, paso_bpm=0.02):
+    """Máximo de bombos_en_rejilla en ±1,5 % de `bpm`: la búsqueda gruesa de detect_tempo
+    puede quedar a 0,7 BPM del real (99,3 por 100), y en 3 min eso corre la fase un tiempo."""
+    return max(bombos_en_rejilla(t, pesos, b)
+               for b in np.arange(bpm * (1 - margen), bpm * (1 + margen), paso_bpm))
+
+
+def desempate_por_bombo(y, sr, bpm_a, bpm_b):
+    """Entre dos tempos en proporción 3:2, el que junta más bombos en su rejilla (con
+    VENTAJA_BOMBO). None si no hay bombo suficiente o si no se separan: decide la regla de antes."""
+    t, pesos = ataques_de_bombo(y, sr, 60.0 / max(bpm_a, bpm_b))
+    if len(t) < MIN_BOMBOS:
+        return None
+    fa = mejor_rejilla_de_bombos(t, pesos, bpm_a)
+    fb = mejor_rejilla_de_bombos(t, pesos, bpm_b)
+    if fa >= fb * VENTAJA_BOMBO:
+        return bpm_a
+    if fb >= fa * VENTAJA_BOMBO:
+        return bpm_b
+    return None
+
+
 
 
 def semillas_candidatas(cruda):
@@ -169,6 +260,15 @@ def detect_tempo(y, sr, seed_bpm=None, env=None):
     mejor_octava = best[0]
     for semilla in otras:
         cand = _busqueda_gruesa(env, sr, dur_s, semilla, env3)
+        # #618: con dos tempos en 3:2, primero decide el bombo (cae en cada tiempo del real).
+        # Solo si no hay bombo o no los separa, siguen las dos reglas de #206 de abajo.
+        if (explicada_por_media_rejilla(cand[0], mejor_octava)
+                or explicada_por_media_rejilla(mejor_octava, cand[0])):
+            gana = desempate_por_bombo(y, sr, mejor_octava, cand[0])
+            if gana is not None:
+                if gana == cand[0]:
+                    best = cand
+                continue
         # #206: una proporción cuya rejilla cae sobre la de medio tiempo de la octava no
         # compite (el hi-hat a contratiempo la hacía ganar a 2/3 del tempo real).
         if explicada_por_media_rejilla(cand[0], mejor_octava):
