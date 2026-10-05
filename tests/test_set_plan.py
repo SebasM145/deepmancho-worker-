@@ -64,7 +64,9 @@ def render(monkeypatch, audios, transiciones):
     capt = {}
 
     def subir(salida, tmpdir, upload_url, result_path):
-        capt["salida"] = salida
+        # Desde #75 C-2 el set llega como SetEnDisco, cuyo archivo se borra al terminar
+        # render_set: se copia a memoria mientras existe (es un set chico de prueba).
+        capt["salida"] = np.array(salida[:])
         return len(salida) / SR
 
     monkeypatch.setattr(worker, "_masterizar_y_subir", subir)
