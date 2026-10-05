@@ -2216,26 +2216,112 @@ def _mezcla_libre(tracks, tmpdir):
     return salida, tracklist
 
 
+class SetEnDisco:
+    """El set que se va armando, escrito a disco por tramos (#75 C-2).
+
+    Antes el set entero vivia en memoria y cada transicion lo copiaba (np.vstack): un set
+    de 28 temas (163 min) llegaba a 13,97 GB en una replica de 10 GB. Ahora lo que ya no
+    va a cambiar se escribe a un archivo float32 estereo y en memoria queda solo el tema
+    que suena. Indexarlo (len, [a:b]) lo abre con memmap: solo para pruebas."""
+
+    def __init__(self, ruta):
+        self.ruta, self.frames = ruta, 0
+        self._f = open(ruta, "wb")
+        self._mm = None
+
+    def escribir(self, pcm):
+        if len(pcm):
+            np.ascontiguousarray(pcm, dtype=np.float32).tofile(self._f)
+            self.frames += len(pcm)
+
+    def cerrar(self):
+        if not self._f.closed:
+            self._f.close()
+        return self
+
+    def trozos(self, frames=30 * SET_SR):
+        """El set en trozos de `frames` (30 s), leido del archivo sin cargarlo entero."""
+        with open(self.ruta, "rb") as f:
+            while True:
+                x = np.fromfile(f, dtype=np.float32, count=frames * 2)
+                if not x.size:
+                    return
+                yield x.reshape(-1, 2)
+
+    def __len__(self):
+        return self.frames
+
+    def __getitem__(self, idx):
+        if self._mm is None:
+            self._mm = (np.memmap(self.ruta, dtype=np.float32, mode="r", shape=(self.frames, 2))
+                        if self.frames else np.zeros((0, 2), np.float32))
+        return self._mm[idx]
+
+
+def _trozos_de(salida, frames=30 * SET_SR):
+    if isinstance(salida, SetEnDisco):
+        yield from salida.trozos(frames)
+    else:
+        for k in range(0, len(salida), frames):
+            yield salida[k:k + frames]
+
+
+def _lufs_y_pico(salida):
+    """Sonoridad integrada BS.1770 del set en mono (como pyloudnorm sobre la media de los
+    canales: bloques de 400 ms cada 100 ms, puertas de -70 LUFS y -10 LU) y pico de muestra,
+    por trozos: la memoria no depende del largo del set."""
+    import pyloudnorm as pyln
+    from scipy.signal import lfilter
+    filtros = [(f.b, f.a) for f in pyln.Meter(SET_SR)._filters.values()]
+    estados = [np.zeros(max(len(b), len(a)) - 1) for b, a in filtros]
+    paso = int(round(0.1 * SET_SR))  # 100 ms
+    sub, resto, pico = [], np.zeros(0), 0.0
+    for x in _trozos_de(salida):
+        pico = max(pico, float(np.max(np.abs(x))) if x.size else 0.0)
+        y = x.astype(np.float64).mean(axis=1)
+        for k, (b, a) in enumerate(filtros):
+            y, estados[k] = lfilter(b, a, y, zi=estados[k])
+        y = np.concatenate([resto, y])
+        n = len(y) // paso
+        if n:
+            sub.extend(np.sum(y[:n * paso].reshape(n, paso) ** 2, axis=1))
+        resto = y[n * paso:]
+    sub = np.asarray(sub)
+    if len(sub) < 4:
+        return -np.inf, pico
+    z = np.convolve(sub, np.ones(4), mode="valid") / (4 * paso)  # bloques de 400 ms
+    with np.errstate(divide="ignore"):
+        l = -0.691 + 10 * np.log10(z)
+    z = z[l >= -70]
+    if not z.size:
+        return -np.inf, pico
+    umbral = -0.691 + 10 * np.log10(np.mean(z)) - 10
+    with np.errstate(divide="ignore"):
+        z = z[-0.691 + 10 * np.log10(z) > umbral]
+    return (-0.691 + 10 * np.log10(np.mean(z))) if z.size else -np.inf, pico
+
+
 def _masterizar_y_subir(salida, tmpdir, upload_url, result_path):
-    """Loudness parejo + techo de true peak, MP3 256k y subida. Devuelve la duracion en s."""
-    try:
-        import pyloudnorm as pyln
-        lufs = pyln.Meter(SET_SR).integrated_loudness(salida.mean(axis=1))
-        if np.isfinite(lufs):
-            salida = salida * (10 ** ((SET_TARGET_LUFS - lufs) / 20.0))
-            print(f"  loudness {lufs:.1f} -> {SET_TARGET_LUFS} LUFS", flush=True)
-    except Exception:
-        pass
-    pico = float(np.max(np.abs(salida))) or 1.0
+    """Loudness parejo + techo de pico, MP3 256k y subida. Devuelve la duracion en s.
+    `salida` es un SetEnDisco (o un array, en el metodo sin plan): se recorre en trozos de
+    30 s en dos pasadas (medir, aplicar), asi el pico de memoria no crece con el set."""
+    lufs, pico = _lufs_y_pico(salida)
+    ganancia = 1.0
+    if np.isfinite(lufs):
+        ganancia = 10 ** ((SET_TARGET_LUFS - lufs) / 20.0)
+        print(f"  loudness {lufs:.1f} -> {SET_TARGET_LUFS} LUFS", flush=True)
     techo = 10 ** (-1.0 / 20.0)
-    if pico > techo:
-        salida = salida * (techo / pico)
+    if pico * ganancia > techo:
+        ganancia = techo / pico
 
     wav = os.path.join(tmpdir, "set.wav")
     import wave
+    frames = 0
     with wave.open(wav, "wb") as w:
         w.setnchannels(2); w.setsampwidth(2); w.setframerate(SET_SR)
-        w.writeframes((np.clip(salida, -1, 1) * 32767).astype(np.int16).tobytes())
+        for x in _trozos_de(salida):
+            w.writeframes((np.clip(x * ganancia, -1, 1) * 32767).astype(np.int16).tobytes())
+            frames += len(x)
     mp3 = os.path.join(tmpdir, "set.mp3")
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", wav,
                     "-c:a", "libmp3lame", "-b:a", "256k", mp3], check=True)
@@ -2243,7 +2329,7 @@ def _masterizar_y_subir(salida, tmpdir, upload_url, result_path):
     with open(mp3, "rb") as f:
         up = requests.put(upload_url, data=f, headers={"Content-Type": "audio/mpeg"}, timeout=900)
     up.raise_for_status()
-    dur = len(salida) / SET_SR
+    dur = frames / SET_SR
     print(f"  subido: {result_path} — {dur/60:.1f} min", flush=True)
     return dur
 
@@ -2422,9 +2508,13 @@ def cola_eco(seca, bpm):
 
 
 def _mezcla_plan(tracks, transiciones, tmpdir):
-    """El set con el plan de cada transicion. Devuelve (salida, tracklist)."""
+    """El set con el plan de cada transicion. Devuelve (SetEnDisco, tracklist).
+    Por tramos (#75 C-2): en memoria vive solo `pend`, el tema que suena desde su entrada
+    (posicion `pos` del set); lo anterior al punto de cada transicion ya no cambia y se
+    escribe a disco. Las cifras de cada transicion son las de siempre."""
     sr = SET_SR
-    salida = np.zeros((0, 2), dtype=np.float32)
+    disco = SetEnDisco(os.path.join(tmpdir, "set.f32"))
+    pend, pos = np.zeros((0, 2), dtype=np.float32), 0
     tracklist = []
     ini_linea, tramos_linea = 0, [(0.0, 0.0, 1.0)]  # donde arranca la linea del tema actual
     for i, tr in enumerate(tracks):
@@ -2432,8 +2522,12 @@ def _mezcla_plan(tracks, transiciones, tmpdir):
         p = os.path.join(tmpdir, f"{i}.audio")
         _bajar_tema(tr.get("audio_url"), p)
         audio = _decode_pcm(p)
+        try:
+            os.remove(p)  # el original ya esta decodificado: no ocupar disco de mas
+        except OSError:
+            pass
         if i == 0:
-            salida = audio
+            pend, pos = audio, 0
             tracklist.append({"position": 1, "start_seconds": 0, **_tl(tr)})
             continue
 
@@ -2442,11 +2536,13 @@ def _mezcla_plan(tracks, transiciones, tmpdir):
         ant = tracks[i - 1]
         bpm_ant = _num(ant.get("bpm"), 0) + _num(ant.get("bpm_fine"), 0)
         salida_seg = _num(t.get("salida_seg"))
+        fin = pos + len(pend)
         if salida_seg is None:  # al final util de la saliente
-            corte = fin_util(salida[ini_linea:]) + ini_linea
+            corte = fin_util(pend[ini_linea - pos:]) + ini_linea
         else:
             corte = ini_linea + int(seg_en_linea(tramos_linea, salida_seg) * sr)
-        corte = max(ini_linea, min(corte, len(salida)))
+        corte = max(ini_linea, min(corte, fin))
+        c = corte - pos  # el corte dentro de `pend`
         entrada = _num(t.get("entrada_seg"), 0.0)
 
         if tipo == "mezcla":
@@ -2460,37 +2556,42 @@ def _mezcla_plan(tracks, transiciones, tmpdir):
                 print(f"    ⚠ mezcla sin igualar tempo ({e}): pasa con eco", flush=True)
                 tipo = "eco"
         if tipo == "mezcla":
-            n = max(1, min(int(dur * sr), len(linea), len(salida) - corte))
+            n = max(1, min(int(dur * sr), len(linea), len(pend) - c))
             x = np.linspace(0.0, 1.0, n)
             g_out, g_in = ganancias_mezcla(x, _num(t.get("asimetria"), 0.6))
             db_in, db_out = curvas_graves(x, bool(t.get("graves_swap")), _num(t.get("graves_swap_en"), 0.5))
-            sale = _graves(salida[corte:corte + n], db_out) * g_out[:, None].astype(np.float32)
+            sale = _graves(pend[c:c + n], db_out) * g_out[:, None].astype(np.float32)
             entra = _graves(linea[:n], db_in) * g_in[:, None].astype(np.float32)
-            salida = np.vstack([salida[:corte], sale + entra, linea[n:]])
+            disco.escribir(pend[:c])
+            pend = np.vstack([sale + entra, linea[n:]])
             print(f"    mezcla {t.get('compases') or 0} compases ({dur:.1f} s, rate {_num(t.get('rate'), 1.0):.4f}) "
                   f"en {corte/sr/60:.1f} min", flush=True)
         else:
-            pos = int(max(0.0, entrada) * sr)
-            linea, tramos = audio[pos:], [(entrada, 0.0, 1.0)]
+            pos_e = int(max(0.0, entrada) * sr)
+            linea, tramos = audio[pos_e:], [(entrada, 0.0, 1.0)]
             if tipo == "eco":
-                n_seca = min(int(60.0 / (bpm_ant or 120.0) / 2 * sr), len(salida) - corte)
-                seca = salida[corte:corte + n_seca] * np.linspace(1.0, 0.0, n_seca, dtype=np.float32)[:, None]
-                cola = cola_eco(salida[corte:corte + n_seca], bpm_ant)
+                n_seca = min(int(60.0 / (bpm_ant or 120.0) / 2 * sr), len(pend) - c)
+                seca = pend[c:c + n_seca] * np.linspace(1.0, 0.0, n_seca, dtype=np.float32)[:, None]
+                cola = cola_eco(pend[c:c + n_seca], bpm_ant)
                 base = linea.copy()
                 base[:len(seca)] += seca[:len(base)]
                 m = min(len(cola), len(base))
                 base[:m] += cola[:m]
-                salida = np.vstack([salida[:corte], base])
+                disco.escribir(pend[:c])
+                pend = base
             else:  # corte o encadenado: 30 ms de salida para no hacer clic
                 n_f = min(int(0.03 * sr), corte - ini_linea)
                 if n_f > 0:
-                    salida[corte - n_f:corte] *= np.linspace(1.0, 0.0, n_f, dtype=np.float32)[:, None]
-                salida = np.vstack([salida[:corte], linea])
+                    pend[c - n_f:c] *= np.linspace(1.0, 0.0, n_f, dtype=np.float32)[:, None]
+                disco.escribir(pend[:c])
+                pend = linea
             print(f"    {tipo} en {corte/sr/60:.1f} min ({t.get('razon') or 'sin razon'})", flush=True)
+        del audio, linea
 
         tracklist.append({"position": i + 1, "start_seconds": round(corte / sr, 3), **_tl(tr)})
-        ini_linea, tramos_linea = corte, tramos
-    return salida, tracklist
+        ini_linea, tramos_linea, pos = corte, tramos, corte
+    disco.escribir(pend)
+    return disco.cerrar(), tracklist
 
 
 def render_set(job, tracks, upload_url, result_path):
@@ -2673,7 +2774,7 @@ def liberar_memoria():
 
 def main():
     filtrar_salida()
-    print("DeepMancho worker iniciado (v7.6.13: temas del Taller constantes y sin 149, desempate 3:2 por el bombo (#618); tempo sin etiqueta a 136 ya no sale a 2/3 (#206); tempo de refine_bpm por bloques, sin pico de memoria en temas largos; SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.6.14: set por tramos a disco, memoria de un solo tema (#75 C-2); temas del Taller constantes y sin 149, desempate 3:2 por el bombo (#618); tempo sin etiqueta a 136 ya no sale a 2/3 (#206); tempo de refine_bpm por bloques, sin pico de memoria en temas largos; SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     global EXAMEN_CM2_APROBADO

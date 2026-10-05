@@ -9,6 +9,7 @@ on:
     paths:
       - bancos/banco_set.py
       - .github/workflows/banco-set.yml
+      - worker.py
 
 permissions:
   contents: read
