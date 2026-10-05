@@ -1,5 +1,13 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.14 (5-oct-2026) — EL SET SE ARMA POR TRAMOS A DISCO (#75 C-2)
+- Medido el 5-oct (GitHub Actions, 28 temas reales en largo y BPM, 163 min de set): el render llegaba a **13,97 GB** de RAM, en una réplica de 10 GB. `render_set` armaba el set entero en memoria y cada transición lo copiaba (`np.vstack`), y el máster hacía más copias del set completo.
+- `_mezcla_plan` ahora escribe a disco (`SetEnDisco`, float32 estéreo) todo lo anterior al punto de cada transición. En memoria queda solo el tema que suena. Las cifras de cada transición (mezcla, eco, corte, encadenado) no cambian.
+- `_masterizar_y_subir` recorre el set en trozos de 30 s, en dos pasadas: sonoridad BS.1770 y pico por trozos (`_lufs_y_pico`, mismo resultado que pyloudnorm) y después ganancia + WAV por trozos. El comando de ffmpeg es el mismo.
+- El original de cada tema se borra apenas se decodifica. Disco necesario: ~1,9 GB por hora de set (float32 + WAV), en lugar de RAM.
+- El método sin plan (`_mezcla_libre`, sets viejos) sigue en memoria. Solo se usa si el plan no coincide.
+- Pruebas: `tests/test_set_memoria.py` (el pico no crece con el set; falla con 7.6.13). El banco de 28 temas se repite en la acción «Banco set largo».
+
 ## 7.6.13 (5-oct-2026) — LOS TEMAS DEL TALLER SALEN «CONSTANTE» Y NO A 149 · Refs dj-connect#618
 - **Qué pasaba:** los temas que exporta el Taller (100 BPM exactos, Entrada de 19,2 s sin bombo, voz) quedaban `tempo_stability = variable` (residuo 136–170 ms), con `bpm_fuera_de_rango:99.959` y confianza 0,6. Con la 7.6.12, además, `detect_tempo` daba **149** (×1,5). El bombo cae a ~1 ms de una rejilla fija de 100.
 - **Causa 1 (149, regresión de 7.6.12):** la regla de #206 es simétrica. La octava gruesa (99,3; puntaje 0,087) quedó «explicada» por la media rejilla de 148,85 (0,0796), y con eso 149 ganaba igualando dentro del 10 %. Con la 7.6.11 los mismos WAV daban 99,28 y 99,0.
