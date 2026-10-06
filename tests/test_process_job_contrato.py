@@ -60,7 +60,7 @@ def job(monkeypatch, tmp_path):
         estado["rendiciones"].append({"bitrate": bitrate, "sufijo": sufijo, "etiquetas": etiquetas, "path": p})
         return str(p)
 
-    def upload_rendition(url, path):
+    def upload_rendition(url, path, mime=None):
         estado["subidas"].append(url)
         return estado["subida_ok"]
 
@@ -245,20 +245,57 @@ def test_sin_destino_completo_no_hay_copia(job, subida):
     assert job["rendiciones"] == [] and "rendition_path" not in resultado(job)
 
 
-def test_master_solo_si_el_tema_lo_necesita(job):
-    correr({"artist": "A", "title": "B"}, master_upload=MASTER)
-    assert job["rendiciones"] == []
-    correr({"artist": "A", "title": "B", "needs_master_conversion": True}, master_upload=MASTER)
-    m, = job["rendiciones"]
-    assert (m["bitrate"], m["sufijo"], m["etiquetas"]) == (worker.MASTER_BITRATE, ".master", True)
-    assert worker.MASTER_BITRATE == "320k"
-    assert job["enviados"][1][1]["result"]["master_path"] == "t1/master.mp3"
+MASTER_FLAC = {"url": "https://x/upload/master.flac", "path": "t1/master.flac"}
 
 
-def test_master_que_no_sube_no_se_anota(job):
-    job["subida_ok"] = False
+@pytest.fixture
+def flac(job, monkeypatch, tmp_path):
+    """Original PCM y un FLAC verificado simulados (la conversión real se prueba con ffmpeg
+    en tests/test_master_flac.py)."""
+    job["codec"] = "pcm_s24le"
+    job["flacs"] = []
+    monkeypatch.setattr(worker, "codec_de", lambda path: job["codec"])
+
+    def make_master_flac(src):
+        p = tmp_path / "m.master.flac"
+        p.write_bytes(b"f" * 1234)
+        job["flacs"].append(src)
+        return str(p)
+    monkeypatch.setattr(worker, "make_master_flac", make_master_flac)
+    return job
+
+
+def test_master_solo_si_el_tema_lo_necesita(flac):
+    correr({"artist": "A", "title": "B"}, master_upload=MASTER_FLAC)
+    assert flac["flacs"] == []
+    correr({"artist": "A", "title": "B", "needs_master_conversion": True}, master_upload=MASTER_FLAC)
+    assert len(flac["flacs"]) == 1 and flac["rendiciones"] == []        # nunca un MP3 de master
+    r = flac["enviados"][1][1]["result"]
+    assert (r["master_path"], r["master_mime"], r["master_bytes"]) == ("t1/master.flac", "audio/flac", 1234)
+
+
+def test_master_que_no_sube_no_se_anota(flac):
+    flac["subida_ok"] = False
+    correr({"artist": "A", "title": "B", "needs_master_conversion": True}, master_upload=MASTER_FLAC)
+    assert "master_path" not in resultado(flac)
+
+
+def test_plataforma_vieja_que_pide_master_mp3_no_convierte(flac):
     correr({"artist": "A", "title": "B", "needs_master_conversion": True}, master_upload=MASTER)
-    assert "master_path" not in resultado(job)
+    assert flac["flacs"] == [] and flac["rendiciones"] == [] and "master_path" not in resultado(flac)
+
+
+@pytest.mark.parametrize("codec", ["mp3", "aac", "flac", "pcm_f32le", "pcm_s32le", None])
+def test_lo_que_no_es_pcm_entero_queda_tal_cual(flac, codec):
+    flac["codec"] = codec
+    correr({"artist": "A", "title": "B", "needs_master_conversion": True}, master_upload=MASTER_FLAC)
+    assert flac["flacs"] == [] and "master_path" not in resultado(flac)
+
+
+def test_flac_que_no_verifica_no_reemplaza(flac, monkeypatch):
+    monkeypatch.setattr(worker, "make_master_flac", lambda src: None)
+    correr({"artist": "A", "title": "B", "needs_master_conversion": True}, master_upload=MASTER_FLAC)
+    assert "master_path" not in resultado(flac) and flac["subidas"] == []
 
 
 # ─────────────────────────────── identificación por huella ───────────────────────────────
