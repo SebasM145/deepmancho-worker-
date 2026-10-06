@@ -1,5 +1,15 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.16 (6-oct-2026) — MASTER SIN PÉRDIDA EN FLAC (decisión de Germán)
+- **Antes (desde la 7.5.1, 30-sep):** un WAV/AIFF/FLAC subido en modo masivo (`needs_master_conversion`) se convertía a **MP3 320k**. `worker-result` cambiaba `audio_asset_path` y borraba el original: el audio sin pérdida se perdía. En la subida normal, la conversión a MP3 la hacía el navegador.
+- **Ahora:**
+  - un original **PCM entero de 16 o 24 bits** (WAV/AIFF) se guarda en **FLAC** (`-compression_level 8`), con el mismo sample rate, la misma profundidad de bits, los metadatos y la portada (si la portada no entra en FLAC, va sin ella);
+  - el FLAC se **verifica muestra por muestra** (`mismo_audio`: sample rate, canales, largo y cada muestra, por bloques) **antes** de reportarlo. Si no es idéntico, no se reemplaza nada y queda el original.
+- **Tal cual, sin re-codificar:** MP3, AAC/M4A, FLAC y WAV en coma flotante o de 32 bits enteros (FLAC no los guarda sin pérdida).
+- **Nunca más un master MP3:** si la plataforma todavía pide `….mp3` (`worker-next` viejo), el worker no convierte y queda el original.
+- Va a `worker-result`: `master_path`, `master_bytes` y `master_mime` (`audio/flac`), para que la cuota (`file_size_bytes`) y el `mime_type` reflejen el FLAC.
+- Pruebas: `tests/test_master_flac.py` (WAV 16/24 bits a 44,1/48/96 kHz y AIFF 16/24 → FLAC idéntico; portada y metadatos; MP3 y WAV flotante intactos; una muestra distinta se detecta) y `tests/test_process_job_contrato.py`.
+
 ## 7.6.15 (5-oct-2026) — ARCHIVOS RAROS: UN MENSAJE CLARO Y SIN REINTENTOS («todo por sistema»)
 - **Antes:** un archivo dañado o que no era audio fallaba al decodificar con un error técnico (`LibsndfileError…`, `NoBackendError`). Se reintentaba 3 veces y terminaba en «sin respuesta después de 3 intentos».
 - **Ahora:**
