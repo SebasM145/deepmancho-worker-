@@ -1,5 +1,18 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.17 (6-oct-2026) — EL ANÁLISIS CORRE EN UN PROCESO HIJO: SI MUERE, LA RÉPLICA SIGUE
+- **Qué pasó:** «Touched The Sky» (410 s, MP3 320k) mató la réplica en sus 3 intentos (14:33, 14:41 y 14:50 UTC del 6-oct). El log llegaba hasta `v7 bpm 124.0 → 124.001` y la réplica se reiniciaba sin traceback ni SIGTERM. El tema quedó en «se detuvo 3 veces» tras ~25 min.
+- **Lo que se midió:** en local, `analyze` con ese archivo termina en 11 s y pica en 2,5 GB. En el contenedor de Railway (CI, `banco_memoria/`), temas sintéticos de 7 min pican en ~1,6 GB y no crecen de un trabajo al otro. La métrica de Railway (suma de réplicas) llegó a 66,6 GB. **La causa exacta no está confirmada:** memoria del contenedor o un fallo de una librería en C con ese archivo.
+- **Arreglo, sirva cual sea la causa:** `analyze`, `medir_sonoridad` y el ancla de CM2 corren en un proceso hijo (`en_proceso_aparte`, fork). Si el hijo muere:
+  - la réplica sigue;
+  - el log dice con qué señal murió («SIGKILL: casi siempre falta de memoria» o «SIGSEGV: falló una librería en C»);
+  - el tema vuelve a la cola al instante con un mensaje claro, en vez de esperar 8 min.
+
+  Además, cada trabajo devuelve toda su memoria al terminar.
+- Las excepciones del worker viajan desde el hijo con su clase (`AudioMudo`, `ArchivoIlegible`…). El tope por trabajo y SIGTERM siguen en el padre y cortan al hijo.
+- `AISLAR_ANALISIS=false` lo apaga. En macOS viene apagado: allí, fork después de los hilos del sistema rompe al hijo; Railway es Linux.
+- Pruebas: `tests/test_aislamiento.py`. En Linux (CI), el análisis real en el hijo da lo mismo que en el padre, con el padre ya «caliente».
+
 ## 7.6.16 (6-oct-2026) — MASTER SIN PÉRDIDA EN FLAC (decisión de Germán)
 - **Antes (desde la 7.5.1, 30-sep):** un WAV/AIFF/FLAC subido en modo masivo (`needs_master_conversion`) se convertía a **MP3 320k**. `worker-result` cambiaba `audio_asset_path` y borraba el original: el audio sin pérdida se perdía. En la subida normal, la conversión a MP3 la hacía el navegador.
 - **Ahora:**

@@ -13,6 +13,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "sondeo_real: usa sondear_audio de verdad (ffprobe)")
+    config.addinivalue_line("markers", "aislamiento_real: corre el análisis en un proceso hijo de verdad")
+
+
+@pytest.fixture(autouse=True)
+def _sin_aislamiento(request, monkeypatch):
+    """Los dobles de las pruebas guardan lo que pasa en listas del proceso padre: con el análisis
+    en un proceso hijo (7.6.17) no se verían. Se apaga salvo con la marca `aislamiento_real`."""
+    if request.node.get_closest_marker("aislamiento_real"):
+        return
+    try:
+        import worker
+    except Exception:
+        return
+    monkeypatch.setattr(worker, "AISLAR_ANALISIS", False, raising=False)
 
 
 @pytest.fixture(autouse=True)
