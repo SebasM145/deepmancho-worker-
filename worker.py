@@ -1695,8 +1695,8 @@ AUDIO_STANDARD = {
 }
 
 
-# Master de biblioteca (7.5.1): todo lo que suben los DJs se guarda en MP3 320k;
-# solo las canciones creadas en el Estudio conservan WAV para descargar.
+# Master de biblioteca: desde la 7.6.16 (6-oct-2026) un WAV/AIFF se guarda en FLAC sin pérdida
+# (ver make_master_flac). MASTER_BITRATE ya no se usa para el master; queda por compatibilidad.
 MASTER_BITRATE = "320k"
 
 
@@ -1733,15 +1733,80 @@ def make_rendition(src_path: str, bitrate: str = None, sufijo: str = ".stream", 
         return None
 
 
-def upload_rendition(signed_url: str, rendition_path: str) -> bool:
-    """Sube la rendition estandar (MP3) a la URL firmada de Supabase Storage."""
+# Master SIN PÉRDIDA (decisión de Germán, 6-oct-2026): un original WAV/AIFF (PCM entero de 16 o
+# 24 bits) se guarda en FLAC, con el mismo sample rate, la misma profundidad de bits, los
+# metadatos y la portada. El FLAC se verifica muestra por muestra contra el original ANTES de
+# reportarlo: worker-result recién entonces cambia audio_asset_path y borra el WAV/AIFF.
+# Ningún original sin pérdida se convierte a MP3 nunca más; MP3/AAC/FLAC se quedan tal cual.
+CODECS_PCM_ENTERO = {"pcm_s16le", "pcm_s16be", "pcm_s24le", "pcm_s24be", "pcm_u8", "pcm_s8"}
+MIME_FLAC = "audio/flac"
+
+
+def codec_de(path: str):
+    """Códec del primer flujo de audio según ffprobe (o None)."""
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+                            "stream=codec_name", "-of", "default=nw=1:nk=1", path],
+                           capture_output=True, text=True, timeout=60)
+        return (r.stdout or "").strip() or None
+    except Exception:
+        return None
+
+
+def mismo_audio(a: str, b: str) -> bool:
+    """True si los dos archivos decodifican al MISMO PCM: sample rate, canales, largo y cada
+    muestra (por bloques, sin cargar el tema entero)."""
+    import soundfile as sf
+    try:
+        ia, ib = sf.info(a), sf.info(b)
+        if (ia.samplerate, ia.channels, ia.frames) != (ib.samplerate, ib.channels, ib.frames):
+            return False
+        with sf.SoundFile(a) as fa, sf.SoundFile(b) as fb:
+            while True:
+                xa = fa.read(1 << 18, dtype="int32", always_2d=True)
+                xb = fb.read(1 << 18, dtype="int32", always_2d=True)
+                if not np.array_equal(xa, xb):
+                    return False
+                if len(xa) == 0:
+                    return True
+    except Exception:
+        return False
+
+
+def make_master_flac(src_path: str):
+    """WAV/AIFF → FLAC sin pérdida (metadatos y portada copiados), verificado contra el
+    original. Devuelve la ruta del FLAC o None (y el original se queda)."""
+    out = src_path + ".master.flac"
+    intentos = (
+        ["-map", "0:a:0", "-map", "0:v?", "-c:v", "copy", "-disposition:v", "attached_pic"],
+        ["-map", "0:a:0", "-vn"],          # portada en un formato que FLAC no acepta: sin ella
+    )
+    for mapas in intentos:
+        try:
+            proc = subprocess.run(["ffmpeg", "-y", "-i", src_path, *mapas, "-map_metadata", "0",
+                                   "-c:a", "flac", "-compression_level", "8", out],
+                                  capture_output=True, timeout=600)
+        except Exception:
+            continue
+        if proc.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+            if mismo_audio(src_path, out):
+                return out
+            print("    WARN: el FLAC no es idéntico al original: se deja el original", flush=True)
+            break
+    if os.path.exists(out):
+        os.remove(out)
+    return None
+
+
+def upload_rendition(signed_url: str, rendition_path: str, mime: str = None) -> bool:
+    """Sube un archivo (por defecto la rendition MP3) a la URL firmada de Supabase Storage."""
     try:
         with open(rendition_path, "rb") as f:
             data = f.read()
         r = requests.put(
             signed_url,
             data=data,
-            headers={"content-type": AUDIO_STANDARD["mime"], "x-upsert": "true"},
+            headers={"content-type": mime or AUDIO_STANDARD["mime"], "x-upsert": "true"},
             timeout=180,
         )
         return r.status_code in (200, 201)
@@ -2040,20 +2105,31 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
                     os.remove(rend)
                 except Exception:
                     pass
-        # Master MP3 320k (subidas masivas de WAV/AIFF/FLAC): worker-result cambia
-        # audio_asset_path y borra el original solo despues de guardar la fila.
+        # Master sin pérdida (6-oct-2026): WAV/AIFF → FLAC verificado. worker-result cambia
+        # audio_asset_path y borra el original solo después de guardar la fila.
         if master_upload and master_upload.get("url") and master_upload.get("path") and track.get("needs_master_conversion"):
-            master = make_rendition(tmp, bitrate=MASTER_BITRATE, sufijo=".master", etiquetas=True)
-            if master:
-                if upload_rendition(master_upload["url"], master):
-                    result["master_path"] = master_upload["path"]
-                    print(f"[job {job_id}] master MP3 320k subido: {master_upload['path']}", flush=True)
-                else:
-                    print(f"[job {job_id}] WARN: no se pudo subir el master MP3", flush=True)
-                try:
-                    os.remove(master)
-                except Exception:
-                    pass
+            destino = master_upload["path"]
+            codec = codec_de(tmp)
+            if not destino.lower().endswith(".flac"):
+                print(f"[job {job_id}] la plataforma pide un master {os.path.splitext(destino)[1] or '?'}: "
+                      f"ya no se pasa un original a MP3; queda el original", flush=True)
+            elif codec not in CODECS_PCM_ENTERO:
+                print(f"[job {job_id}] original {codec or '?'}: no es PCM entero, queda tal cual", flush=True)
+            else:
+                master = make_master_flac(tmp)
+                if master:
+                    if upload_rendition(master_upload["url"], master, mime=MIME_FLAC):
+                        result["master_path"] = destino
+                        result["master_bytes"] = os.path.getsize(master)
+                        result["master_mime"] = MIME_FLAC
+                        print(f"[job {job_id}] master FLAC verificado y subido: {destino} "
+                              f"({os.path.getsize(tmp) // 1048576} → {os.path.getsize(master) // 1048576} MB)", flush=True)
+                    else:
+                        print(f"[job {job_id}] WARN: no se pudo subir el master FLAC", flush=True)
+                    try:
+                        os.remove(master)
+                    except Exception:
+                        pass
         # respetar bpm/key de tags: el backend solo los usa si el track no los tenía
         result["bpm"] = result.get("bpm")  # enviar siempre el BPM preciso (con decimales)
         result["key"] = result.get("key") if not track.get("key") else None
@@ -2824,7 +2900,7 @@ def liberar_memoria():
 
 def main():
     filtrar_salida()
-    print("DeepMancho worker iniciado (v7.6.15: archivos raros terminan con un mensaje claro y sin reintentos; v7.6.14: set por tramos a disco, memoria de un solo tema (#75 C-2); temas del Taller constantes y sin 149, desempate 3:2 por el bombo (#618); tempo sin etiqueta a 136 ya no sale a 2/3 (#206); tempo de refine_bpm por bloques, sin pico de memoria en temas largos; SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.6.16: WAV/AIFF se guardan en FLAC sin perdida y verificado; v7.6.15: archivos raros terminan con un mensaje claro y sin reintentos; v7.6.14: set por tramos a disco, memoria de un solo tema (#75 C-2); temas del Taller constantes y sin 149, desempate 3:2 por el bombo (#618); tempo sin etiqueta a 136 ya no sale a 2/3 (#206); tempo de refine_bpm por bloques, sin pico de memoria en temas largos; SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     global EXAMEN_CM2_APROBADO
