@@ -1932,6 +1932,75 @@ def bpm_en_rango(bpm):
     return b
 
 
+# Análisis en un proceso hijo (6-oct-2026): «Touched The Sky» mató 3 réplicas seguidas dentro de
+# analyze, sin traceback ni SIGTERM (el proceso desaparece: memoria del contenedor o un fallo de una
+# librería en C). Así muere solo el hijo: la réplica sigue, el tema vuelve a la cola al instante con un
+# mensaje claro y el log dice con qué señal murió. Además, cada trabajo devuelve toda su memoria.
+# En macOS, fork después de que las librerías del sistema arrancaron hilos rompe al hijo (le pasa a
+# un Mac de desarrollo, no a Railway, que es Linux): ahí queda apagado salvo que se pida.
+AISLAR_ANALISIS = os.environ.get("AISLAR_ANALISIS", "false" if sys.platform == "darwin" else "true").lower() != "false"
+MSJ_CAIDO = ("El análisis se cortó con este archivo (se quedó sin memoria o el archivo tiene algo que el "
+             "decodificador no soporta). Prueba reintentarlo; si vuelve a pasar, expórtalo de nuevo "
+             "(MP3 320, WAV o AIFF) y súbelo otra vez.")
+
+
+class AnalisisCaido(RuntimeError):
+    """El proceso hijo del análisis murió sin responder."""
+
+
+def en_proceso_aparte(fn, *args, **kw):
+    """Corre fn en un proceso hijo (fork) y devuelve su resultado. Si el hijo lanza una excepción,
+    se relanza aquí (las del worker con su clase); si el hijo muere, AnalisisCaido."""
+    if not AISLAR_ANALISIS:
+        return fn(*args, **kw)
+    import multiprocessing as mp
+    import signal as _signal
+    ctx = mp.get_context("fork")
+    lee, escribe = ctx.Pipe(duplex=False)
+
+    def hijo():
+        _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)   # el apagado lo maneja el padre
+        _signal.signal(_signal.SIGALRM, _signal.SIG_IGN)   # el tope por trabajo, también
+        try:
+            escribe.send(("ok", fn(*args, **kw)))
+        except BaseException as e:  # noqa: BLE001 — viaja al padre
+            try:
+                escribe.send(("err", type(e).__name__, str(e)))
+            except Exception:
+                pass
+        finally:
+            sys.stdout.flush()
+            os._exit(0)
+
+    proc = ctx.Process(target=hijo, daemon=True)
+    proc.start()
+    escribe.close()
+    try:
+        try:
+            msg = lee.recv()
+        except EOFError:
+            proc.join(5)
+            cod = proc.exitcode
+            causa = (f"señal {-cod}" + (" (SIGKILL: casi siempre falta de memoria)" if cod == -9 else
+                                        " (SIGSEGV: falló una librería en C)" if cod == -11 else "")
+                     if cod is not None and cod < 0 else f"código {cod}")
+            print(f"    el proceso de análisis murió: {causa}", flush=True)
+            raise AnalisisCaido(MSJ_CAIDO) from None
+    finally:
+        lee.close()
+        proc.join(10)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(5)
+    if msg[0] == "ok":
+        return msg[1]
+    tipo, texto = msg[1], msg[2]
+    clases = {"AudioMudo": AudioMudo, "ArchivoIlegible": ArchivoIlegible, "ArchivoMuyGrande": ArchivoMuyGrande}
+    if tipo in clases:
+        raise clases[tipo](texto)
+    raise RuntimeError(f"{tipo}: {texto}")
+
+
 class Apagado(Exception):
     """Railway manda SIGTERM al redesplegar o al cambiar la configuración."""
 
@@ -1986,7 +2055,7 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
                 print(f"[job {job_id}] BPM bloqueado {semilla} fuera de rango: se analiza a {octava:g}", flush=True)
             else:
                 octava = None
-            result = analyze(tmp, bpm_seed=octava or semilla)
+            result = en_proceso_aparte(analyze, tmp, bpm_seed=octava or semilla)
             if dur_archivo and dur_archivo > MAX_DURATION + 1:
                 # Más largo que un tema (un set, un podcast): se analizan los primeros 10 min.
                 result["analysis_flags"] = list(result.get("analysis_flags") or []) + [f"analisis_parcial:primeros_{MAX_DURATION}_s_de_{int(dur_archivo)}"]
@@ -2006,7 +2075,7 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
             print(f"[job {job_id}] genero: {gen.get('genre_detected')} ({gen.get('genre_confidence')})", flush=True)
         except Exception as e:
             print(f"[job {job_id}] genero: fallo ({e})", flush=True)
-        result.update(medir_sonoridad(tmp))
+        result.update(en_proceso_aparte(medir_sonoridad, tmp))
         if result.get("energy_v2") is not None:
             print(f"[job {job_id}] energia: {result.get('energy')} (v2: {result['energy_v2']})", flush=True)
         # CM2 (solo con ENABLE_ANCHOR_BACKFILL=true y examen aprobado): ancla de
@@ -2016,7 +2085,7 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
             try:
                 bpm_ref = bpm_en_rango(track.get("bpm") or result.get("bpm"))
                 if bpm_ref and 40 < float(bpm_ref) < 240:
-                    anc = ancla_de_rendicion(track_id, float(bpm_ref))
+                    anc = en_proceso_aparte(ancla_de_rendicion, track_id, float(bpm_ref))
                     if anc["residuo_ms"] <= 8:
                         result["first_beat_detected_ms"] = int(round(anc["ancla_ms"]))
                         print(f"[job {job_id}] CM2 ancla={anc['ancla_ms']}ms residuo={anc['residuo_ms']}ms", flush=True)
@@ -2824,7 +2893,7 @@ def liberar_memoria():
 
 def main():
     filtrar_salida()
-    print("DeepMancho worker iniciado (v7.6.15: archivos raros terminan con un mensaje claro y sin reintentos; v7.6.14: set por tramos a disco, memoria de un solo tema (#75 C-2); temas del Taller constantes y sin 149, desempate 3:2 por el bombo (#618); tempo sin etiqueta a 136 ya no sale a 2/3 (#206); tempo de refine_bpm por bloques, sin pico de memoria en temas largos; SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.6.17: el analisis corre en un proceso hijo (si muere, la replica sigue); v7.6.15: archivos raros terminan con un mensaje claro y sin reintentos; v7.6.14: set por tramos a disco, memoria de un solo tema (#75 C-2); temas del Taller constantes y sin 149, desempate 3:2 por el bombo (#618); tempo sin etiqueta a 136 ya no sale a 2/3 (#206); tempo de refine_bpm por bloques, sin pico de memoria en temas largos; SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     global EXAMEN_CM2_APROBADO
