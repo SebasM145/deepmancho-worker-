@@ -38,6 +38,7 @@ import numpy as np
 import librosa
 from grid_detect import detect_grid, ataques_de_bombo, fase_de_bombos
 import requests
+import parecido
 
 # ----------------------------------------------------------------------------
 # Config — el worker habla con dos Edge Functions (worker-next / worker-result).
@@ -58,6 +59,9 @@ MAX_DURATION = 600  # analiza como máximo 10 min (tope de tiempo/memoria)
 # 3000 da ~4x de detalle para el zoom por compás sin inflar demasiado el payload.
 BUCKETS = 3000
 HEADERS = {"x-worker-secret": WORKER_SECRET, "Content-Type": "application/json"}
+# Lo que este worker sabe hacer, para que worker-next mande solo lo que entiende (función y
+# contenedor se despliegan en cualquier orden).
+CAPACIDADES = "parecido-1"
 
 
 # ── Registros sin firmas (W6, 2-oct-2026) ────────────────────────────────────
@@ -1214,6 +1218,13 @@ def analyze(path: str, bpm_seed=None) -> dict:
         # Plan B sin el pipeline v7 (BPM de detect_grid) o Plan C (sin BPM).
         out["cue_points"] = cues_respaldo(y, sr, bpm, first_beat_ms) or cues_por_tiempo(dur_total_ms)
         print(f"    v7.5 respaldo de cues: {len(out['cue_points'])} ({out['cue_points'][0].get('origen')})", flush=True)
+    # Huella de rasgos (parecido v0, 6-oct-2026): con el audio ya cargado, para comparar una
+    # toma con su semilla y con la línea base sin volver a bajar ningún tema. No bloquea.
+    try:
+        out["rasgos"] = parecido.huella(y, sr, out.get("bpm_precise") or bpm,
+                                        out.get("first_beat_detected_ms", first_beat_ms), camelot)
+    except Exception as e:
+        print(f"    rasgos: fallo (no bloquea): {e}", flush=True)
     # Duracion real (solo si no se corto en MAX_DURATION): muchos temas generados llegan sin ella.
     if dur_total_ms < (MAX_DURATION - 1) * 1000:
         out["duration_seconds"] = int(round(dur_total_ms / 1000.0))
@@ -1662,7 +1673,7 @@ def golden_exam():
 # ----------------------------------------------------------------------------
 def next_job():
     """Reclama el siguiente job y devuelve (job, track, audio_url) o (None, None, None)."""
-    r = requests.post(f"{WORKER_API_URL}/worker-next", headers=HEADERS, timeout=30)
+    r = requests.post(f"{WORKER_API_URL}/worker-next", headers={**HEADERS, "x-worker-capacidades": CAPACIDADES}, timeout=30)
     if r.status_code == 401:
         raise RuntimeError("401: WORKER_SECRET incorrecto")
     r.raise_for_status()
@@ -1673,7 +1684,8 @@ def next_job():
     # El 4.º valor lleva las dos subidas firmadas: rendicion de escucha y master MP3 320
     # (este ultimo solo cuando la plataforma marca needs_master_conversion).
     return job, data.get("track") or {}, data.get("audio_url"), {
-        "rendition": data.get("rendition_upload"), "master": data.get("master_upload")}
+        "rendition": data.get("rendition_upload"), "master": data.get("master_upload"),
+        "parecido": data.get("parecido")}
 
 
 # ---------------------------------------------------------------------------
@@ -2087,7 +2099,8 @@ def _al_apagar(_sig, _frame):
     sys.exit(0)
 
 
-def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict = None, master_upload: dict = None):
+def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict = None, master_upload: dict = None,
+                pedido_parecido: dict = None):
     job_id = job["id"]
     track_id = job["track_id"]
     print(f"[job {job_id}] track {track_id} — analizando...", flush=True)
@@ -2199,6 +2212,12 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
                         os.remove(master)
                     except Exception:
                         pass
+        # Parecido v0: solo para una toma con semilla (worker-next manda el pedido). No bloquea.
+        if pedido_parecido:
+            try:
+                result["parecido"] = medir_parecido_toma(job_id, result.get("rasgos"), pedido_parecido)
+            except Exception as e:
+                print(f"[job {job_id}] parecido: fallo (no bloquea): {e}", flush=True)
         # respetar bpm/key de tags: el backend solo los usa si el track no los tenía
         result["bpm"] = result.get("bpm")  # enviar siempre el BPM preciso (con decimales)
         result["key"] = result.get("key") if not track.get("key") else None
@@ -2955,6 +2974,119 @@ def poll_set_render():
     return True
 
 
+# ============================================================================
+# PARECIDO v0 (6-oct-2026, pedido del Estudio): toma generada contra su tema semilla
+# ============================================================================
+# worker-next manda, solo a un worker con la capacidad «parecido-1», un pedido así:
+#   {"semilla_track_id": uuid, "semilla_rasgos": huella|null,
+#    "semilla_audio_url": url firmada (solo si la semilla no tiene huella vigente),
+#    "semilla": {"bpm", "key", "first_beat_ms"},
+#    "bases": [{"track_id": uuid, "rasgos": huella}, ...]}
+# La cuenta está en parecido.py (funciones puras). Las tomas del banco de calibración
+# (calibracion_eleven) no son music_tracks: llegan por su propia cola, parecido-next.
+
+def huella_de_semilla(job_id, pedido: dict):
+    """(huella, calculada_aquí). Usa la guardada si está vigente; si no, baja la semilla."""
+    h = pedido.get("semilla_rasgos")
+    if parecido.huella_valida(h):
+        return h, False
+    url = pedido.get("semilla_audio_url")
+    if not url:
+        raise RuntimeError("la semilla no tiene huella ni audio")
+    s = pedido.get("semilla") or {}
+    tmp = download_audio(url)
+    try:
+        print(f"[job {job_id}] parecido: la semilla no tenía huella; se mide ahora", flush=True)
+        return en_proceso_aparte(parecido.huella_de_archivo, tmp, s.get("bpm"), s.get("first_beat_ms"),
+                                 s.get("key"), SR, MAX_DURATION), True
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+
+def medir_parecido_toma(job_id, rasgos_toma: dict, pedido: dict) -> dict:
+    if not parecido.huella_valida(rasgos_toma):
+        raise RuntimeError("la toma no tiene huella")
+    h_semilla, nueva = huella_de_semilla(job_id, pedido)
+    bases = [(b.get("track_id"), b.get("rasgos")) for b in pedido.get("bases") or []
+             if parecido.huella_valida(b.get("rasgos"))]
+    out = parecido.medir_parecido(rasgos_toma, h_semilla, bases)
+    out["semilla_track_id"] = pedido.get("semilla_track_id")
+    if nueva:
+        out["semilla_rasgos"] = h_semilla  # worker-result la guarda: la próxima vez no se baja
+    print(f"[job {job_id}] parecido {out['puntaje']} (bruto {out['bruto']}, base {out['linea_base']['media']} "
+          f"con {len(out['linea_base']['temas'])} temas)", flush=True)
+    return out
+
+
+def huella_completa(path: str) -> dict:
+    """Para una toma de calibración, que nunca pasó por analyze: tempo, tonalidad y huella."""
+    y, sr = librosa.load(path, sr=SR, mono=True, duration=MAX_DURATION)
+    if y.size == 0 or float(np.max(np.abs(y))) < SILENCIO_PICO:
+        raise AudioMudo("toma sin audio útil (silencio)")
+    try:
+        bpm, ancla = detect_grid(y, sr, seed_bpm=None)
+        if not (40 < bpm < 240):
+            bpm, ancla = None, None
+    except Exception:
+        bpm, ancla = None, None
+    _, camelot = detect_key(y, sr)
+    return parecido.huella(y, sr, bpm, ancla, camelot)
+
+
+CALIBRACION_DISPONIBLE = True
+
+
+def _parecido_api(action, payload=None):
+    r = requests.post(f"{WORKER_API_URL}/parecido-next?action={action}",
+                      headers={**HEADERS, "x-worker-capacidades": CAPACIDADES}, json=payload or {}, timeout=60)
+    if r.status_code == 404 and action == "next":
+        return None
+    r.raise_for_status()
+    return r.json()
+
+
+def poll_parecido_calibracion() -> bool:
+    """Mide una toma del banco de calibración contra su semilla. True si hizo algo."""
+    global CALIBRACION_DISPONIBLE
+    if not CALIBRACION_DISPONIBLE:
+        return False
+    try:
+        data = _parecido_api("next")
+    except Exception as e:
+        print(f"[parecido-calibracion] no disponible: {type(e).__name__}", flush=True)
+        return False
+    if data is None:
+        CALIBRACION_DISPONIBLE = False  # la función no existe todavía: no se pregunta hasta reiniciar
+        print("[parecido-calibracion] la funcion parecido-next no existe todavia: se omite", flush=True)
+        return False
+    cal = data.get("calibracion")
+    if not cal:
+        return False
+    tmp, resultado, error = None, None, None
+    try:
+        tmp = download_audio(cal["audio_url"])
+        rasgos = en_proceso_aparte(huella_completa, tmp)
+        resultado = medir_parecido_toma(f"cal {cal['id']}", rasgos, data.get("parecido") or {})
+        resultado["toma_rasgos"] = rasgos
+    except Exception as e:
+        error = f"determinista:{e}" if isinstance(e, (ArchivoMuyGrande, ArchivoIlegible, AudioMudo)) else str(e)
+        print(f"[parecido-calibracion] {cal.get('id')}: fallo: {sin_firma(error)}", flush=True)
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+    try:
+        _parecido_api("resultado", {"calibracion_id": cal["id"], "parecido": resultado, "error": error})
+    except Exception as e:
+        print(f"[parecido-calibracion] no se pudo guardar el resultado: {type(e).__name__}", flush=True)
+    return True
+
+
 def liberar_memoria():
     """Devuelve al sistema la RAM de los picos de un analisis (v7.5.1).
     numpy/librosa piden varios GB por tema (WAV de 65 MB, filtros en float64) y
@@ -2969,7 +3101,7 @@ def liberar_memoria():
 
 def main():
     filtrar_salida()
-    print("DeepMancho worker iniciado (v7.6.17: el analisis corre en un proceso hijo (si muere, la replica sigue); v7.6.16: WAV/AIFF se guardan en FLAC sin perdida y verificado; v7.6.15: archivos raros terminan con un mensaje claro y sin reintentos; v7.6.14: set por tramos a disco, memoria de un solo tema (#75 C-2); temas del Taller constantes y sin 149, desempate 3:2 por el bombo (#618); tempo sin etiqueta a 136 ya no sale a 2/3 (#206); tempo de refine_bpm por bloques, sin pico de memoria en temas largos; SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.6.18: parecido v0 entre una toma y su semilla, con huella de rasgos por tema; v7.6.17: el analisis corre en un proceso hijo (si muere, la replica sigue); v7.6.16: WAV/AIFF se guardan en FLAC sin perdida y verificado; v7.6.15: archivos raros terminan con un mensaje claro y sin reintentos; v7.6.14: set por tramos a disco, memoria de un solo tema (#75 C-2); temas del Taller constantes y sin 149, desempate 3:2 por el bombo (#618); tempo sin etiqueta a 136 ya no sale a 2/3 (#206); tempo de refine_bpm por bloques, sin pico de memoria en temas largos; SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     global EXAMEN_CM2_APROBADO
@@ -2997,13 +3129,20 @@ def main():
         if job:
             idle = 0
             espera.trabajo()
-            process_job(job, track, audio_url, (subidas or {}).get("rendition"), (subidas or {}).get("master"))
+            process_job(job, track, audio_url, (subidas or {}).get("rendition"), (subidas or {}).get("master"),
+                        (subidas or {}).get("parecido"))
             liberar_memoria()
         else:
             # Sin jobs de analisis: aprovechar para renderizar sets si hay cola.
             # El analisis tiene prioridad (un track sin analizar bloquea mas que
             # un set sin renderizar).
             if ENABLE_SET_RENDER and poll_set_render():
+                idle = 0
+                espera.trabajo()
+                liberar_memoria()
+                continue
+            # Parecido de las tomas del banco de calibración (pocas; corren con la cola vacía).
+            if poll_parecido_calibracion():
                 idle = 0
                 espera.trabajo()
                 liberar_memoria()
