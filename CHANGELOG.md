@@ -1,5 +1,22 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.18 (6-oct-2026) — PARECIDO v0 ENTRE UNA TOMA Y SU TEMA SEMILLA (pedido del Estudio)
+- **Para qué:** medir cuánto se parece una toma generada («Que suene como un tema mío») al tema del DJ que se usó de semilla. Sirve para el experimento de semillas del Estudio, antes del 17-oct. No usa un modelo de embeddings: es la versión 0.
+- **Huella de rasgos:** cada análisis agrega `rasgos` al resultado. Es un resumen liviano del tema, medido sobre el audio ya cargado (sin descargas extra):
+  - MFCC 1–19, media y desvío (el 0 queda fuera: mide el volumen);
+  - contraste espectral y tercios de octava;
+  - curva de energía por compás (32 puntos);
+  - BPM y tonalidad.
+
+  La plataforma la guarda (`track_rasgos`) para armar la línea base sin bajar audio.
+- **Puntaje bruto (0–100):** 15·BPM + 15·tonalidad + 25·energía + 45·timbre. Las fórmulas están en `parecido.py`.
+  - Si a la semilla le falta un dato, su peso se reparte entre los demás.
+  - Si la semilla lo tiene y a la toma le falta, cuenta como diferencia.
+- **Línea base:** el mismo bruto contra temas del mismo DJ que manda `worker-next`. parecido = clamp(100·(S − media)/(100 − media), 0, 100). Se guardan el bruto, la base y los componentes, para recalibrar.
+- **Cuándo se mide:** `process_job` mide solo si `worker-next` manda un pedido `parecido`. El worker anuncia la cabecera `x-worker-capacidades: parecido-1`, así que la función y el contenedor se despliegan en cualquier orden. Si la semilla no tiene huella vigente, el worker la baja y la mide una vez (va en `semilla_rasgos`). Si algo falla, el análisis sigue igual.
+- **Banco de calibración:** con la cola vacía, el worker pide tomas a `parecido-next` (que no son music_tracks). Si la función no existe (404), deja de preguntar hasta reiniciar.
+- Pruebas: `tests/test_parecido.py`, con audio sintético de resultado conocido (igual 100, casi igual ≥ 75, ambiental sin pulso ≤ 10) y comprobación por mutación de cada regla.
+
 ## 7.6.17 (6-oct-2026) — EL ANÁLISIS CORRE EN UN PROCESO HIJO: SI MUERE, LA RÉPLICA SIGUE
 - **Qué pasó:** «Touched The Sky» (410 s, MP3 320k) mató la réplica en sus 3 intentos (14:33, 14:41 y 14:50 UTC del 6-oct). El log llegaba hasta `v7 bpm 124.0 → 124.001` y la réplica se reiniciaba sin traceback ni SIGTERM. El tema quedó en «se detuvo 3 veces» tras ~25 min.
 - **Lo que se midió:** en local, `analyze` con ese archivo termina en 11 s y pica en 2,5 GB. En el contenedor de Railway (CI, `banco_memoria/`), temas sintéticos de 7 min pican en ~1,6 GB y no crecen de un trabajo al otro. La métrica de Railway (suma de réplicas) llegó a 66,6 GB. **La causa exacta no está confirmada:** memoria del contenedor o un fallo de una librería en C con ese archivo.
