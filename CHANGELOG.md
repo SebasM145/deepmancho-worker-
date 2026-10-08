@@ -1,5 +1,13 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.19 (8-oct-2026) — TEMPO SIN ETIQUETA: UNA PERCUSIÓN DE 3 SEMICORCHEAS YA NO LO LLEVA A 4/3 (#206)
+- **Qué pasó:** de los 21 temas sin BPM en la etiqueta analizados desde el 5-oct, 2 salieron raros: `02589893` a 160,007 y `085906cd` a 162,502, los dos «Minimal / Deep Tech». 160 × 3/4 = 120 y 162,5 × 3/4 ≈ 122.
+- **Causa, reproducida con audio sintético:** en minimal es común una percusión que se repite cada 3 semicorcheas (0,75 tiempos). Su rejilla es la de 4/3 del tempo. La envolvente de ataques le da más peso a ese ruido de banda ancha que al bombo, y la rejilla de 160 puntuaba más que la de 120 aunque el bombo pegara en cada tiempo de 120. Antes del arreglo: 120 → 160,0 · 122 → 162,68 · 126 → 168,0, todos «constante». Sin esa percusión salían exactos.
+- **Arreglo (`grid_detect.py`):** el desempate por el bombo de #618, que solo miraba parejas 3:2, ahora también decide las parejas 4:3. En el sintético de 120, el 100 % de los bombos cae en la rejilla de 120 y el 33 % en la de 160. Si no hay bombo o no separa las dos rejillas por un 25 %, decide la regla de antes.
+- **Un tema de 160 de verdad** (bombo en cada tiempo de 160) se queda en 160.
+- **Falta:** medir los 2 temas reales con este worker (hace falta su audio). Los temas ya analizados no cambian solos: se corrigen al reanalizarlos.
+- Pruebas: `tests/test_206_cuatro_tercios.py` (falla con 7.6.18).
+
 ## 7.6.18 (6-oct-2026) — PARECIDO v0 ENTRE UNA TOMA Y SU TEMA SEMILLA (pedido del Estudio)
 - **Para qué:** medir cuánto se parece una toma generada («Que suene como un tema mío») al tema del DJ que se usó de semilla. Sirve para el experimento de semillas del Estudio, antes del 17-oct. No usa un modelo de embeddings: es la versión 0.
 - **Huella de rasgos:** cada análisis agrega `rasgos` al resultado. Es un resumen liviano del tema, medido sobre el audio ya cargado (sin descargas extra):
