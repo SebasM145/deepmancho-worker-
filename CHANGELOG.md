@@ -1,5 +1,20 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.19 (9-oct-2026) — TEMPO SIN ETIQUETA: EL BOMBO DECIDE TAMBIÉN LAS PAREJAS 4:3 Y 5:4 (#206)
+- **Qué pasó:** de los 21 temas sin BPM en la etiqueta analizados desde el 5-oct, 2 salieron raros: `02589893` a 160,007 y `085906cd` a 162,502 (162,5 «variable»), los dos «Minimal / Deep Tech».
+- **Medido con su audio real (9-oct):** son **128** y **130**. 160/128 = 162,5/130 = **5/4**, no 4/3 como se sospechaba. La autocorrelación del bombo y la de la banda completa dan su pico en 128,00 y 130,00. Con las funciones del detector, la rejilla de 128 junta el 68,7 % de los bombos (la de 160, el 29,4 %), y la de 130 el 46,5 % (la de 162,5, el 24,3 %).
+- **Causa:** a 11025 Hz librosa da 86,13. Su doble (172,3) queda como octava y se ajusta a 159,98/162,48, y el tempo real (129,2 = ×1,5) entra como proporción. En `085906cd` la proporción hasta puntuaba más (0,242 contra 0,228), pero no llegaba al 10 % de ventaja. Ninguna regla de desempate miraba las parejas 5:4.
+- **Arreglo (`grid_detect.py`):** el desempate por el bombo de #618 (antes solo 3:2) ahora decide también las parejas **4:3** (`en_proporcion_4_3`, una percusión cada 3 semicorcheas, reproducida con audio sintético) y **5:4** (`en_proporcion_5_4`, una percusión cada 0,8 tiempos). Si no hay bombo o no separa las dos rejillas por un 25 %, decide la regla de antes.
+
+| Tema real | 7.6.18 (producción) | solo el arreglo 4:3 | 7.6.19 |
+|---|---|---|---|
+| `02589893` | 160,007 · constante · ⚠ fuera de rango | 160,007 | **128,071 · constante** · confianza 1,0 |
+| `085906cd` | 162,502 · **variable** · ancla rechazada (88,6 ms) | 162,502 | **129,993 · constante** · ancla con residuo 1,1 ms |
+
+- **Un tema de 160 de verdad se queda en 160**, tanto con la percusión de 3 semicorcheas como con una cada 1,25 tiempos (antes del arreglo 5:4, ese salía 128).
+- **Los temas ya analizados no cambian solos:** se corrigen al reanalizarlos.
+- Pruebas: `tests/test_206_cuatro_tercios.py`, 12 pruebas. Con 7.6.18 fallan 5 de las 4:3; con solo el arreglo 4:3 fallan las 6 de 5:4.
+
 ## 7.6.18 (6-oct-2026) — PARECIDO v0 ENTRE UNA TOMA Y SU TEMA SEMILLA (pedido del Estudio)
 - **Para qué:** medir cuánto se parece una toma generada («Que suene como un tema mío») al tema del DJ que se usó de semilla. Sirve para el experimento de semillas del Estudio, antes del 17-oct. No usa un modelo de embeddings: es la versión 0.
 - **Huella de rasgos:** cada análisis agrega `rasgos` al resultado. Es un resumen liviano del tema, medido sobre el audio ya cargado (sin descargas extra):
