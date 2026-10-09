@@ -186,8 +186,21 @@ def en_proporcion_4_3(bpm_a, bpm_b, tol=TOLERANCIA_4_3):
     return abs(r - 4 / 3) <= tol * 4 / 3
 
 
+def en_proporcion_5_4(bpm_a, bpm_b, tol=TOLERANCIA_4_3):
+    """¿Los dos tempos están en proporción 5:4 (en cualquier orden)?
+
+    #206 (9-oct, medido con el audio real): `02589893` (128) y `085906cd` (130) salían 160,007
+    y 162,502. A 11025 Hz librosa da 86,13; su doble (172,3) queda de octava y se ajusta a
+    159,98/162,48, y el tempo real (129,2 = ×1,5) entra como proporción. 160/128 = 162,5/130 =
+    5/4: ninguna regla de desempate miraba esa pareja y a la proporción le faltaba el 10 %."""
+    if not (bpm_a and bpm_b) or bpm_a <= 0 or bpm_b <= 0:
+        return False
+    r = max(bpm_a, bpm_b) / min(bpm_a, bpm_b)
+    return abs(r - 5 / 4) <= tol * 5 / 4
+
+
 def desempate_por_bombo(y, sr, bpm_a, bpm_b):
-    """Entre dos tempos en proporción 3:2 o 4:3, el que junta más bombos en su rejilla (con
+    """Entre dos tempos en proporción 3:2, 4:3 o 5:4, el que junta más bombos en su rejilla (con
     VENTAJA_BOMBO). None si no hay bombo suficiente o si no se separan: decide la regla de antes."""
     t, pesos = ataques_de_bombo(y, sr, 60.0 / max(bpm_a, bpm_b))
     if len(t) < MIN_BOMBOS:
@@ -276,12 +289,13 @@ def detect_tempo(y, sr, seed_bpm=None, env=None):
     mejor_octava = best[0]
     for semilla in otras:
         cand = _busqueda_gruesa(env, sr, dur_s, semilla, env3)
-        # #618: con dos tempos en 3:2 (o en 4:3, #206), primero decide el bombo (cae en cada
+        # #618: con dos tempos en 3:2 (o en 4:3 o 5:4, #206), primero decide el bombo (cae en cada
         # tiempo del real).
         # Solo si no hay bombo o no los separa, siguen las dos reglas de #206 de abajo.
         if (explicada_por_media_rejilla(cand[0], mejor_octava)
                 or explicada_por_media_rejilla(mejor_octava, cand[0])
-                or en_proporcion_4_3(cand[0], mejor_octava)):
+                or en_proporcion_4_3(cand[0], mejor_octava)
+                or en_proporcion_5_4(cand[0], mejor_octava)):
             gana = desempate_por_bombo(y, sr, mejor_octava, cand[0])
             if gana is not None:
                 if gana == cand[0]:
