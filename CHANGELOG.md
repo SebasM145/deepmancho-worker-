@@ -1,5 +1,24 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.20 (9-oct-2026) — energy_v2 EN LA ESCALA DEL CATÁLOGO REAL (#248). `energy` NO CAMBIA
+- **Qué cambia:** solo `energy_v2`, la candidata que se guarda aparte. La app no la lee: nada cambia en pantalla, en las listas ni en la radio.
+- **Por qué:** medido en 40 temas al azar del catálogo del dueño (9-oct), la v2 seguía apretada, con el 70 % en 7, por escala y no por oído:
+  - golpes por segundo: tope en 6/s con una mediana real de 6,05, así que **el 52 % de los temas quedaba topado**;
+  - agudos: se dividía por 0,25, pero la fracción real va de 0,035 a 0,10;
+  - volumen: −20…−6 LUFS, y el catálogo va de −10,7 a −7,3.
+- **Arreglo (`analizador_v8.py`):** los mismos tres componentes y los mismos pesos, en la escala real (`V2_LUFS` −13…−6, `V2_AGUDOS` 0,02…0,12, `V2_GOLPES` 3…8/s).
+
+| | Valores que usa | El más común |
+|---|---|---|
+| `energy` (sin cambio) | 2 | 82 % en 8 |
+| `energy_v2` antes | 5 | 70 % en 7 |
+| `energy_v2` 7.6.20 | **6** | **30 %** |
+
+- **Es la misma medida, solo bien escalada:** Spearman 0,96 contra la v2 anterior. Moviendo los límites (−14…−6, −12…−6 o −13…−5 LUFS; golpes 2…8, 3…9 o 4…8), el más común queda entre 30 y 38 %.
+- **Falta:** H-5 (15 temas con la nota de Germán) para decidir si `energy` pasa a esta escala.
+- **Mientras tanto,** `energy_v2` queda con dos escalas en la base: la vieja en lo ya analizado y esta en lo nuevo. Se iguala al reanalizar. Nadie la lee.
+- Pruebas: `tests/test_v8_mezcla.py` suma 2, con las medidas reales de los 40 temas (solo números). Con 7.6.19 fallan las dos.
+
 ## 7.6.19 (9-oct-2026) — TEMPO SIN ETIQUETA: EL BOMBO DECIDE TAMBIÉN LAS PAREJAS 4:3 Y 5:4 (#206)
 - **Qué pasó:** de los 21 temas sin BPM en la etiqueta analizados desde el 5-oct, 2 salieron raros: `02589893` a 160,007 y `085906cd` a 162,502 (162,5 «variable»), los dos «Minimal / Deep Tech».
 - **Medido con su audio real (9-oct):** son **128** y **130**. 160/128 = 162,5/130 = **5/4**, no 4/3 como se sospechaba. La autocorrelación del bombo y la de la banda completa dan su pico en 128,00 y 130,00. Con las funciones del detector, la rejilla de 128 junta el 68,7 % de los bombos (la de 160, el 29,4 %), y la de 130 el 46,5 % (la de 162,5, el 24,3 %).

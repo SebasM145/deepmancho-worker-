@@ -115,19 +115,33 @@ def tercios_de_octava(mono: np.ndarray, sr: int) -> dict:
     return {k: _r(10 * math.log10(v / tope) if v > 0 and tope > 0 else -120.0, 1) for k, v in out.items()}
 
 
+# #248 (9-oct): escalas al rango REAL del catálogo. Medido en 40 temas al azar del dueño (p10–p90):
+# LUFS −10,7…−7,3 · agudos 0,035…0,10 · golpes 4,6…7,1/s. Con las de antes (−20…−6 LUFS, agudos/0,25,
+# golpes 1…6/s) el componente de golpes quedaba topado en el 52 % de los temas, los agudos usaban solo
+# 0,14–0,41 y el 70 % salía en 7. Con estas: 6 valores y el más común con el 30 %, mismo orden (Spearman 0,96).
+V2_LUFS = (-13.0, -6.0)
+V2_AGUDOS = (0.02, 0.12)
+V2_GOLPES = (3.0, 8.0)
+
+
+def _escala(x: float, rango: tuple) -> float:
+    lo, hi = rango
+    return min(1.0, max(0.0, (x - lo) / (hi - lo)))
+
+
 def energia_v2(mezcla: dict, onsets_por_seg: float | None = None) -> int | None:
-    """Candidato para #248, aun SIN calibrar: no reemplaza a `energy` hasta tener la
-    referencia del dueno. Sonoridad en escala de -20 a -6 LUFS (no se satura), agudos
-    absolutos (tercios desde 2 kHz contra el total, sin normalizar por tema) y
-    densidad de golpes."""
+    """Candidato para #248, aun SIN calibrar con el oído del dueño: no reemplaza a `energy`
+    hasta tener su referencia (H-5). Sonoridad, agudos absolutos (tercios desde 2 kHz contra
+    el total, sin normalizar por tema) y densidad de golpes, cada uno en la escala del
+    catálogo real (V2_*)."""
     lufs = mezcla.get("lufs_integrado")
     if lufs is None:
         return None
-    vol = min(1.0, max(0.0, (lufs + 20) / 14))
+    vol = _escala(lufs, V2_LUFS)
     t = mezcla.get("tercios_db") or {}
     lin = {float(k): 10 ** (v / 10) for k, v in t.items() if v is not None}
     total = sum(lin.values()) or 1.0
-    agudos = min(1.0, (sum(v for k, v in lin.items() if k >= 2000) / total) / 0.25)
-    golpes = min(1.0, max(0.0, ((onsets_por_seg or 2.0) - 1.0) / 5.0))
+    agudos = _escala(sum(v for k, v in lin.items() if k >= 2000) / total, V2_AGUDOS)
+    golpes = _escala(onsets_por_seg or 2.0, V2_GOLPES)
     e01 = 0.5 * vol + 0.25 * agudos + 0.25 * golpes
     return int(max(1, min(10, round(1 + 9 * e01))))
