@@ -1,5 +1,14 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.22 (10-oct-2026) — UN TEMA REANALIZADO Y LIMPIO BORRA SUS ALARMAS VIEJAS (#206)
+- **Qué pasó:** después del reanálisis del 9-oct, `02589893` y `085906cd` quedaron bien (128,071 y 129,993, «constante», confianza 1), pero `analysis_flags` conservó las alarmas del análisis viejo: `bpm_fuera_de_rango:160.007`, `bpm_fuera_de_rango:162.502` y `tempo_variable`. Cualquier pantalla que lea las alarmas mostraba un aviso falso.
+- **Causa (worker, no `worker-result`):** el worker solo mandaba `analysis_flags` si la revisión encontraba algún problema. `worker-result` reemplaza las alarmas cuando llega el campo y, si no llega, no toca la columna. Un tema limpio no mandaba nada y se quedaba con las de antes.
+- **Arreglo:** cuando la revisión automática corre, `analysis_flags` va siempre, vacía si no hay problemas. `worker-result` ya guarda la lista vacía (más su propia bandera `bpm_etiqueta_difiere`, si aplica). No hace falta tocar funciones ni SQL.
+- **Sin cambio:** si la revisión no llega a correr (falla el análisis v7), el campo no va y las alarmas guardadas se conservan, como antes. Las banderas que suma `process_job` (`analisis_parcial`, `bpm_etiqueta_octava`, `genero_por_revisar`) se siguen sumando a la lista.
+- **Para cerrar #206:** después de desplegar, reanalizar en silencio los 2 temas (`origen='reanalisis'`); deben quedar con `analysis_flags = []`.
+- **Mezclar después de #50 (7.6.21):** los dos tocan la línea de arranque y el inicio de este historial.
+- Pruebas: `tests/test_alarmas_reanalisis.py` (2). Con 7.6.20 falla la del tema limpio.
+
 ## 7.6.20 (9-oct-2026) — energy_v2 EN LA ESCALA DEL CATÁLOGO REAL (#248). `energy` NO CAMBIA
 - **Qué cambia:** solo `energy_v2`, la candidata que se guarda aparte. La app no la lee: nada cambia en pantalla, en las listas ni en la radio.
 - **Por qué:** medido en 40 temas al azar del catálogo del dueño (9-oct), la v2 seguía apretada, con el 70 % en 7, por escala y no por oído:
