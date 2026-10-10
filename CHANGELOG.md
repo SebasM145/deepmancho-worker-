@@ -1,5 +1,27 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.23 (10-oct-2026) — TEMPO SIN ETIQUETA: UNA PROPORCIÓN DE AFUERA YA NO LE GANA A 124 (dj-connect #885)
+- **Qué pasó:** en 48 temas con el BPM bloqueado (Mixed In Key o a mano), el `bpm_detected` guardado estaba a 3/4, 5/4, 4/3 o 3/2 del tempo real. Lo guardado es de versiones viejas: con 7.6.20, 34 ya salen bien. Quedaban 14.
+- **Medido con su audio** (el stream MP3 público, solo lectura, borrado al terminar) y con el bombo como árbitro:
+  - **8 son del detector:** 186 por 124, 184,5 por 123 (3:2), 151,25 y 150 por 121 y 120 (5:4) y 91,5 por 122.
+  - **6 son la etiqueta mal puesta:** 90–97 en temas de house, más uno con 123 que es 120. La rejilla del detector junta el 71–94 % de los bombos; la de la etiqueta, el 9–25 %. No es del worker.
+- **Causa:** en `0d474d0a` (124), el bajo hace semicorcheas (0, ¼ y ¾ de cada tiempo) dentro de la banda del bombo y con la misma fuerza. El desempate por el bombo de #618 elegía 186 (57 % contra 32 %), aunque la rejilla de ataques prefería 124 (0,466 contra 0,362). En `1289fd09` (123) lo sacaba la regla de #206: la octava explicada por la media rejilla, con el 10 %. En `d91a7c9d` (122), la octava quedaba en 91,5 y 122 ni siquiera era candidata.
+- **Arreglo (`grid_detect.py`), con el rango de baile = el de `bpm_fuera_de_rango` (99,5–150,5):**
+  1. `saca_del_rango`: una proporción de afuera no compite contra una octava de adentro, ni por el bombo ni por la puntuación. Al revés sí: 160 → 128 de #206 sigue igual.
+  2. `volver_al_rango_por_bombo`: si el tempo queda **por debajo** del rango, se prueban sus proporciones de adentro y decide el bombo, con su 25 %. Por encima no se toca.
+  - Con semilla (BPM conocido) no cambia nada.
+
+| | 7.6.20 | 7.6.23 |
+|---|---|---|
+| Los 48: en proporción 1 con lo guardado | 34 | **41** |
+| Los 48: correctos según el bombo | 40 | **47** |
+| Control: 60 temas al azar que ya salían bien | 60 | 60, ninguno cambia |
+| Los 3 del catálogo con etiqueta > 138 (140, «160», «155») | 140 · 128 · 124 | igual |
+
+- **Queda:** `f9a2a9c4` (120) sale 150. Los dos están dentro del rango y el bombo no los separa (48 % contra 41 %).
+- **Cambia una decisión de 7.6.19:** sin etiqueta, un 160 de verdad con una percusión cada ¾ o 1¼ tiempos ahora sale 106,5 o 128. En el catálogo no hay ni uno: los 2 con etiqueta de 155 y 160 son 124 y 128 por el bombo, 57 % contra 25 % y 64 % contra 37 %. Con su etiqueta, el tempo que se usa (`bpm_precise`) sigue en 160. Las dos pruebas de control de `test_206_cuatro_tercios.py` ahora pasan la etiqueta.
+- Pruebas: `tests/test_885_rango_de_baile.py` (10) usa los puntajes medidos en el audio real. Con 7.6.20 fallan 9. Batería completa: 559 en verde.
+
 ## 7.6.20 (9-oct-2026) — energy_v2 EN LA ESCALA DEL CATÁLOGO REAL (#248). `energy` NO CAMBIA
 - **Qué cambia:** solo `energy_v2`, la candidata que se guarda aparte. La app no la lee: nada cambia en pantalla, en las listas ni en la radio.
 - **Por qué:** medido en 40 temas al azar del catálogo del dueño (9-oct), la v2 seguía apretada, con el 70 % en 7, por escala y no por oído:

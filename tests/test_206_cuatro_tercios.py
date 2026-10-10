@@ -83,12 +83,20 @@ def test_con_pausas_largas_de_bombo(tmp_path):
     assert round(float(r["bpm"])) == 120, r.get("bpm")
 
 
+def _rapido_con_etiqueta(ruta, audio):
+    """dj-connect #885 (7.6.23): sin etiqueta, una proporción por encima del rango de baile (99,5–150,5)
+    ya no le gana a una octava de adentro. En el catálogo no hay ni un tema real por encima de 150,5
+    (los 2 con etiqueta de 155 y 160 son 124 y 128 por el bombo), y así salían 186 por 124. Un 160 de
+    verdad con esta percusión queda protegido por su etiqueta: con semilla, el tempo que se usa
+    (`bpm_precise`) es 160 y el detector solo audita (`bpm_etiqueta_difiere`)."""
+    sf.write(ruta, audio, SR)
+    return worker.analyze(str(ruta), bpm_seed=160)
+
+
 def test_un_tema_de_160_de_verdad_sigue_en_160(tmp_path):
-    """Control: con el bombo en cada tiempo de 160, la misma percusión no lo baja a 120."""
-    ruta = tmp_path / "rapido_160.wav"
-    sf.write(ruta, minimal(160, percusion=0.3), SR)
-    r = worker.analyze(str(ruta), bpm_seed=None)
-    assert round(float(r["bpm"])) == 160, r.get("bpm")
+    """Control: con el bombo en cada tiempo de 160 y su etiqueta, la misma percusión no lo baja."""
+    r = _rapido_con_etiqueta(tmp_path / "rapido_160.wav", minimal(160, percusion=0.3))
+    assert round(float(r["bpm_precise"])) == 160, r.get("bpm_precise")
 
 
 def test_proporcion_cinco_cuartos():
@@ -112,8 +120,6 @@ def test_percusion_cada_0_8_tiempos_no_lleva_a_cinco_cuartos(bpm, percusion, pau
 
 
 def test_un_160_con_percusion_cada_1_25_tiempos_sigue_en_160(tmp_path):
-    """El sentido contrario: antes del arreglo 5:4 salía 128."""
-    ruta = tmp_path / "rapido_160_54.wav"
-    sf.write(ruta, minimal(160, percusion=0.5, paso=1.25), SR)
-    r = worker.analyze(str(ruta), bpm_seed=None)
-    assert round(float(r["bpm"])) == 160, r.get("bpm")
+    """El sentido contrario: antes del arreglo 5:4 salía 128. Con su etiqueta (ver arriba)."""
+    r = _rapido_con_etiqueta(tmp_path / "rapido_160_54.wav", minimal(160, percusion=0.5, paso=1.25))
+    assert round(float(r["bpm_precise"])) == 160, r.get("bpm_precise")
