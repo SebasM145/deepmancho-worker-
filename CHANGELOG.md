@@ -22,6 +22,36 @@
 - **Cambia una decisión de 7.6.19:** sin etiqueta, un 160 de verdad con una percusión cada ¾ o 1¼ tiempos ahora sale 106,5 o 128. En el catálogo no hay ni uno: los 2 con etiqueta de 155 y 160 son 124 y 128 por el bombo, 57 % contra 25 % y 64 % contra 37 %. Con su etiqueta, el tempo que se usa (`bpm_precise`) sigue en 160. Las dos pruebas de control de `test_206_cuatro_tercios.py` ahora pasan la etiqueta.
 - Pruebas: `tests/test_885_rango_de_baile.py` (10) usa los puntajes medidos en el audio real. Con 7.6.20 fallan 9. Batería completa: 559 en verde.
 
+## 7.6.22 (10-oct-2026) — UN TEMA REANALIZADO Y LIMPIO BORRA SUS ALARMAS VIEJAS (#206)
+- **Qué pasó:** después del reanálisis del 9-oct, `02589893` y `085906cd` quedaron bien (128,071 y 129,993, «constante», confianza 1), pero `analysis_flags` conservó las alarmas del análisis viejo: `bpm_fuera_de_rango:160.007`, `bpm_fuera_de_rango:162.502` y `tempo_variable`. Cualquier pantalla que lea las alarmas mostraba un aviso falso.
+- **Causa (worker, no `worker-result`):** el worker solo mandaba `analysis_flags` si la revisión encontraba algún problema. `worker-result` reemplaza las alarmas cuando llega el campo y, si no llega, no toca la columna. Un tema limpio no mandaba nada y se quedaba con las de antes.
+- **Arreglo:** cuando la revisión automática corre, `analysis_flags` va siempre, vacía si no hay problemas. `worker-result` ya guarda la lista vacía (más su propia bandera `bpm_etiqueta_difiere`, si aplica). No hace falta tocar funciones ni SQL.
+- **Sin cambio:** si la revisión no llega a correr (falla el análisis v7), el campo no va y las alarmas guardadas se conservan, como antes. Las banderas que suma `process_job` (`analisis_parcial`, `bpm_etiqueta_octava`, `genero_por_revisar`) se siguen sumando a la lista.
+- **Para cerrar #206:** después de desplegar, reanalizar en silencio los 2 temas (`origen='reanalisis'`); deben quedar con `analysis_flags = []`.
+- **Mezclar después de #50 (7.6.21):** los dos tocan la línea de arranque y el inicio de este historial.
+- Pruebas: `tests/test_alarmas_reanalisis.py` (2). Con 7.6.20 falla la del tema limpio.
+
+## 7.6.21 (9-oct-2026) — HOT CUES Y ENERGÍA CALIBRADOS CONTRA MIXED IN KEY (#860)
+- **Banco:** los 50 temas de «Toque Tech House Piso 3» de Germán, con los 8 cues y la energía de Mixed In Key (dj-connect `docs/hot-cues/referencia-mik-piso3-2026-10-09.json`). Se corre con `bancos/banco_mik.py` (el mismo camino de `analyze`) y se mide con `scripts/medir/cues-mik.mjs` en dj-connect. La corrida local con 7.6.20 da exactamente la línea base de producción (237 de 397, +1,78): el banco es fiel.
+
+| Medida | 7.6.20 | 7.6.21 | Meta |
+|---|---|---|---|
+| Cues de MIK con uno nuestro a ≤ 2 compases | 237 de 397 (60 %) | **300 de 397 (76 %)** | ≥ 80 % |
+| Cues nuestros sin pareja en MIK | 163 de 400 (41 %) | 100 de 400 (25 %) | |
+| Energía del tema (nuestra − MIK) | +1,78 (absoluta 1,78) | **−0,04** (absoluta 0,32) | ≤ 0,5 |
+| Temas con la energía exacta de MIK | 2 de 50 | 34 de 50 | |
+
+- **Cues (`detect_cues` v7.7):**
+  1. Las frases se cuentan desde el **inicio del archivo** (en la fase del primer beat), no desde el ancla. Si el bombo entra tarde (ancla en el compás 4), todos los cues quedaban a 4 compases de los de MIK.
+  2. El cambio se mide con **4 compases** antes y después (con 8 se borraban los cambios cortos; AUC 0,89 contra 0,82). Los candidatos van cada 4 compases y el borde de 8 vale un 20 % más, como lo prefiere MIK.
+  3. La salida (H) se elige primero, desde el 75 % del audio útil y con 24 compases de cola. Queda en la mediana 0,80 del tema (MIK: 0,79) y nunca antes del 75 %. Después van los 6 cambios más fuertes antes de H, a una frase como mínimo.
+- **Energía (`compute_energy`):** `1 + 7·e01` en lugar de `1 + 9·e01`. El tech house salía 8 donde MIK dice 6. El silencio sigue en 1 y lo más fuerte baja de 10 a 8.
+- **Sin sobreajuste:** cada regla se eligió mirando el banco partido en dos (temas pares e impares) y da lo mismo en las dos mitades: cues 148/199 y 152/198; energía −0,08 y 0,00.
+- **Por qué no llega al 80 %:** con este tipo de señal (energía por bandas), ninguna variante pasó de 302. Eso incluye 22 kHz con 6 bandas, una regresión logística con validación cruzada y una programación dinámica con la distribución de saltos de MIK. Si pudiéramos poner 9 cues llegaríamos a 318 (80 %): el límite es el orden entre el 7.º y el 9.º cambio, no la posición. Queda como siguiente paso.
+- **No se tocó:** la energía de cada cue (+0,52 sobre MIK; con base 3,0 bajaría a +0,12). Esa escala se calibró con 7.493 cues de MIK de todo el catálogo, y moverla por 50 temas de un solo estilo sería sobreajustar.
+- **Efecto visible al reanalizar:** `energy` baja unos 2 puntos en todo el catálogo (en el buscador, el tech house pasa de «alta» ≥ 8 a «media»), y los cues se mueven. Los temas con `cue_source = 'mixedinkey'` no se tocan (#859).
+- **Pruebas:** `tests/test_860_cues_mik.py`, con 4 casos de audio sintético. Con 7.6.20 fallan 2: la fase con intro sin bombo y la escala de la energía.
+
 ## 7.6.20 (9-oct-2026) — energy_v2 EN LA ESCALA DEL CATÁLOGO REAL (#248). `energy` NO CAMBIA
 - **Qué cambia:** solo `energy_v2`, la candidata que se guarda aparte. La app no la lee: nada cambia en pantalla, en las listas ni en la radio.
 - **Por qué:** medido en 40 temas al azar del catálogo del dueño (9-oct), la v2 seguía apretada, con el 70 % en 7, por escala y no por oído:
