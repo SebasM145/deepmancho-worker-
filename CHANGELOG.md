@@ -1,5 +1,14 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.22 (10-oct-2026) — UN TEMA REANALIZADO Y LIMPIO BORRA SUS ALARMAS VIEJAS (#206)
+- **Qué pasó:** después del reanálisis del 9-oct, `02589893` y `085906cd` quedaron bien (128,071 y 129,993, «constante», confianza 1), pero `analysis_flags` conservó las alarmas del análisis viejo: `bpm_fuera_de_rango:160.007`, `bpm_fuera_de_rango:162.502` y `tempo_variable`. Cualquier pantalla que lea las alarmas mostraba un aviso falso.
+- **Causa (worker, no `worker-result`):** el worker solo mandaba `analysis_flags` si la revisión encontraba algún problema. `worker-result` reemplaza las alarmas cuando llega el campo y, si no llega, no toca la columna. Un tema limpio no mandaba nada y se quedaba con las de antes.
+- **Arreglo:** cuando la revisión automática corre, `analysis_flags` va siempre, vacía si no hay problemas. `worker-result` ya guarda la lista vacía (más su propia bandera `bpm_etiqueta_difiere`, si aplica). No hace falta tocar funciones ni SQL.
+- **Sin cambio:** si la revisión no llega a correr (falla el análisis v7), el campo no va y las alarmas guardadas se conservan, como antes. Las banderas que suma `process_job` (`analisis_parcial`, `bpm_etiqueta_octava`, `genero_por_revisar`) se siguen sumando a la lista.
+- **Para cerrar #206:** después de desplegar, reanalizar en silencio los 2 temas (`origen='reanalisis'`); deben quedar con `analysis_flags = []`.
+- **Mezclar después de #50 (7.6.21):** los dos tocan la línea de arranque y el inicio de este historial.
+- Pruebas: `tests/test_alarmas_reanalisis.py` (2). Con 7.6.20 falla la del tema limpio.
+
 ## 7.6.21 (9-oct-2026) — HOT CUES Y ENERGÍA CALIBRADOS CONTRA MIXED IN KEY (#860)
 - **Banco:** los 50 temas de «Toque Tech House Piso 3» de Germán, con los 8 cues y la energía de Mixed In Key (dj-connect `docs/hot-cues/referencia-mik-piso3-2026-10-09.json`). Se corre con `bancos/banco_mik.py` (el mismo camino de `analyze`) y se mide con `scripts/medir/cues-mik.mjs` en dj-connect. La corrida local con 7.6.20 da exactamente la línea base de producción (237 de 397, +1,78): el banco es fiel.
 
