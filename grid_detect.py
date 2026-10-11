@@ -214,6 +214,67 @@ def desempate_por_bombo(y, sr, bpm_a, bpm_b):
     return None
 
 
+# #885 (10-oct): el rango de baile es el mismo de `bpm_fuera_de_rango` (worker.sanity_check).
+# En el catálogo público, 1.148 de 1.156 temas con BPM bloqueado caen ahí. El bombo se
+# equivoca cuando el bajo hace semicorcheas dentro de su banda (35–130 Hz) con la misma fuerza:
+# en `0d474d0a` (124) los ataques graves caen en 0, ¼ y ¾ de cada tiempo, la rejilla de 186
+# junta el 57 % y la de 124 el 32 %, aunque la rejilla de ataques prefiere 124 (0,466 contra
+# 0,362). Así salían 186 por 124 y 151,25 por 121. Y 184,5 por 123 por la regla de #206 de abajo (la
+# octava explicada por la media rejilla de la proporción, con 10 % de ventaja).
+RANGO_BAILE = (99.5, 150.5)
+
+
+def en_rango_de_baile(bpm):
+    return bool(bpm) and RANGO_BAILE[0] <= bpm <= RANGO_BAILE[1]
+
+
+def saca_del_rango(octava_bpm, cand_bpm):
+    """#885: una proporción fuera del rango de baile no compite contra una octava que está dentro
+    (ni por el bombo ni por la puntuación). Al revés sí (160 → 128 de #206), y un 160 de verdad
+    que ya era la octava sigue en 160."""
+    return en_rango_de_baile(octava_bpm) and not en_rango_de_baile(cand_bpm)
+
+
+PROPORCIONES_RANGO = (3 / 4, 4 / 3, 2 / 3, 3 / 2, 4 / 5, 5 / 4)
+
+
+def _busqueda_cerca(env, sr, dur_s, centro, env3, margen=0.02):
+    """Mejor (bpm, puntuación) en ±2 % de `centro`, paso 0,05: una proporción exacta de un tempo
+    ya ajustado cae a menos de 1 BPM de la real."""
+    best = (centro, -1e9)
+    for bpm in np.arange(centro * (1 - margen), centro * (1 + margen), 0.05):
+        p = 60.0 / bpm
+        sc = max(_grid_score(env, sr, p, ph, dur_s, env3) for ph in np.arange(0, p, p / 8))
+        if sc > best[1]:
+            best = (float(bpm), sc)
+    return best
+
+
+def volver_al_rango_por_bombo(y, sr, env, dur_s, best, env3):
+    """#885: si el tempo elegido quedó POR DEBAJO del rango de baile, prueba sus proporciones que
+    caen dentro (ajustadas a ±2 % con la rejilla de ataques) y se queda con la que el bombo
+    prefiere con VENTAJA_BOMBO. `d91a7c9d` (122) salía 91,5 y 122 no era candidata (la rejilla de
+    122 junta el 88 % de los bombos, la de 91,5 el 23 %).
+    Por ENCIMA del rango no se toca: hay tempos reales de 160 (#206), y ahí una percusión cada ¾
+    o 1¼ tiempos también cae en la banda del bombo y lo bajaba a 106,5 o 128. Los errores de
+    arriba (186 por 124) ya los evita saca_del_rango."""
+    if best[0] >= RANGO_BAILE[0]:
+        return best
+    elegido, mejor_fraccion = best, None
+    for f in PROPORCIONES_RANGO:
+        c = best[0] * f
+        if not en_rango_de_baile(c):
+            continue
+        cand = _busqueda_cerca(env, sr, dur_s, c, env3)
+        if not en_rango_de_baile(cand[0]) or desempate_por_bombo(y, sr, best[0], cand[0]) != cand[0]:
+            continue
+        t, pesos = ataques_de_bombo(y, sr, 60.0 / max(best[0], cand[0]))
+        fraccion = mejor_rejilla_de_bombos(t, pesos, cand[0])
+        if mejor_fraccion is None or fraccion > mejor_fraccion:
+            elegido, mejor_fraccion = cand, fraccion
+    return elegido
+
+
 
 
 def semillas_candidatas(cruda):
@@ -289,6 +350,8 @@ def detect_tempo(y, sr, seed_bpm=None, env=None):
     mejor_octava = best[0]
     for semilla in otras:
         cand = _busqueda_gruesa(env, sr, dur_s, semilla, env3)
+        if saca_del_rango(mejor_octava, cand[0]):
+            continue
         # #618: con dos tempos en 3:2 (o en 4:3 o 5:4, #206), primero decide el bombo (cae en cada
         # tiempo del real).
         # Solo si no hay bombo o no los separa, siguen las dos reglas de #206 de abajo.
@@ -316,6 +379,10 @@ def detect_tempo(y, sr, seed_bpm=None, env=None):
             continue
         if cand[1] > best[1] * VENTAJA_PROPORCION:
             best = (cand[0], cand[1] / VENTAJA_PROPORCION)
+
+    # #885: por debajo del rango de baile, el bombo puede traerlo a una proporción de adentro.
+    if seed_bpm is None or not (60 <= seed_bpm <= 200):
+        best = volver_al_rango_por_bombo(y, sr, env, dur_s, best, env3)
 
     # refinamiento fino
     coarse = best[0]
