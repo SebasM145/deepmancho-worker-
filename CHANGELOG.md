@@ -1,5 +1,13 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.24 (11-oct-2026) — EL CUE A VA AL PRIMER DOWNBEAT DE LA REJILLA, NO AL SEGUNDO 0 (dj-connect #930)
+- **Qué pasó:** en producción, el cue A (MIX-IN) estaba en 0 ms en los 1.128 temas `structure_v1`. Pero su primer golpe (`first_beat_offset_ms`) solo estaba en ≤ 30 ms en 90; en 255 caía entre 30 y 500 ms, y en 783 después de 0,5 s (mediana 729 ms). **En 1.038 temas, saltar a A caía fuera del compás.** Germán: «el primer hot cue debe ir donde inicia la canción, como dice la metodología».
+- **Causa:** la regla 1 de #860 («A va SIEMPRE al segundo 0 del archivo, punto de carga de MIK»), repetida en tres sitios: `detect_cues`, `cues_respaldo` y `cuantizar_cues`. `detect_cues` ya calculaba el primer downbeat (`origen_ms`, el compás 0 de sus frases), pero no lo usaba para A.
+- **Arreglo:** `primer_downbeat_ms(ancla, bpm)` = ancla − k compases, el más temprano ≥ 0. Lo usan los tres sitios, con la rejilla definitiva (ancla de ataque + BPM fino). Sin BPM (plan C, `cues_por_tiempo`), A sigue en 0 porque no hay compás.
+- **Sin cambio:** B–H no se mueven. Las frases se siguen contando desde el inicio del archivo, en la fase del primer beat (#860). Los cues `mixedinkey` y `manual` siguen siendo intocables: eso lo decide `worker-result`, no el worker.
+- **Banco MIK:** no se corrió, porque no está el audio en este equipo. La regla cambia por decisión del dueño, no por la medida contra MIK, que ponía A en 0 en 34 de los 50.
+- Pruebas: `tests/test_930_cue_a_downbeat.py` (13). Con 7.6.23 fallan las 4 de comportamiento. `test_cues_respaldo.py` ahora espera A en el ancla.
+
 ## 7.6.23 (10-oct-2026) — TEMPO SIN ETIQUETA: UNA PROPORCIÓN DE AFUERA YA NO LE GANA A 124 (dj-connect #885)
 - **Qué pasó:** en 48 temas con el BPM bloqueado (Mixed In Key o a mano), el `bpm_detected` guardado estaba a 3/4, 5/4, 4/3 o 3/2 del tempo real. Lo guardado es de versiones viejas: con 7.6.20, 34 ya salen bien. Quedaban 14.
 - **Medido con su audio** (el stream MP3 público, solo lectura, borrado al terminar) y con el bombo como árbitro:

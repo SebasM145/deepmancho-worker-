@@ -431,12 +431,29 @@ CUE_SALIDA_DESDE = 0.75  # H se busca a partir del 75 % del audio util (MIK: med
 CUE_SEPARACION = 8       # dos cues nunca a menos de una frase
 
 
+def primer_downbeat_ms(first_beat_ms, bpm) -> int:
+    """#930 · Donde va el cue A: el primer downbeat de la rejilla, el mas temprano >= 0
+    (ancla - k compases). Antes A iba al segundo 0 del archivo y en 1.038 de 1.128 temas
+    saltar a A caia fuera del compas (ancla mediana 729 ms). Sin BPM o sin ancla: 0.
+    El +1e-6 evita que un ancla justo en un compas caiga al anterior por redondeo."""
+    try:
+        bpm = float(bpm or 0)
+        ancla = float(first_beat_ms or 0)
+    except (TypeError, ValueError):
+        return 0
+    if not (40 < bpm < 240) or ancla <= 0:
+        return 0
+    bar_ms = (60000.0 / bpm) * 4
+    return int(round(max(0.0, ancla - math.floor(ancla / bar_ms + 1e-6) * bar_ms)))
+
+
 def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
     """v7.7 — 8 hot cues como los pone Mixed In Key: A al inicio y el resto DONDE CAMBIA la
     musica, en borde de frase.
 
     Medido contra MIK (banco de #860, 397 cues):
-      1. A va SIEMPRE al segundo 0 del archivo (punto de carga).
+      1. A va al PRIMER DOWNBEAT de la rejilla (`primer_downbeat_ms`, #930). Hasta 7.6.23 iba
+         al segundo 0 (punto de carga de MIK) y saltar a A caia fuera del compas.
       2. Las frases se cuentan desde el INICIO del archivo, en la fase del primer beat: el
          compas 0 es el primer downbeat que cabe antes del ancla. Contarlas desde el ancla
          corria todos los cues cuando el tema arranca sin bombo (ancla en el compas 4 -> cues
@@ -501,7 +518,7 @@ def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
         nmax = max(cambio.values()) or 1.0
         cues = []
         for num, b in enumerate(elegidos):
-            pos = 0 if num == 0 else int(round(origen_ms + b * bar_ms))
+            pos = int(round(origen_ms + b * bar_ms))  # b = 0 -> A en el primer downbeat (#930)
             if pos >= dur_ms - 500:
                 continue
             label, color = CUE_DEF[num]
@@ -526,7 +543,7 @@ def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
 # >= 24 compases y contraste de energia; si no lo encuentra devolvia None y el
 # tema quedaba SIN cues (bocetos, frases, correcciones, temas muy planos).
 # Ahora nunca queda vacio:
-#   B) rejilla de frases desde el ancla real: A en 0, H en la ultima frase que
+#   B) rejilla de frases desde el ancla real: A en el primer downbeat (#930), H en la ultima frase que
 #      deja cola, intermedios en los bordes de frase con mas cambio medido.
 #   C) sin BPM: por tiempo (A en 0, H al 85 %).
 # Ambos van con confidence < 0.5 y "origen": el mezclador no los usa para
@@ -553,8 +570,9 @@ def cues_respaldo(y: np.ndarray, sr: int, bpm, first_beat_ms):
         if anchor < 0 or anchor > dur_ms:
             anchor = 0.0
         n_bars = int((dur_ms - anchor) // bar_ms)
+        inicio = primer_downbeat_ms(anchor, bpm)
         if n_bars < 2:
-            return [_cue_respaldo(0, 0, 5, "grilla")]
+            return [_cue_respaldo(0, inicio, 5, "grilla")]
         # Frase de 8 compases; en audio corto, de 4 (o 2) para que entren cues.
         paso = 8 if n_bars >= 32 else (4 if n_bars >= 8 else 2)
         F = _bar_band_energies(y, sr, anchor, bar_ms, n_bars)
@@ -585,7 +603,7 @@ def cues_respaldo(y: np.ndarray, sr: int, bpm, first_beat_ms):
             h = bordes[-1] if bordes else None
         medios = [b for b in bordes if h is None or b < h]
         medios = sorted(sorted(medios, key=novedad, reverse=True)[:6])
-        cues = [_cue_respaldo(0, 0, energia(0), "grilla")]
+        cues = [_cue_respaldo(0, inicio, energia(0), "grilla")]
         for i, b in enumerate(medios, start=1):
             cues.append(_cue_respaldo(i, anchor + b * bar_ms, energia(b), "grilla"))
         if h is not None:
@@ -921,11 +939,11 @@ def cuantizar_cues(cues, bpm_grid, fb, dur_ms, mix=None):
                 c2["positionMs"] = int(mix[1])
         nuevos.append(c2)
     for c2 in nuevos:
-        # El cue A va SIEMPRE al segundo 0 del archivo (metodologia
-        # MIK: es el punto de carga). Esta re-cuantizacion lo movia
-        # al downbeat mas cercano (medido: 0 -> 907 ms).
+        # #930: el cue A va al PRIMER DOWNBEAT de la rejilla definitiva (el mas
+        # temprano >= 0), no al segundo 0 del archivo ni al downbeat mas cercano
+        # a donde estaba (eso lo corria hasta el compas del ancla: 0 -> 907 ms).
         if int(c2.get("number", -1)) == 0:
-            c2["positionMs"] = 0
+            c2["positionMs"] = primer_downbeat_ms(fb, bpm_grid)
             continue
         p = c2["positionMs"]
         # MIX-IN/OUT al compás; el resto de los cues al BEAT (los
@@ -3062,7 +3080,7 @@ def liberar_memoria():
 
 def main():
     filtrar_salida()
-    print("DeepMancho worker iniciado (v7.6.23: tempo sin etiqueta dentro del rango de baile, una proporcion de afuera ya no le gana a 124 (dj-connect #885); un tema reanalizado y limpio borra sus alarmas viejas, analysis_flags va siempre (#206); v7.6.20: energy_v2 en la escala del catalogo real, energy no cambia (#248); v7.6.19: tempo sin etiqueta ya no sale a 4/3 ni a 5/4 por una percusion que arma otra rejilla, decide el bombo (#206); v7.6.18: parecido v0 entre una toma y su semilla, con huella de rasgos por tema; v7.6.17: el analisis corre en un proceso hijo (si muere, la replica sigue); v7.6.16: WAV/AIFF se guardan en FLAC sin perdida y verificado; v7.6.15: archivos raros terminan con un mensaje claro y sin reintentos; v7.6.14: set por tramos a disco, memoria de un solo tema (#75 C-2); temas del Taller constantes y sin 149, desempate 3:2 por el bombo (#618); tempo sin etiqueta a 136 ya no sale a 2/3 (#206); tempo de refine_bpm por bloques, sin pico de memoria en temas largos; SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.6.24: el cue A va al primer downbeat de la rejilla, no al segundo 0 (dj-connect #930); v7.6.23: tempo sin etiqueta dentro del rango de baile, una proporcion de afuera ya no le gana a 124 (dj-connect #885); un tema reanalizado y limpio borra sus alarmas viejas, analysis_flags va siempre (#206); v7.6.20: energy_v2 en la escala del catalogo real, energy no cambia (#248); v7.6.19: tempo sin etiqueta ya no sale a 4/3 ni a 5/4 por una percusion que arma otra rejilla, decide el bombo (#206); v7.6.18: parecido v0 entre una toma y su semilla, con huella de rasgos por tema; v7.6.17: el analisis corre en un proceso hijo (si muere, la replica sigue); v7.6.16: WAV/AIFF se guardan en FLAC sin perdida y verificado; v7.6.15: archivos raros terminan con un mensaje claro y sin reintentos; v7.6.14: set por tramos a disco, memoria de un solo tema (#75 C-2); temas del Taller constantes y sin 149, desempate 3:2 por el bombo (#618); tempo sin etiqueta a 136 ya no sale a 2/3 (#206); tempo de refine_bpm por bloques, sin pico de memoria en temas largos; SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     global EXAMEN_CM2_APROBADO
