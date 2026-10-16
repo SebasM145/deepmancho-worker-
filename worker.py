@@ -454,10 +454,11 @@ def posicion_cue_a_ms(first_beat_ms, bpm, inicio_ms=None) -> int:
     sonido (regla del duenio #278, la misma de `posicionCueASec` en el mezclador). Sin dato de
     sonido, el primer beat >= 0. Sin BPM o sin ancla: 0.
 
-    7.6.24 lo ponia en el primer DOWNBEAT: en el banco de 1.305 temas de German contra MIK
-    (15-oct) eso dejaba sonido antes de A en la mayoria (el tema arranca en un beat que
-    nuestra rejilla no marca como 1) y el mezclador lo corregia al cargar. MIK pone A en el
-    primer beat. El +1e-6 evita que un ancla justo en un beat caiga al anterior por redondeo."""
+    7.6.24 lo ponia en el primer DOWNBEAT: en el banco de German contra MIK (16-oct,
+    bancos/banco_cue_a.py) eso dejaba sonido mas de un beat antes de A en el 73 % (el tema
+    arranca en un beat que nuestra rejilla no marca como 1) y el mezclador lo corregia al
+    cargar. MIK pone A en el primer beat de su rejilla: con esta regla, 79 % a <= 50 ms de
+    MIK (antes 22 %). El +1e-6 evita que un ancla justo en un beat caiga al anterior."""
     try:
         bpm = float(bpm or 0)
         ancla = float(first_beat_ms or 0)

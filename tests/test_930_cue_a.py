@@ -1,7 +1,7 @@
 """#930 · dónde va el cue A.
 
 7.6.23: A en el segundo 0 del archivo (en 1.038 de 1.128 temas, saltar a A caía fuera de la
-rejilla). 7.6.24: A en el primer DOWNBEAT; en el banco de Germán contra MIK (15-oct) eso dejaba
+rejilla). 7.6.24: A en el primer DOWNBEAT; en el banco de Germán contra MIK (16-oct) eso dejaba
 sonido más de un beat antes de A en la mayoría de los temas (arrancan en un beat que nuestra
 rejilla no marca como 1) y el mezclador lo corregía al cargar. 7.6.25: A en un BEAT de la
 rejilla, el último que no pasa el primer sonido (#278, `posicionCueASec` del mezclador).
