@@ -431,11 +431,34 @@ CUE_SALIDA_DESDE = 0.75  # H se busca a partir del 75 % del audio util (MIK: med
 CUE_SEPARACION = 8       # dos cues nunca a menos de una frase
 
 
-def primer_downbeat_ms(first_beat_ms, bpm) -> int:
-    """#930 · Donde va el cue A: el primer downbeat de la rejilla, el mas temprano >= 0
-    (ancla - k compases). Antes A iba al segundo 0 del archivo y en 1.038 de 1.128 temas
-    saltar a A caia fuera del compas (ancla mediana 729 ms). Sin BPM o sin ancla: 0.
-    El +1e-6 evita que un ancla justo en un compas caiga al anterior por redondeo."""
+UMBRAL_AUDIBLE = 0.02  # «suena»: mas del 2 % del pico, el criterio del mezclador (inicioAudible.ts)
+
+
+def inicio_audible_ms(peaks, dur_ms, umbral=UMBRAL_AUDIBLE):
+    """Primer instante (ms) en que la forma de onda pasa el 2 % de su pico: el criterio de
+    `inicioAudibleSec` del mezclador. El worker lo mide sobre las MUESTRAS (`peaks` = y): los
+    3.000 `waveform_peaks` lo adelantan hasta un balde (~100 ms en 5 min) y A podia bajar un
+    beat dentro del silencio. None sin datos."""
+    if peaks is None or len(peaks) < 8 or not dur_ms or dur_ms <= 0:
+        return None
+    a = np.abs(np.asarray(peaks, dtype=np.float64))
+    mx = float(a.max())
+    if mx <= 0:
+        return None
+    i = np.flatnonzero(a > mx * umbral)
+    return float(i[0]) / len(a) * float(dur_ms) if i.size else None
+
+
+def posicion_cue_a_ms(first_beat_ms, bpm, inicio_ms=None) -> int:
+    """#930 · Donde va el cue A: en un BEAT de la rejilla, el ultimo que no pasa el primer
+    sonido (regla del duenio #278, la misma de `posicionCueASec` en el mezclador). Sin dato de
+    sonido, el primer beat >= 0. Sin BPM o sin ancla: 0.
+
+    7.6.24 lo ponia en el primer DOWNBEAT: en el banco de German contra MIK (16-oct,
+    bancos/banco_cue_a.py) eso dejaba sonido mas de un beat antes de A en el 73 % (el tema
+    arranca en un beat que nuestra rejilla no marca como 1) y el mezclador lo corregia al
+    cargar. MIK pone A en el primer beat de su rejilla: con esta regla, 79 % a <= 50 ms de
+    MIK (antes 22 %). El +1e-6 evita que un ancla justo en un beat caiga al anterior."""
     try:
         bpm = float(bpm or 0)
         ancla = float(first_beat_ms or 0)
@@ -443,8 +466,11 @@ def primer_downbeat_ms(first_beat_ms, bpm) -> int:
         return 0
     if not (40 < bpm < 240) or ancla <= 0:
         return 0
-    bar_ms = (60000.0 / bpm) * 4
-    return int(round(max(0.0, ancla - math.floor(ancla / bar_ms + 1e-6) * bar_ms)))
+    beat_ms = 60000.0 / bpm
+    fase = max(0.0, ancla - math.floor(ancla / beat_ms + 1e-6) * beat_ms)
+    if inicio_ms is not None and inicio_ms > fase:
+        fase += math.floor((float(inicio_ms) - fase) / beat_ms + 1e-6) * beat_ms
+    return int(round(fase))
 
 
 def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
@@ -452,8 +478,9 @@ def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
     musica, en borde de frase.
 
     Medido contra MIK (banco de #860, 397 cues):
-      1. A va al PRIMER DOWNBEAT de la rejilla (`primer_downbeat_ms`, #930). Hasta 7.6.23 iba
-         al segundo 0 (punto de carga de MIK) y saltar a A caia fuera del compas.
+      1. A va a un BEAT de la rejilla, el ultimo que no pasa el primer sonido
+         (`posicion_cue_a_ms`, #930 y #278). Hasta 7.6.23 iba al segundo 0 y saltar a A caia
+         fuera de la rejilla; 7.6.24 lo puso en el primer downbeat y quedaba despues del sonido.
       2. Las frases se cuentan desde el INICIO del archivo, en la fase del primer beat: el
          compas 0 es el primer downbeat que cabe antes del ancla. Contarlas desde el ancla
          corria todos los cues cuando el tema arranca sin bombo (ancla en el compas 4 -> cues
@@ -479,6 +506,7 @@ def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
         if n_bars < 24:
             return None
 
+        a_ms = posicion_cue_a_ms(anchor_ms, bpm, inicio_audible_ms(y, dur_ms))
         F = _bar_band_energies(y, sr, origen_ms, bar_ms, n_bars)
         tot = 20 * np.log10(np.maximum(
             np.sqrt(sum(10 ** (F[k] / 10) for k in F)), 1e-6))
@@ -518,7 +546,7 @@ def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
         nmax = max(cambio.values()) or 1.0
         cues = []
         for num, b in enumerate(elegidos):
-            pos = int(round(origen_ms + b * bar_ms))  # b = 0 -> A en el primer downbeat (#930)
+            pos = int(round(origen_ms + b * bar_ms)) if b else a_ms  # A: posicion_cue_a_ms (#930)
             if pos >= dur_ms - 500:
                 continue
             label, color = CUE_DEF[num]
@@ -543,7 +571,7 @@ def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
 # >= 24 compases y contraste de energia; si no lo encuentra devolvia None y el
 # tema quedaba SIN cues (bocetos, frases, correcciones, temas muy planos).
 # Ahora nunca queda vacio:
-#   B) rejilla de frases desde el ancla real: A en el primer downbeat (#930), H en la ultima frase que
+#   B) rejilla de frases desde el ancla real: A en `posicion_cue_a_ms` (#930), H en la ultima frase que
 #      deja cola, intermedios en los bordes de frase con mas cambio medido.
 #   C) sin BPM: por tiempo (A en 0, H al 85 %).
 # Ambos van con confidence < 0.5 y "origen": el mezclador no los usa para
@@ -570,7 +598,7 @@ def cues_respaldo(y: np.ndarray, sr: int, bpm, first_beat_ms):
         if anchor < 0 or anchor > dur_ms:
             anchor = 0.0
         n_bars = int((dur_ms - anchor) // bar_ms)
-        inicio = primer_downbeat_ms(anchor, bpm)
+        inicio = posicion_cue_a_ms(anchor, bpm, inicio_audible_ms(y, dur_ms))
         if n_bars < 2:
             return [_cue_respaldo(0, inicio, 5, "grilla")]
         # Frase de 8 compases; en audio corto, de 4 (o 2) para que entren cues.
@@ -922,11 +950,12 @@ def detect_mix_out(y22, sr22, bpm, first_beat_ms):
         return None, False
 
 
-def cuantizar_cues(cues, bpm_grid, fb, dur_ms, mix=None):
+def cuantizar_cues(cues, bpm_grid, fb, dur_ms, mix=None, inicio_ms=None):
     """Pasos 4-5 del pipeline v7: cues a la rejilla definitiva y sin duplicados.
 
     Aparte de analyze() para que el banco de Mixed In Key (bancos/banco_mik.py) mida
-    exactamente lo que se guarda. `mix` = (mi, mo) solo con ENABLE_MIX_V7."""
+    exactamente lo que se guarda. `mix` = (mi, mo) solo con ENABLE_MIX_V7. `inicio_ms` = primer
+    sonido (`inicio_audible_ms`), para el cue A."""
     bar_ms = (60000.0 / bpm_grid) * 4
     beat_ms = 60000.0 / bpm_grid
     nuevos = []
@@ -939,11 +968,11 @@ def cuantizar_cues(cues, bpm_grid, fb, dur_ms, mix=None):
                 c2["positionMs"] = int(mix[1])
         nuevos.append(c2)
     for c2 in nuevos:
-        # #930: el cue A va al PRIMER DOWNBEAT de la rejilla definitiva (el mas
-        # temprano >= 0), no al segundo 0 del archivo ni al downbeat mas cercano
-        # a donde estaba (eso lo corria hasta el compas del ancla: 0 -> 907 ms).
+        # #930: el cue A va a un BEAT de la rejilla definitiva, el ultimo que no pasa el
+        # primer sonido (#278), no al segundo 0 del archivo ni al downbeat mas cercano a
+        # donde estaba (eso lo corria hasta el compas del ancla: 0 -> 907 ms).
         if int(c2.get("number", -1)) == 0:
-            c2["positionMs"] = primer_downbeat_ms(fb, bpm_grid)
+            c2["positionMs"] = posicion_cue_a_ms(fb, bpm_grid, inicio_ms)
             continue
         p = c2["positionMs"]
         # MIX-IN/OUT al compás; el resto de los cues al BEAT (los
@@ -1169,7 +1198,8 @@ def analyze(path: str, bpm_seed=None) -> dict:
             # rejilla) que hacía saltar los hot cues a otro lado en el mixer.
             if cues:
                 usar_mix = ENABLE_MIX_V7 and mi is not None and mo is not None and mo > mi
-                cues = cuantizar_cues(cues, bpm_grid, fb, dur_ms, (mi, mo) if usar_mix else None)
+                cues = cuantizar_cues(cues, bpm_grid, fb, dur_ms, (mi, mo) if usar_mix else None,
+                                      inicio_audible_ms(y, len(y) / sr * 1000.0))
                 out["cue_points"] = cues
 
             # 6) Energía por sección (base del arco de los sets)
@@ -3080,7 +3110,7 @@ def liberar_memoria():
 
 def main():
     filtrar_salida()
-    print("DeepMancho worker iniciado (v7.6.24: el cue A va al primer downbeat de la rejilla, no al segundo 0 (dj-connect #930); v7.6.23: tempo sin etiqueta dentro del rango de baile, una proporcion de afuera ya no le gana a 124 (dj-connect #885); un tema reanalizado y limpio borra sus alarmas viejas, analysis_flags va siempre (#206); v7.6.20: energy_v2 en la escala del catalogo real, energy no cambia (#248); v7.6.19: tempo sin etiqueta ya no sale a 4/3 ni a 5/4 por una percusion que arma otra rejilla, decide el bombo (#206); v7.6.18: parecido v0 entre una toma y su semilla, con huella de rasgos por tema; v7.6.17: el analisis corre en un proceso hijo (si muere, la replica sigue); v7.6.16: WAV/AIFF se guardan en FLAC sin perdida y verificado; v7.6.15: archivos raros terminan con un mensaje claro y sin reintentos; v7.6.14: set por tramos a disco, memoria de un solo tema (#75 C-2); temas del Taller constantes y sin 149, desempate 3:2 por el bombo (#618); tempo sin etiqueta a 136 ya no sale a 2/3 (#206); tempo de refine_bpm por bloques, sin pico de memoria en temas largos; SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.6.25: el cue A va al beat de la rejilla donde empieza a sonar, no al primer downbeat (dj-connect #930); v7.6.24: el cue A va al primer downbeat de la rejilla, no al segundo 0 (#930); v7.6.23: tempo sin etiqueta dentro del rango de baile, una proporcion de afuera ya no le gana a 124 (dj-connect #885); un tema reanalizado y limpio borra sus alarmas viejas, analysis_flags va siempre (#206); v7.6.20: energy_v2 en la escala del catalogo real, energy no cambia (#248); v7.6.19: tempo sin etiqueta ya no sale a 4/3 ni a 5/4 por una percusion que arma otra rejilla, decide el bombo (#206); v7.6.18: parecido v0 entre una toma y su semilla, con huella de rasgos por tema; v7.6.17: el analisis corre en un proceso hijo (si muere, la replica sigue); v7.6.16: WAV/AIFF se guardan en FLAC sin perdida y verificado; v7.6.15: archivos raros terminan con un mensaje claro y sin reintentos; v7.6.14: set por tramos a disco, memoria de un solo tema (#75 C-2); temas del Taller constantes y sin 149, desempate 3:2 por el bombo (#618); tempo sin etiqueta a 136 ya no sale a 2/3 (#206); tempo de refine_bpm por bloques, sin pico de memoria en temas largos; SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     global EXAMEN_CM2_APROBADO

@@ -1,5 +1,22 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.25 (16-oct-2026) — EL CUE A VA AL BEAT DONDE EMPIEZA A SONAR, NO AL PRIMER DOWNBEAT (dj-connect #930)
+- **Qué pasó:** con 7.6.24 el A quedaba en el primer *downbeat* de nuestra rejilla. Pero en la mayoría de los temas, nuestro compás no empieza donde empieza el de Rekordbox y MIK: el tema arranca en un beat que nosotros marcamos como 2, 3 o 4. A quedaba **más de un beat después del primer sonido** y la red del mezclador (#278, `agujaAlCargar`) lo pisaba al cargar y ponía la aguja fuera de la rejilla.
+- **Arreglo:** `posicion_cue_a_ms(ancla, bpm, inicio_ms)` = el último **beat** de la rejilla que no pasa el primer sonido (la regla del dueño en #278, la misma de `posicionCueASec` en el mezclador). Sin dato de sonido, el primer beat ≥ 0. Sin BPM, 0. El primer sonido (`inicio_audible_ms`) usa el criterio del mezclador (más del 2 % del pico), pero sobre las muestras: los 3.000 `waveform_peaks` lo adelantan hasta un balde. Lo usan `detect_cues`, `cues_respaldo` y `cuantizar_cues`.
+- **Sin cambio:** B–H siguen en los downbeats de nuestra rejilla. Sin BPM (plan C), A en 0. `mixedinkey` y `manual` los protege `worker-result`, no el worker.
+- **Banco contra MIK** (`bancos/banco_cue_a.py`, XML de Rekordbox de Germán del 16-sep, audio local, solo lectura; 328 de 1.151 temas al publicar):
+
+| | 7.6.24 | 7.6.25 |
+|---|---|---|
+| A a ≤ 50 ms del A de MIK | 22 % | **79 %** |
+| Distancia mediana al A de MIK | 442 ms | **41 ms** |
+| El mezclador respeta el A al cargar | 27 % | **100 %** |
+
+  - El A de MIK está en el primer beat de la rejilla de Rekordbox (`TEMPO Inizio`) en el 88 % de los temas, y en un beat de nuestra rejilla en el 90 %; en nuestro *downbeat*, solo en el 23 %.
+  - Los 41 ms que quedan son de la decodificación del MP3: la rejilla de Rekordbox va 39 ms después de la nuestra en MP3 y 16 ms antes en AIFF. No es del cue A.
+- **Queda (aparte):** nuestro compás no coincide con el de Rekordbox en ~3 de cada 4 temas. B–H van a nuestros downbeats; medirlo es otra tarea.
+- Pruebas: `tests/test_930_cue_a.py` (19) reemplaza a `test_930_cue_a_downbeat.py`; `test_cues_respaldo.py` espera A en el beat del primer sonido.
+
 ## 7.6.24 (11-oct-2026) — EL CUE A VA AL PRIMER DOWNBEAT DE LA REJILLA, NO AL SEGUNDO 0 (dj-connect #930)
 - **Qué pasó:** en producción, el cue A (MIX-IN) estaba en 0 ms en los 1.128 temas `structure_v1`. Pero su primer golpe (`first_beat_offset_ms`) solo estaba en ≤ 30 ms en 90; en 255 caía entre 30 y 500 ms, y en 783 después de 0,5 s (mediana 729 ms). **En 1.038 temas, saltar a A caía fuera del compás.** Germán: «el primer hot cue debe ir donde inicia la canción, como dice la metodología».
 - **Causa:** la regla 1 de #860 («A va SIEMPRE al segundo 0 del archivo, punto de carga de MIK»), repetida en tres sitios: `detect_cues`, `cues_respaldo` y `cuantizar_cues`. `detect_cues` ya calculaba el primer downbeat (`origen_ms`, el compás 0 de sus frases), pero no lo usaba para A.
