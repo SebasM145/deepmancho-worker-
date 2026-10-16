@@ -11,7 +11,9 @@ Uso:
   python bancos/banco_cue_a.py --medir <salida.jsonl>
 
 Retoma donde quedo: salta los temas que ya estan en la salida. La parte cara (audio, BPM fino
-y ancla) va a la cache, igual que en banco_mik.py.
+y ancla) va a la cache, igual que en banco_mik.py. Cada proceso usa su propia cache de numba
+(varios compilando a la vez en la misma la corrompen y librosa revienta con segfault), y si un
+proceso muere el banco lo dice y rearma los procesos en vez de quedarse colgado.
 """
 import json
 import math
@@ -20,7 +22,8 @@ import statistics as st
 import sys
 import urllib.parse
 import xml.etree.ElementTree as ET
-from multiprocessing import Pool
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 
 os.environ.setdefault("WORKER_API_URL", "http://banco.invalid")
 os.environ.setdefault("WORKER_SECRET", "banco")
@@ -70,17 +73,30 @@ def medir_tema(args):
         return dict(t, error=repr(e)[:200])
 
 
-def correr(xml, cache, salida, procesos=4):
+def _cache_numba(base):
+    """Cada proceso con su cache de numba, antes de importar librosa."""
+    os.environ["NUMBA_CACHE_DIR"] = os.path.join(base, "numba", str(os.getpid()))
+
+
+def correr(xml, cache, salida, procesos=4, intentos=5):
     os.makedirs(cache, exist_ok=True)
-    hechos = set()
-    if os.path.exists(salida):
-        hechos = {json.loads(x)["id"] for x in open(salida)}
-    pend = [t for t in temas(xml) if t["id"] not in hechos]
-    print(f"pendientes {len(pend)}", flush=True)
-    with Pool(procesos) as p, open(salida, "a") as f:
-        for r in p.imap_unordered(medir_tema, [(t, cache) for t in pend], chunksize=2):
-            f.write(json.dumps(r) + "\n")
-            f.flush()
+    for _ in range(intentos):
+        hechos = set()
+        if os.path.exists(salida):
+            hechos = {json.loads(x)["id"] for x in open(salida)}
+        pend = [t for t in temas(xml) if t["id"] not in hechos]
+        print(f"pendientes {len(pend)}", flush=True)
+        if not pend:
+            return
+        try:
+            with ProcessPoolExecutor(procesos, initializer=_cache_numba, initargs=(cache,)) as p, \
+                    open(salida, "a") as f:
+                for fut in as_completed([p.submit(medir_tema, (t, cache)) for t in pend]):
+                    f.write(json.dumps(fut.result()) + "\n")
+                    f.flush()
+            return
+        except BrokenProcessPool as e:  # un proceso murio (segfault, memoria): se rearma y sigue
+            print(f"proceso caido ({e!r}); rearmo y sigo", flush=True)
 
 
 def _fase(pos, ancla, paso):
