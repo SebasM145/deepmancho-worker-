@@ -2721,8 +2721,9 @@ def cola_eco(seca, bpm):
     return cola
 
 
-def _mezcla_plan(tracks, transiciones, tmpdir):
+def _mezcla_plan(tracks, transiciones, tmpdir, largos=None):
     """El set con el plan de cada transicion. Devuelve (SetEnDisco, tracklist).
+    `largos` (opcional, #878): se le agrega el largo en muestras de cada tema decodificado.
     Por tramos (#75 C-2): en memoria vive solo `pend`, el tema que suena desde su entrada
     (posicion `pos` del set); lo anterior al punto de cada transicion ya no cambia y se
     escribe a disco. Las cifras de cada transicion son las de siempre."""
@@ -2736,6 +2737,8 @@ def _mezcla_plan(tracks, transiciones, tmpdir):
         p = os.path.join(tmpdir, f"{i}.audio")
         _bajar_tema(tr.get("audio_url"), p)
         audio = _decode_pcm(p)
+        if largos is not None:
+            largos.append(len(audio))
         try:
             os.remove(p)  # el original ya esta decodificado: no ocupar disco de mas
         except OSError:
@@ -3116,10 +3119,18 @@ def main():
     signal.signal(signal.SIGTERM, _al_apagar)
     idle = 0
     espera = Espera(POLL_INTERVAL, POLL_MAX)
+    import escucha
     while True:
         if APAGANDO:
             print("apagando: no pido más temas", flush=True)
             sys.exit(0)
+        # #878: la mezcla preparada va primero (alguien la está escuchando); después, el análisis.
+        hizo_tramo, sesion_viva = escucha.poll_escucha()
+        if hizo_tramo:
+            idle = 0
+            espera.trabajo()
+            liberar_memoria()
+            continue
         try:
             job, track, audio_url, subidas = next_job()
         except Exception as e:
@@ -3155,7 +3166,8 @@ def main():
             idle += 1
             if idle % 12 == 1:
                 print(f"sin jobs pendientes... (proxima consulta en {espera.actual:.0f} s)", flush=True)
-            time.sleep(espera.vacia())
+            # #878: con una lista preparada sonando, el tramo siguiente no espera la espera creciente.
+            time.sleep(escucha.espera_con_escucha(espera.vacia(), sesion_viva))
 
 
 if __name__ == "__main__":
