@@ -1,0 +1,23 @@
+# Memoria del análisis en el MISMO contenedor que Railway (Dockerfile), con temas sintéticos.
+# Compara el entorno de hoy con ajustes del asignador de glibc. No usa secretos ni música real.
+name: Memoria del análisis
+on:
+  pull_request:
+    paths: ["banco_memoria/**", ".github/workflows/memoria.yml", "Dockerfile", "worker.py", "requirements.txt"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  memoria:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Imagen del análisis (Dockerfile de Railway)
+        run: docker build -q -t analisis .
+      - name: Hoy (como en Railway)
+        run: docker run --rm --cpus=2 --memory=10g -v "$PWD/banco_memoria:/banco" analisis python -u /banco/medir.py 6
+      - name: Con umbral de mmap fijo
+        run: docker run --rm --cpus=2 --memory=10g -e MALLOC_MMAP_THRESHOLD_=131072 -e MALLOC_TRIM_THRESHOLD_=131072 -v "$PWD/banco_memoria:/banco" analisis python -u /banco/medir.py 6
+      - name: Con umbral de mmap fijo y 2 hilos
+        run: docker run --rm --cpus=2 --memory=10g -e MALLOC_MMAP_THRESHOLD_=131072 -e MALLOC_TRIM_THRESHOLD_=131072 -e OPENBLAS_NUM_THREADS=2 -e OMP_NUM_THREADS=2 -e NUMBA_NUM_THREADS=2 -v "$PWD/banco_memoria:/banco" analisis python -u /banco/medir.py 6
