@@ -3,9 +3,11 @@
 Usa la cache del banco del cue A (`bancos/banco_cue_a.py`: audio a SR del análisis, BPM fino y
 ancla, un .npz por TrackID del XML de Rekordbox) y mide, por tema, el B de antes (primer cambio
 de estructura) y el de ahora (`worker.entrada_del_bajo`):
-  · dos bajos: compases ANTES de B con la energía < 150 Hz a nivel de cuerpo (RMS a <= 6 dB del
-    percentil 75 del tema, el criterio de la auditoría del 17-oct). Cuenta también el bombo
-    solo, así que es una cota alta; lo que importa es el antes frente al después.
+  · bajo antes de B: compases ANTES de B con el PISO de graves (< 150 Hz, entre golpes) a <= 6 dB
+    del cuerpo del tema. Es lo que suena como "dos bajos" en el intercambio de graves.
+  · graves antes de B: lo mismo con el RMS de la banda (el criterio literal de la auditoría del
+    17-oct). Cuenta también el bombo solo: en un intro de bombo sin bajo da "dos bajos" aunque
+    no los haya. Se deja para comparar con la auditoría.
   · B en borde de frase (múltiplo de 4 y de 8 compases desde el primer downbeat).
   · distancia al cue B de Mixed In Key (Num=1 del XML), solo como referencia: MIK no marca la
     entrada del bajo sino un cambio de energía.
@@ -44,14 +46,22 @@ def cues_b_de_mik(xml):
     return out
 
 
-def rms_graves_por_compas(y, sr, origen_ms, bar_ms, n_bars):
+def graves_por_compas(y, sr, origen_ms, bar_ms, n_bars):
+    """(RMS, piso) en dB por compás de la banda < 150 Hz. El RMS cuenta el bombo; el piso
+    (percentil 30 de la envolvente de 20 ms) solo sube con un bajo sostenido."""
     from scipy.signal import butter, sosfiltfilt
     g = sosfiltfilt(butter(4, [30 / (sr / 2), 150 / (sr / 2)], btype="band", output="sos"), y.astype(np.float64))
-    e = np.empty(n_bars)
+    paso = int(0.02 * sr)
+    rms, piso = np.full(n_bars, -120.0), np.full(n_bars, -120.0)
     for i in range(n_bars):
         seg = g[int((origen_ms + i * bar_ms) * sr / 1000):int((origen_ms + (i + 1) * bar_ms) * sr / 1000)]
-        e[i] = 20 * np.log10(max(float(np.sqrt(np.mean(seg ** 2))) if seg.size else 0.0, 1e-6))
-    return e
+        n = seg.size // paso
+        if not n:
+            continue
+        env = np.sqrt(np.mean(seg[:n * paso].reshape(n, paso) ** 2, axis=1))
+        rms[i] = 20 * np.log10(max(float(np.sqrt(np.mean(env ** 2))), 1e-6))
+        piso[i] = 20 * np.log10(max(float(np.percentile(env, 30)), 1e-6))
+    return rms, piso
 
 
 def b_de(cues):
@@ -72,8 +82,9 @@ def medir_tema(ruta_npz, mik_b_s):
     finally:
         worker.entrada_del_bajo = real
     ahora = b_de(worker.detect_cues(y, sr, bpm, fb))
-    graves = rms_graves_por_compas(y, sr, origen, bar_ms, n_bars)
+    graves, piso = graves_por_compas(y, sr, origen, bar_ms, n_bars)
     cuerpo = float(np.percentile(graves, 75)) if n_bars else 0.0
+    cuerpo_piso = float(np.percentile(piso, 75)) if n_bars else 0.0
     fila = {"id": os.path.basename(ruta_npz)[:-4], "bpm": round(bpm, 2), "compases": n_bars}
     for nombre, b in (("antes", antes), ("ahora", ahora)):
         if not b:
@@ -82,6 +93,7 @@ def medir_tema(ruta_npz, mik_b_s):
         k = int(round((b["positionMs"] - origen) / bar_ms))
         fila[nombre] = {"compas": k, "conf": b["confidence"], "medido": b.get("origen") == "auto",
                         "dos_bajos": int(sum(graves[:k] >= cuerpo - 6)),
+                        "bajo_antes": int(sum(piso[:k] >= cuerpo_piso - 6)),
                         "mik_s": None if mik_b_s is None else round(b["positionMs"] / 1000 - mik_b_s, 2)}
     return fila
 
@@ -98,7 +110,9 @@ def resumen(filas):
               f"{sum(m > 0 for m in movidos)} · mediana {st.median(movidos):+.0f} compases")
     for v in ("antes", "ahora"):
         dos = [f[v]["dos_bajos"] for f in ok]
-        print(f"{v}: temas con >= 2 compases de graves a nivel de cuerpo antes de B {pct(sum(x >= 2 for x in dos))}"
+        sost = [f[v].get("bajo_antes", 0) for f in ok]
+        print(f"{v}: temas con >= 2 compases de bajo SOSTENIDO a nivel de cuerpo antes de B {pct(sum(x >= 2 for x in sost))}")
+        print(f"   temas con >= 2 compases de graves (RMS, cuenta el bombo) a nivel de cuerpo antes de B {pct(sum(x >= 2 for x in dos))}"
               f" · B en múltiplo de 8 {pct(sum(f[v]['compas'] % 8 == 0 for f in ok))}"
               f" · de 4 {pct(sum(f[v]['compas'] % 4 == 0 for f in ok))}")
         mik = [(abs(f[v]["mik_s"]), 240 / f["bpm"]) for f in ok if f[v]["mik_s"] is not None]

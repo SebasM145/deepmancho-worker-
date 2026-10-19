@@ -440,7 +440,7 @@ BAJO_CUERPO_PCT = 75         # el cuerpo del tema: los compases llenos, no los b
 BAJO_MARGEN_DB = 6.0         # "suena el bajo" = piso a -6 dB o menos del cuerpo
 BAJO_SOSTENIDO = 4           # compases seguidos (3 de 4 deben pasar el margen)
 BAJO_SALTO_MIN_DB = 6.0      # sin un salto claro frente a los 4 compases de antes, no se mueve B
-BAJO_SOSTEN_DB = 12.0        # el piso a <= 12 dB del RMS del compás: si no, son golpes (bombo, ruido)
+BAJO_SOSTEN_DB = 18.0        # piso a <= 18 dB del RMS del compás (bombo solo: 25-45 dB; bajo con sidechain: 4-12)
 
 
 def primer_downbeat_ms(first_beat_ms, bpm) -> int:
@@ -467,7 +467,7 @@ def entrada_del_bajo(y, sr, origen_ms, bar_ms, n_bars):
     Por compás se toma el PISO de la energía < 150 Hz (percentil 30 de la envolvente): un
     bombo solo deja el piso bajo entre golpes; el bajo lo sostiene. La entrada es el primer
     compás desde el que, en 3 de 4 compases seguidos, el piso queda a <= 6 dB del cuerpo y a
-    <= 12 dB del RMS del propio compás (sin bajo, el piso de un bombo con hats es ruido)."""
+    <= 18 dB del RMS del propio compás (sin bajo, el piso de un bombo con hats es ruido)."""
     from scipy.signal import butter, sosfiltfilt
     lo, hi = BAJO_BANDA_HZ
     hi = min(hi, sr / 2 - 100)
@@ -3148,7 +3148,7 @@ def liberar_memoria():
 
 def main():
     filtrar_salida()
-    print("DeepMancho worker iniciado (v7.6.24: el cue A va al primer downbeat de la rejilla, no al segundo 0 (dj-connect #930); v7.6.23: tempo sin etiqueta dentro del rango de baile, una proporcion de afuera ya no le gana a 124 (dj-connect #885); un tema reanalizado y limpio borra sus alarmas viejas, analysis_flags va siempre (#206); v7.6.20: energy_v2 en la escala del catalogo real, energy no cambia (#248); v7.6.19: tempo sin etiqueta ya no sale a 4/3 ni a 5/4 por una percusion que arma otra rejilla, decide el bombo (#206); v7.6.18: parecido v0 entre una toma y su semilla, con huella de rasgos por tema; v7.6.17: el analisis corre en un proceso hijo (si muere, la replica sigue); v7.6.16: WAV/AIFF se guardan en FLAC sin perdida y verificado; v7.6.15: archivos raros terminan con un mensaje claro y sin reintentos; v7.6.14: set por tramos a disco, memoria de un solo tema (#75 C-2); temas del Taller constantes y sin 149, desempate 3:2 por el bombo (#618); tempo sin etiqueta a 136 ya no sale a 2/3 (#206); tempo de refine_bpm por bloques, sin pico de memoria en temas largos; SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.6.26: el cue B automatico va al downbeat donde entra el bajo (dj-connect #1064); v7.6.24: el cue A va al primer downbeat de la rejilla, no al segundo 0 (dj-connect #930); v7.6.23: tempo sin etiqueta dentro del rango de baile, una proporcion de afuera ya no le gana a 124 (dj-connect #885); un tema reanalizado y limpio borra sus alarmas viejas, analysis_flags va siempre (#206); v7.6.20: energy_v2 en la escala del catalogo real, energy no cambia (#248); v7.6.19: tempo sin etiqueta ya no sale a 4/3 ni a 5/4 por una percusion que arma otra rejilla, decide el bombo (#206); v7.6.18: parecido v0 entre una toma y su semilla, con huella de rasgos por tema; v7.6.17: el analisis corre en un proceso hijo (si muere, la replica sigue); v7.6.16: WAV/AIFF se guardan en FLAC sin perdida y verificado; v7.6.15: archivos raros terminan con un mensaje claro y sin reintentos; v7.6.14: set por tramos a disco, memoria de un solo tema (#75 C-2); temas del Taller constantes y sin 149, desempate 3:2 por el bombo (#618); tempo sin etiqueta a 136 ya no sale a 2/3 (#206); tempo de refine_bpm por bloques, sin pico de memoria en temas largos; SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
     global EXAMEN_CM2_APROBADO

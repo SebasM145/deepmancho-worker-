@@ -13,7 +13,7 @@ BPM = 126.0
 BAR_S = 240.0 / BPM
 
 
-def tema(partes, bombo_largo=False, seed=3):
+def tema(partes, bombo_largo=False, seed=3, sidechain=False):
     """partes = [(compases, capas)]; capas: "k" bombo, "b" bajo sostenido, "h" hats, "p" pad
     (220 Hz, sin graves). Cada capa cambia el timbre: hay cambios de estructura que no son
     del bajo (los hats y el pad), para ver que B no se queda en ellos."""
@@ -27,7 +27,10 @@ def tema(partes, bombo_largo=False, seed=3):
             caida = 0.25 if bombo_largo else 0.06
             y += 0.8 * np.exp(-fase / caida) * np.sin(2 * np.pi * 55 * t) * (fase < 0.2)
         if "b" in capas:
-            y += 0.3 * np.sin(2 * np.pi * 82 * t)
+            # con sidechain el bajo se agacha ~12 dB bajo cada bombo (tech house real: el piso
+            # queda a 4-12 dB del RMS del compás; un bombo solo, a 25-45 dB)
+            agache = 1 - 0.75 * np.exp(-fase / 0.12) if sidechain else 1.0
+            y += 0.3 * agache * np.sin(2 * np.pi * 82 * t)
         if "h" in capas:
             y += 0.25 * rng.standard_normal(t.size) * ((t % (30.0 / BPM)) < 0.02)
         if "p" in capas:
@@ -69,6 +72,12 @@ def test_los_demas_cues_van_despues_de_b_y_en_orden():
 
 def test_un_bombo_largo_solo_no_cuenta_como_bajo():
     y = tema(CON_INTRO, bombo_largo=True)
+    cues = worker.detect_cues(y, SR, BPM, 0)
+    assert abs(compas(cue(cues, 1)) - 16) < 0.02, [round(compas(c), 2) for c in cues]
+
+
+def test_un_bajo_con_sidechain_tambien_cuenta():
+    y = tema(CON_INTRO, sidechain=True)
     cues = worker.detect_cues(y, SR, BPM, 0)
     assert abs(compas(cue(cues, 1)) - 16) < 0.02, [round(compas(c), 2) for c in cues]
 
