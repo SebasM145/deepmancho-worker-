@@ -430,6 +430,18 @@ CUE_COLA = 24            # compases que deja la salida (H) hasta el final del au
 CUE_SALIDA_DESDE = 0.75  # H se busca a partir del 75 % del audio util (MIK: mediana 79 %)
 CUE_SEPARACION = 8       # dos cues nunca a menos de una frase
 
+# #1064 (decisión de Germán, 18-oct): el cue B (BASS-IN) va al downbeat donde ENTRA EL BAJO.
+# El mezclador hace ahí el intercambio de graves; con B en el primer cambio de estructura, en
+# 9 de 21 entrantes de «Piso 2» el bajo ya sonaba varios compases antes (dos bajos a la vez).
+BAJO_BANDA_HZ = (30, 150)    # graves del bajo (el criterio de la auditoría: < 150 Hz)
+BAJO_FRAME_S = 0.02          # ventana de la envolvente
+BAJO_PISO_PCT = 30           # piso del compás: el bombo solo cae entre golpes, el bajo sostiene
+BAJO_CUERPO_PCT = 75         # el cuerpo del tema: los compases llenos, no los breaks
+BAJO_MARGEN_DB = 6.0         # "suena el bajo" = piso a -6 dB o menos del cuerpo
+BAJO_SOSTENIDO = 4           # compases seguidos (3 de 4 deben pasar el margen)
+BAJO_SALTO_MIN_DB = 6.0      # sin un salto claro frente a los 4 compases de antes, no se mueve B
+BAJO_SOSTEN_DB = 12.0        # el piso a <= 12 dB del RMS del compás: si no, son golpes (bombo, ruido)
+
 
 def primer_downbeat_ms(first_beat_ms, bpm) -> int:
     """#930 · Donde va el cue A: el primer downbeat de la rejilla, el mas temprano >= 0
@@ -445,6 +457,47 @@ def primer_downbeat_ms(first_beat_ms, bpm) -> int:
         return 0
     bar_ms = (60000.0 / bpm) * 4
     return int(round(max(0.0, ancla - math.floor(ancla / bar_ms + 1e-6) * bar_ms)))
+
+
+def entrada_del_bajo(y, sr, origen_ms, bar_ms, n_bars):
+    """#1064 · Compás (contado desde el primer downbeat `origen_ms`) donde entra el bajo, y el
+    salto en dB frente a los compases de antes. None si el bajo suena desde el compás 0, si
+    nunca llega al cuerpo o si la entrada no es clara.
+
+    Por compás se toma el PISO de la energía < 150 Hz (percentil 30 de la envolvente): un
+    bombo solo deja el piso bajo entre golpes; el bajo lo sostiene. La entrada es el primer
+    compás desde el que, en 3 de 4 compases seguidos, el piso queda a <= 6 dB del cuerpo y a
+    <= 12 dB del RMS del propio compás (sin bajo, el piso de un bombo con hats es ruido)."""
+    from scipy.signal import butter, sosfiltfilt
+    lo, hi = BAJO_BANDA_HZ
+    hi = min(hi, sr / 2 - 100)
+    if n_bars < 2 * BAJO_SOSTENIDO or hi <= lo:
+        return None
+    sos = butter(4, [lo / (sr / 2), hi / (sr / 2)], btype="band", output="sos")
+    g = sosfiltfilt(sos, y.astype(np.float64))
+    paso = max(1, int(BAJO_FRAME_S * sr))
+    n_fr = len(g) // paso
+    if n_fr < 2:
+        return None
+    env = np.sqrt(np.mean(g[:n_fr * paso].reshape(n_fr, paso) ** 2, axis=1))
+    t_ms = (np.arange(n_fr) + 0.5) * paso * 1000.0 / sr
+    piso = np.full(n_bars, -120.0)
+    rms = np.full(n_bars, -120.0)
+    for i in range(n_bars):
+        m = (t_ms >= origen_ms + i * bar_ms) & (t_ms < origen_ms + (i + 1) * bar_ms)
+        if m.any():
+            piso[i] = 20 * np.log10(max(float(np.percentile(env[m], BAJO_PISO_PCT)), 1e-6))
+            rms[i] = 20 * np.log10(max(float(np.sqrt(np.mean(env[m] ** 2))), 1e-6))
+    cuerpo = float(np.percentile(piso, BAJO_CUERPO_PCT))
+    suena = (piso >= cuerpo - BAJO_MARGEN_DB) & (piso >= rms - BAJO_SOSTEN_DB)
+    for b in range(n_bars - BAJO_SOSTENIDO + 1):
+        if suena[b] and int(suena[b:b + BAJO_SOSTENIDO].sum()) >= BAJO_SOSTENIDO - 1:
+            if b == 0:
+                return None   # el bajo ya está al empezar: no hay entrada que marcar
+            antes = float(np.median(piso[max(0, b - BAJO_SOSTENIDO):b]))
+            salto = float(np.median(piso[b:b + BAJO_SOSTENIDO])) - antes
+            return (b, round(salto, 1)) if salto >= BAJO_SALTO_MIN_DB else None
+    return None
 
 
 def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
@@ -463,6 +516,9 @@ def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
          frente a 0,89 contra los cues de MIK).
       4. H (salida) se elige PRIMERO, en el ultimo cuarto util dejando cola: es la que usa el
          mezclador. Despues, los 6 cambios mas fuertes antes de H, separados al menos una frase.
+      5. B va al downbeat donde ENTRA EL BAJO (`entrada_del_bajo`, #1064), con `origen: auto`,
+         y los demas cambios van despues de B. Si el bajo suena desde el inicio, si la entrada
+         no es clara o si cae a menos de una frase de H, B sigue siendo el primer cambio.
     """
     if not bpm or bpm < 40:
         return None
@@ -506,9 +562,16 @@ def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
         ventana_h = [b for b in cambio if b >= CUE_SALIDA_DESDE * fin_util]
         h_bar = max(ventana_h, key=cambio.get) if ventana_h else max(cambio)
         elegidos.append(h_bar)
+        # #1064: B donde entra el bajo; los demas cambios van despues de el.
+        bajo = entrada_del_bajo(y, sr, origen_ms, bar_ms, n_bars)
+        b_bajo = bajo[0] if bajo and bajo[0] <= h_bar - CUE_SEPARACION else None
+        if b_bajo is not None:
+            elegidos.append(b_bajo)
         for b in sorted(cambio, key=cambio.get, reverse=True):
             if len(elegidos) == 7:
                 break
+            if b_bajo is not None and b <= b_bajo:
+                continue
             if b < h_bar and all(abs(b - e) >= CUE_SEPARACION for e in elegidos):
                 elegidos.append(b)
         elegidos = [0] + sorted(elegidos)
@@ -526,12 +589,17 @@ def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
             energia = _energia_1_10(
                 float(np.median(seg)) if seg.size else p10, p10, p90)
             conf = 0.4 + 0.6 * min(1.0, cambio.get(b, 0.0) / nmax) if num else 1.0
-            cues.append({
+            if b_bajo is not None and b == b_bajo:
+                conf = 0.4 + 0.05 * bajo[1]   # salto de 6 dB -> 0,7; de 12 dB o más -> 1
+            cue = {
                 "number": num, "label": label, "color": color,
                 "positionMs": pos,
                 "energy": energia,
                 "confidence": round(float(min(1.0, conf)), 2),
-            })
+            }
+            if b_bajo is not None and b == b_bajo:
+                cue["origen"] = "auto"   # #1064: B medido en la entrada del bajo
+            cues.append(cue)
         return cues if len(cues) >= 6 else None
     except Exception as e:
         print(f"    detect_cues v7.7 fallo: {e}", flush=True)
