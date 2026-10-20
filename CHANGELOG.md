@@ -1,5 +1,25 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.26 (19-oct-2026) — EL CUE B AUTOMÁTICO VA AL DOWNBEAT DONDE ENTRA EL BAJO (dj-connect #1064)
+- **Qué pasó:** el mezclador hace el intercambio de graves en el cue B (BASS-IN) de la entrante. Pero el worker ponía B en el **primer cambio de estructura** después de A, que muchas veces es la entrada del bombo o de los hats, no la del bajo. La auditoría del 17-oct (`docs/auditorias/2026-10-17/mezcla-profesional.md`) lo encontró corrido en 9 de 21 entrantes de «Piso 2»: dos bajos a la vez en el cruce. Decisión de Germán (18-oct): B va donde entra el bajo real.
+- **Arreglo:** `entrada_del_bajo` mide, por compás desde el primer downbeat, el **piso** de la energía por debajo de 150 Hz (percentil 30 de la envolvente de 20 ms). Un bombo solo deja el piso muy abajo entre golpes (25–45 dB por debajo del RMS del compás); un bajo lo sostiene, aunque tenga *sidechain* (4–12 dB). La entrada es el primer compás desde el que, en 3 de 4 compases seguidos, el piso queda a ≤ 6 dB del cuerpo del tema (percentil 75) y a ≤ 18 dB del RMS del compás, con un salto de ≥ 6 dB frente a los 4 compases de antes. `detect_cues` pone B ahí, con `origen: "auto"` y confianza 0,4 + 0,05 × salto (6 dB → 0,7; 12 dB o más → 1), y elige los otros cambios **después** de B.
+- **B queda como antes** si el bajo suena desde el compás 0, si no hay una entrada clara, si el tema no tiene bajo o si la entrada cae a menos de una frase de H. Los cues de respaldo (planes B y C) no cambian. Los cues `manual`, `mixedinkey`, `heredada` y `plan_generacion` siguen siendo intocables: eso lo decide `worker-result`. `cue_source` sigue siendo `structure_v1`.
+- **Banco** (`bancos/banco_cue_b.py`, 235 temas de la biblioteca de Germán con la cache del banco del cue A, solo lectura):
+
+| | Antes (7.6.24) | Ahora (7.6.26) |
+|---|---|---|
+| B medido en la entrada del bajo | — | 206 de 235 (88 %) |
+| Temas con ≥ 2 compases de bajo **sostenido** a nivel de cuerpo antes de B | 75 (32 %) | **27 (11 %)** |
+| Lo mismo con el RMS de la banda (cuenta el bombo solo) | 134 (57 %) | 168 (71 %) |
+| B en múltiplo de 4 compases desde el primer downbeat | 100 % | 87 % |
+| \|B − B de MIK\| mediana | 1,9 s | 16,1 s |
+
+  - B se movió en 145 temas: 58 antes y 87 después (mediana +8 compases). Revisé a mano 15 temas por compás: en los que B va **después**, el compás de antes era un intro de bombo solo (piso a −55 dB y bajo a −18 desde el compás 32, por ejemplo). En los que va **antes**, el bajo ya sonaba desde la frase anterior.
+  - El RMS sube porque B deja de caer en el intro de bombo: ese criterio cuenta el bombo como bajo. Los 31 que no son múltiplo de 4 son temas cuya frase empieza un compás antes de nuestra rejilla (el bajo entra en el 15 o el 31): B sigue en el downbeat donde entra.
+  - MIK no marca la entrada del bajo sino un cambio de energía, así que alejarse de su B era lo esperado.
+- **Falta (de día):** medir con el banco de mezcla de la plataforma sobre «Piso 2» antes de desplegar (paso 3 de #1064) y recalcular los temas existentes sin pisar los cues de origen `manual` ni `metadata` (paso 2, Funciones).
+- Pruebas: `tests/test_1064_cue_b_entrada_bajo.py` (10, audio sintético: intro de bombo, bombo largo, bajo con sidechain, ancla tarde, bajo desde el inicio, break, sin bajo, entrada casi al final). Las de #860, #930 y respaldo siguen igual.
+
 ## 7.6.25 (16-oct-2026) — EL CUE A VA AL BEAT DONDE EMPIEZA A SONAR, NO AL PRIMER DOWNBEAT (dj-connect #930)
 - **Qué pasó:** con 7.6.24 el A quedaba en el primer *downbeat* de nuestra rejilla. Pero en la mayoría de los temas, nuestro compás no empieza donde empieza el de Rekordbox y MIK: el tema arranca en un beat que nosotros marcamos como 2, 3 o 4. A quedaba **más de un beat después del primer sonido** y la red del mezclador (#278, `agujaAlCargar`) lo pisaba al cargar y ponía la aguja fuera de la rejilla.
 - **Arreglo:** `posicion_cue_a_ms(ancla, bpm, inicio_ms)` = el último **beat** de la rejilla que no pasa el primer sonido (la regla del dueño en #278, la misma de `posicionCueASec` en el mezclador). Sin dato de sonido, el primer beat ≥ 0. Sin BPM, 0. El primer sonido (`inicio_audible_ms`) usa el criterio del mezclador (más del 2 % del pico), pero sobre las muestras: los 3.000 `waveform_peaks` lo adelantan hasta un balde. Lo usan `detect_cues`, `cues_respaldo` y `cuantizar_cues`.
