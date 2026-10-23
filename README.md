@@ -9,7 +9,7 @@ Servicios de procesamiento de audio de **DJConnect / DeepMancho**. Corren en Rai
 | `deepmancho-worker-` | `worker.py` (+ `grid_detect.py`) | `Dockerfile` | `worker.py`, `grid_detect.py`, `Dockerfile`, `requirements.txt` |
 | `grid-verifier` | `grid_verifier.py` | `Dockerfile.verifier` | `grid_verifier.py`, `Dockerfile.verifier` |
 
-Cambiar este README, el CHANGELOG, las pruebas o `banco_separacion.py` **no redespliega nada**.
+Cambiar este README, el CHANGELOG, las pruebas, `bancos/` o `banco_separacion.py` **no redespliega nada**.
 
 ## Flujo de trabajos
 1. La plataforma encola (`stem_jobs`, análisis, verificación de rejilla).
@@ -43,6 +43,14 @@ pip install -r requirements-stems.txt
 python banco_separacion.py temas/*.mp3 --salida banco --tempos tempos.csv   # tempos.csv: archivo,bpm,ancla_ms (opcional)
 ```
 Deja `resultados.csv`, `resumen.txt`, las pistas por motor y `escucha_ciega/<tema>/A|B` (la clave está en `clave_ciega.json`: escuchar antes de abrirla).
+
+## Banco de mezcla con los cues de otra versión (local, no se despliega)
+El banco de mezcla de la plataforma (`tools/mezcla-banco/` en dj-connect) mide las transiciones de una lista con los cues de la base. `bancos/cues_banco_mezcla.py` recalcula esos cues con el worker de cualquier rama, con la misma rejilla y las mismas reglas de `worker-result`, y deja una caché variante para medir antes y después de un cambio de cues **sin desplegar ni reanalizar en producción** (dj-connect #1064, paso 3).
+```
+python bancos/cues_banco_mezcla.py ~/.cache/dj-connect/mezcla-banco/<lista> ~/.cache/dj-connect/mezcla-banco-7.6.26 --rama origin/feat/1064-cue-b-sobre-930
+# en dj-connect:
+MEZCLA_BANCO_CACHE=~/.cache/dj-connect/mezcla-banco-7.6.26 npm run mezcla:banco -- --salida docs/medidas/<fecha>-banco-piso2-7.6.26
+```
 
 ## Escala de `loudness_lufs` (importante)
 Desde la 7.6.9 (3-oct-2026, decisión de Germán), `loudness_lufs` es el **LUFS integrado BS.1770 en estéreo**, el mismo valor que da cualquier medidor. Hasta la 7.6.8 se medía sobre la mezcla en mono, ≈3,8 dB por debajo («Weekend's Started»: −12,2 en mono contra −8,4 reales). Los objetivos de normalización de la app (`soundChain.ts`) y de la radio (`radio-queue-next`) pasaron de −12,5 a −9 en el mismo despliegue, y los temas analizados antes se reanalizaron en silencio (`origen='reanalisis'`).
