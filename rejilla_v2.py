@@ -305,7 +305,16 @@ def beats_del_modelo(path: str, modelo: str = "small0", hilos: int = 2):
 
 
 def _pico_mb() -> float:
-    """Pico de memoria residente de ESTE proceso (MB). En Linux, ru_maxrss viene en KB."""
+    """Pico de memoria residente de ESTE proceso (MB). Se lee VmHWM de /proc: `ru_maxrss` no sirve
+    en un proceso recién lanzado, porque en Linux arranca con el pico de quien lo lanzó (medido
+    el 17-nov: daba 1.111 MB, lo que ocupaba el worker, en todos los temas)."""
+    try:
+        with open("/proc/self/status") as f:
+            for linea in f:
+                if linea.startswith("VmHWM:"):
+                    return round(int(linea.split()[1]) / 1024.0, 0)
+    except Exception:
+        pass
     import resource
     return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 0)
 

@@ -1,5 +1,112 @@
 # Historial de versiones · worker.py (análisis)
 
+## 7.6.25 (17-nov-2026) — TONO PROPIO SIEMPRE, HASTA 8 CUES CLAROS, SALIDA CON COLA Y SIN ALARMA FALSA, Y EL DETECTOR NUEVO DEL «1» LISTO PARA ENCENDER
+Sale de la auditoría del 15-nov de dj-connect (`docs/auditorias/2026-11-15/analisis-sin-rekordbox.md`, §6 y §7) y del sí de Germán del 17-nov (T1, D-AN-3, C5 y D-AN-7) y de su pedido de ese mismo día: que el «1» salga bien desde la subida. **El worker sigue mandando el mismo BPM y la misma ancla de la 7.6.24.** La rejilla nueva viaja aparte, y si se usa o no lo decide un interruptor de la plataforma, apagado de fábrica.
+
+### 1. Tono propio siempre (T1)
+- `process_job` manda `key_detected` con el tono (Camelot) que midió `detect_key`, **siempre**. `key` no cambia: sigue viajando solo si el tema no traía tono, y `worker-result` nunca pisa una etiqueta ni un dato manual.
+- **Por qué:** con etiqueta, nuestro tono se descartaba (`result["key"] = None`) y no había con qué compararlo. La auditoría tuvo que medirlo aparte: 29 de 41 = 71 % exacto donde Rekordbox y MIK coinciden. Ahora queda guardado en cada análisis.
+
+### 2. Hasta 8 hot cues, todos en el «1» y en frontera de 8 compases (C1 y C3)
+- **Inicio (A) y Salida (H) siempre.** H es siempre el cue 7 (`MIX-OUT`), haya los del medio que haya: antes, con menos de 8 cues, la salida quedaba numerada 5 o 6 y con la etiqueta «DROP 2» o «VOCALS».
+- **Del medio, hasta 6, solo los claros.** Un cambio es claro si cumple las dos:
+  1. **se oye:** el nivel de las 4 bandas cambia en promedio 1 dB o más entre los 4 compases de antes y los 4 de después (`CAMBIO_AUDIBLE_DB`; 1 dB es más o menos el menor cambio de nivel que se alcanza a oír);
+  2. **le gana al azar del propio tema:** cambia más que la mediana del cambio medido en las **medias frases** del mismo tema, que es donde caería un cue puesto sin oír la canción.
+- **Todos en frontera de 8 compases contados desde el primer «1»** (`CUE_FRASE`). Los candidatos ya no van cada 4 compases, y `cuantizar_cues` lleva los cues al compás y a la frase (antes, los del medio iban al beat). El plan B también cuenta sus frases desde el primer «1» y no desde el ancla.
+
+### 3. Salida con cola y sin alarma falsa (C5)
+- **Tema de 5 min o más:** H va entre 32 y 48 compases antes del final del audio útil, en la frontera con más bajada **sostenida**.
+- **Tema corto:** H va en la última bajada real que deja al menos 16 compases de cola, sin pasar de medio tema. Si no hay bajada, va en la última frontera con esa cola y se dice (`salida_sin_bajada`); si ni eso cabe, `salida_sin_cola`.
+- **«Bajada real»** (`BAJADA_REAL_DB` = 1 dB): desde H hasta el final, el nivel medio de las 4 bandas queda al menos 1 dB por debajo de los 8 compases anteriores. Se mide contra **toda la cola**: un break de 8 compases también baja, pero después la música vuelve.
+- **Se quitó `mixout_temprano`.** El detector ponía H desde el 75 % del tema y la revisión exigía el 80 %: saltaba en 48 de 72 subidas reales y en 31 de 58 temas de la muestra, y cada una le quitaba 0,2 a `analysis_confidence`.
+- **La confianza de H ahora dice algo** (tramos de `cueConfidence.ts` de la app): 1,0 con bajada real; 0,6 en un tema largo sin bajada (la cola alcanza: mezcla completa); 0,5 en un tema corto sin bajada (mezcla corta de 8 compases); 0,3 sin cola (el Auto no la usa y se dibuja punteada).
+
+### Medida de 2 y 3 (antes 7.6.24, después 7.6.25)
+Los mismos 58 temas de la muestra ciega del 15-nov (semilla 20261115; 51 de `entrenar` y 7 de `ajuste`; `prueba` sigue sellada), sin BPM ni tono de semilla, como una subida cruda. Las reglas se eligieron mirando 26 temas (la mitad de `entrenar`) y se confirmaron en los otros 32.
+
+| Medida | 7.6.24 | 7.6.25 | Vara de §6 |
+|---|---|---|---|
+| BPM, ancla y tono que se guardan | — | **idénticos** en los 55 | no cambian |
+| Cues en frontera de 8 compases, contra la rejilla de **Rekordbox**, en los temas con el «1» bien (10 temas) | 70/80 = 88 % (IC 78-93) | **77/77 = 100 %** (IC 95-100) | ≥ 85 % (MIK: 88 %) |
+| Cues en frontera de 8 contados desde nuestro primer «1» (58 temas; se cumple por construcción, no es mérito) | 419/464 = 90 % | 456/456 = 100 % | — |
+| Cues del medio que NO son claros (bajo el azar del tema o < 1 dB) | 6/348 = 2 % | **0/340** | 0 |
+| Temas con 8 cues · con menos | 58 · 0 | 54 · 4 (uno con 5, dos con 6, uno con 7) | hasta 8 |
+| La salida es el cue 7 (`MIX-OUT`) | 58/58 (todos traían 8) | 58/58, también con menos de 8 | siempre |
+| **Salida: cola ≥ 32 compases** en temas de 5 min o más (50) | 38/50 = 76 % (IC 63-86) | **50/50 = 100 %** (IC 93-100); pareado 0 pierden, 12 ganan, p < 0,001 | ≥ 80 % |
+| Cola de la salida, los 58 temas (p10 · mediana · p90) | 28 · 32 · 48 | 30 · 38 · 47 | 32 a 48 en los largos |
+| **Salida en bajada real** (1 dB sostenido), temas de 5 min o más | 21/50 = 42 % (IC 29-56) | **30/50 = 60 %** (IC 46-72); pareado 4 pierden, 13 ganan, p = 0,049 | ≥ 90 %: **no se cumple** |
+| Alarma `mixout_temprano` | 28 de 55 temas | **0** (ya no existe) | quitarla |
+| Temas sin ninguna alarma | 26 de 55 | 53 de 55 | — |
+| `analysis_confidence` = 1,0 | 26 de 55 | 53 de 55 | — |
+| Alarmas nuevas | — | `salida_sin_bajada` en 1 (un tema corto) | decirlo |
+| Cues de MIK con uno nuestro a ≤ 2 compases (referencia, no meta) | 304/413 = 74 % (IC 69-78) | 282/413 = 68 % (IC 64-73) | base sin oír: 53 % |
+| Salida a ≤ 8 compases de la de MIK (referencia) | 27/53 = 51 % | 15/53 = 28 % | otro criterio (MIK sale en el último drop) |
+
+Las filas «de 55» son la corrida completa del worker (`analyze`, de punta a punta) antes y después; 3 temas de los 58 no terminaron por un fallo de la herramienta de medida (el reparto de procesos se queda esperando, el mismo que anotó la auditoría del 15-nov). Las filas «de 58» y «de 50» salen de las mismas funciones del worker sobre la energía por compás de cada tema: en los 55 con corrida completa dan los mismos cues, tema por tema (55 de 55). En los 32 temas que no se usaron para elegir las reglas: cola ≥ 32 en 20/28 → 28/28 y bajada real en 12/28 → 17/28.
+
+- **Lo que NO se cumple, dicho de frente.** La vara de §6 pide «bajada real ≥ 90 %». Queda en 30 de 50 = 60 % de los temas largos (antes, 42 %). No es el detector: solo en esa proporción de los temas largos hay una bajada sostenida de 1 dB dentro de la ventana de 32 a 48 compases; abriendo la ventana a 24-48 serían 39 de 50, y a 16-80, 44 de 50. Germán pidió la ventana de 32 a 48, así que H va ahí y, cuando no hay bajada, lo dice su confianza (0,6). Mover la ventana es decisión suya.
+- **«Menos de 8 cuando la canción no da» casi no aparece en esta música:** 54 de 58 temas siguen con 8 cues. Con el detector de hoy solo 6 de 348 cues del medio quedaban por debajo de la vara. La regla muerde en temas planos y cortos, que en la colección de Germán casi no hay (8 de 58 duran menos de 5 min) y en las subidas reales sí (28 de 72 duran menos de 2,5 min). **Eso no se pudo medir:** no hay audio de esas subidas fuera de producción.
+- **Parecerse a MIK baja un poco y ya no es la meta (C9):** cues de MIK con uno nuestro a ≤ 2 compases, de 74 % a 68 %. La base sin oír (un cue cada 16 compases) da 53 %. Es el precio de sacar la salida del último drop (donde la pone MIK) y llevarla a donde deja cola.
+- **Límites:** 58 temas dan unos ±12 puntos. Es música de un solo dueño, house y techno de 105 a 150 en versión extendida. `ajuste` ya estaba gastado antes de esto. «En el “1”» sigue dependiendo de la rejilla, que no cambia: con el «1» de hoy mal puesto en 4 de cada 5 subidas crudas, los cues siguen heredando ese error hasta que el detector nuevo pase de sombra a real.
+
+### 4. El detector nuevo del «1» (D-AN-7, R3 y R2): el worker lo calcula y la plataforma decide
+- `rejilla_v2.py`: Beat This! `small0` (CPJKU, ISMIR 2024, MIT) en CPU + rejilla global + sesgo medido + árbitro. Es el **mismo cálculo** del banco de dj-connect (`tools/analizador`), llevado a Python: con las predicciones guardadas de la biblioteca de entrenamiento da **904 de 904 bloques idénticos** (los 7 campos del banco), y `tests/test_rejilla_v2.py` lo compara con 8 casos sintéticos calculados allá. Y con audio real, de punta a punta (ffmpeg, modelo, rejilla, árbitro): **55 de 55 bloques idénticos** a los del banco en los temas de la muestra del 15-nov que tienen bloque guardado.
+- **El worker no decide nada.** Manda un bloque `v2` **aparte** y no cambia `bpm`, `bpm_fine`, el ancla ni los cues que ya mandaba. El bloque trae `bpm`, `bpm_fino`, `bpm_redondo` (R2: el entero si cae a ≤ 0,1), `ancla_ms`, `regla` («voto» o «primer_beat»), `acuerdo`, `confianza`, `intro_s`, `version` (hash de modelo + árbitro, el mismo del banco), las medidas con las que decide el árbitro y el tiempo y la memoria que gastó.
+- **D-AN-10 (Germán, 17-nov: «sí, encendamos y conectemos todo»):** en la versión final el detector nuevo se enciende de verdad para los temas sin candado, sin esperar el XML de otros DJ. Encenderlo es un paso del guion de publicación (dos filas en la base), no de este PR.
+- **Dos interruptores, los dos en la plataforma y los dos apagados de fábrica** (tabla `analisis_config` de dj-connect; se cambian con una fila, sin desplegar ni tocar Railway):
+  1. `sombra_v2`: `worker-next` le pide al worker el bloque (`sombra_v2: true` en la respuesta). `worker-result` lo guarda en `music_tracks.analisis_v2` y nada más.
+  2. `rejilla_v2_real`: además, `worker-result` escribe el ancla y el tempo del bloque con `grid_source = 'analizador_v2'`, **solo en temas sin candado** (nunca rejilla `rekordbox`, `manual` o `audio`; nunca BPM de etiqueta o manual), y lleva los cues nuestros al «1» nuevo.
+- El worker anuncia la capacidad `sombra-v2-1` solo si tiene instalados el modelo y sus pesos. `SOMBRA_V2=true` en Railway lo fuerza siempre (para probar); `SOMBRA_V2=false` es el freno de mano: ni se anuncia ni se calcula, diga lo que diga la plataforma.
+- **No puede tumbar un análisis.** Corre al final (después de la copia de escucha y del máster), en un **proceso nuevo** (`python rejilla_v2.py tema`), con tope (`SOMBRA_V2_TOPE_S`, 150 s) y solo con el tiempo que sobre del tope del trabajo. Si falla, se cae o tarda de más, el resultado se entrega igual, el bloque dice `error` (`fallo`, `caido`, `tope`, `sin_tiempo`, `sin_rejilla`) y la rejilla queda en manos del detector de hoy.
+- **Por qué un proceso nuevo y no un hijo por fork como el análisis:** en la medida local, cargar torch en un proceso que ya había corrido librosa y numba se quedó trabado en un futex (2 de 2 intentos). Un intérprete nuevo no hereda nada; cuesta unos segundos más por tema, y están en la tabla de abajo.
+- **Contrato:** `worker-result` y `worker-next` de antes ignoran lo nuevo, y un worker de antes no lo manda ni lo anuncia: función y contenedor se despliegan en cualquier orden.
+- **Imagen:** `requirements-v2.txt` (torch de CPU 2.15, torchaudio, beat-this 1.1.0) y los pesos `small0` (8 MB), que se bajan al construir y se comprueban por sha256. En marcha el worker no baja nada. **La imagen pasa de 1,52 a 2,77 GB.**
+
+### Humo: tiempo y memoria en un contenedor como el de Railway
+`bancos/humo_sombra.py`, en la imagen del `Dockerfile` (`python:3.11-slim`), con `--cpus 4 --memory 8g` y 10 temas **sintéticos** (de 2 a 10 min; uno sin beats, uno de 10 min, uno en 3/4, uno a 95 y uno a 150). El padre corre antes su examen CM2, como en producción. El servidor tenía otros trabajos corriendo: los tiempos son más bien pesimistas. **Mide operación, no calidad** (con 10 temas, ±25 puntos; y son sintéticos).
+
+| Tema sintético | Dura | Análisis de hoy | + detector nuevo, 2 hilos | + detector nuevo, 4 hilos | Memoria del proceso del modelo |
+|---|---|---|---|---|---|
+| House 124 | 6 min | 47,6 s | 21,4 s | 16,8 s | 513 MB |
+| Techno 130 | 7 min | 42,6 s | 23,3 s | 17,3 s | 556 MB |
+| Deep 120 | 5 min | 25,5 s | 18,2 s | 12,8 s | 459 MB |
+| Tech 126, intro de 15 s | 6 min | 32,0 s | 17,5 s | 13,7 s | 513 MB |
+| Rápido 150 | 4 min | 20,2 s | 14,4 s | 12,2 s | 422 MB |
+| Corto 128 | 2 min | 9,5 s | 9,7 s | 7,6 s | 402 MB |
+| Lento 95 | 3 min | 14,0 s | 11,8 s | 10,0 s | 385 MB |
+| Largo 125 | 10 min | 52,6 s | 31,5 s | 25,0 s | 658 MB |
+| En 3/4, 120 | 4 min | 24,1 s | 14,9 s | 13,0 s | 420 MB |
+| Sin beats | 4 min | 28,7 s | 15,6 s | 12,9 s | 422 MB |
+| **Los 10** | 51 min | 296,8 s | **178,3 s** (+60 %) | 141,3 s (+46 %) | máx. **658 MB** |
+
+| Lo que Germán necesita para decidir | Cifra |
+|---|---|
+| **Segundos por tema** que suma el detector nuevo (2 hilos) | mediana **16,6 s**; el de 10 min, **31,5 s**; unos 3,6 s por minuto de audio |
+| … con música real (58 temas de la muestra, fuera del contenedor, 3 a la vez y el servidor cargado) | mediana 32,8 s; el peor, 98,7 s |
+| **Memoria máxima** del proceso del modelo | **658 MB** (tema de 10 min); 680 MB con música real |
+| Pico del contenedor entero | 2,1 a 2,5 GB, con o sin el detector nuevo: lo pone el análisis de hoy |
+| **Tamaño de la imagen** | de **1,52 GB a 2,77 GB** (+1,25 GB: torch de CPU) |
+| Fallos del modelo | 0 de 20 corridas en el contenedor y 0 de 58 con música real |
+
+- **Cabe.** El detector nuevo suma unos 3,6 s por minuto de audio con 2 hilos (entre la mitad y dos tercios más de lo que ya tarda el análisis) y su proceso no pasa de 0,7 GB. El pico del contenedor no sube, porque lo pone el análisis de hoy (2,1 GB aquí; 4,5 GB medido antes con un tema real de 10 min) y el modelo corre después, cuando ese proceso ya devolvió su memoria. Railway da 24 GB por réplica.
+- **Costo** (precios de lista de Railway: US$ 20 por vCPU al mes y US$ 10 por GB al mes): unos 17 s de 2 vCPU y 0,5 GB por tema ≈ **US$ 0,0003 por tema**, unos 30 centavos por cada 1.000 temas.
+- **El tope de 150 s** es casi 5 veces lo que tardó el tema de 10 min en el contenedor (31,5 s), y vez y media el peor tema real con el servidor cargado (98,7 s).
+- **No se midió en Railway de verdad:** eso es encender el interruptor allá, y necesita el sí del dueño. Tampoco se midió con las 3 réplicas trabajando a la vez.
+
+### Para desplegar (lo hace el integrador, con el sí del dueño)
+1. Aplicar en dj-connect la migración `20261117120000_tono_propio_y_sombra_v2.sql` y desplegar `worker-result` y `worker-next`. El orden no importa.
+2. Mezclar este PR a `main`: Railway redespliega solo. Con eso ya salen el tono propio, los cues y la salida nuevos. **El detector nuevo sigue apagado** (los dos interruptores nacen en `false`).
+3. Sumar `rejilla_v2.py` y `requirements-v2.txt` a las rutas vigiladas del servicio en Railway.
+4. Para encender la sombra: `UPDATE public.analisis_config SET sombra_v2 = true WHERE id;`. Mirar en los registros la línea `[sombra v2] … en N s, pico M MB` de los primeros 10 temas.
+5. Para pasar a real (D-AN-10): `UPDATE public.analisis_config SET rejilla_v2_real = true WHERE id;`. Apagar: lo mismo con `false`; no hace falta desplegar.
+6. Volver a analizar las subidas crudas que ya están (89 temas sin candado al 17-nov, contados en solo lectura): `supabase/pruebas/1117_reanalizar_crudas_ensayo.sql` (solo cuenta) y `1117_reanalizar_crudas.sql` en dj-connect. A unos 60 s por tema con una réplica, hora y media.
+- **Los temas ya analizados no cambian solos.** Los cues nuevos, el tono propio y la rejilla nueva llegan al analizar o reanalizar; los temas con cues importados o manuales no se tocan (lo decide `worker-result`).
+
+### Pruebas
+- `tests/test_1117_cues_y_salida.py` (18), `tests/test_1117_tono_propio.py` (3), `tests/test_1117_sombra_v2.py` (18) y `tests/test_rejilla_v2.py` (19). Ajustadas: `test_860_cues_mik.py` (la salida ya no se busca desde el 75 %) y `test_worker_puras.py` (sin `mixout_temprano`).
+- Batería completa: 848 en verde, 39 saltadas y 2 fallos esperados (las mismas saltadas y esperadas de antes). `ruff` limpio. Ninguna prueba necesita torch.
+- En dj-connect: `worker-result/sombra_test.ts`, `worker-result/contrato_test.ts` (con un payload grabado de este worker) y `worker-next/index_test.ts`.
+
 ## 7.6.24 (11-oct-2026) — EL CUE A VA AL PRIMER DOWNBEAT DE LA REJILLA, NO AL SEGUNDO 0 (dj-connect #930)
 - **Qué pasó:** en producción, el cue A (MIX-IN) estaba en 0 ms en los 1.128 temas `structure_v1`. Pero su primer golpe (`first_beat_offset_ms`) solo estaba en ≤ 30 ms en 90; en 255 caía entre 30 y 500 ms, y en 783 después de 0,5 s (mediana 729 ms). **En 1.038 temas, saltar a A caía fuera del compás.** Germán: «el primer hot cue debe ir donde inicia la canción, como dice la metodología».
 - **Causa:** la regla 1 de #860 («A va SIEMPRE al segundo 0 del archivo, punto de carga de MIK»), repetida en tres sitios: `detect_cues`, `cues_respaldo` y `cuantizar_cues`. `detect_cues` ya calculaba el primer downbeat (`origen_ms`, el compás 0 de sus frases), pero no lo usaba para A.

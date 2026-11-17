@@ -21,11 +21,15 @@ Cambiar este README, el CHANGELOG, las pruebas o `banco_separacion.py` **no rede
 `WORKER_API_URL`, `WORKER_SECRET`, `SOMBRA_V2`, `SOMBRA_V2_HILOS`, `SOMBRA_V2_TOPE_S`, `STEMS_MODEL`, `STEMS_ENGINE` (sin definir = demucs; `hibrido` activa el motor híbrido de la v1.23), `HIBRIDO_DIR`, `HIBRIDO_OTHER`, `HIBRIDO_LOTE`, `HIBRIDO_SOLAPES`, `DEMUCS_SEGMENT`, `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `TORCH_THREADS`, `MAX_TRACK_MB`, `POLL_INTERVAL_SECONDS`, `RAILWAY_DOCKERFILE_PATH`.
 Valores de referencia: `OMP_NUM_THREADS=5`, `DEMUCS_JOBS=4`, `DEMUCS_OVERLAP=0.15`, `DEMUCS_SEGMENT=7`. **No usar `NO_CACHE`**: hace lentísimos los despliegues.
 
-## Analizador v2 del «1», en sombra (desde la 7.6.25)
-`rejilla_v2.py` calcula la rejilla con el detector nuevo (Beat This! `small0` + rejilla global + sesgo + árbitro) y el worker la manda en un bloque `v2` **aparte**. No cambia `bpm`, el ancla ni los cues: `worker-result` lo guarda en `music_tracks.analisis_v2` y nadie lo usa para mezclar. Pasar de sombra a real lo decide el dueño con los criterios de dj-connect `docs/plan/analizador-sombra.md` §4.
-- **Apagado de fábrica.** Se enciende con `SOMBRA_V2=true` en Railway (con el sí del dueño). Opcionales: `SOMBRA_V2_HILOS` (2) y `SOMBRA_V2_TOPE_S` (150).
-- La imagen trae torch de CPU y los pesos del modelo (`requirements-v2.txt`, comprobados por sha256 al construir). Apagada, el worker no importa torch.
-- Corre al final del trabajo, en un proceso hijo y con tope: si falla, se cae o tarda de más, el análisis se entrega igual y el bloque dice `error`.
+## Analizador v2 del «1» (desde la 7.6.25)
+`rejilla_v2.py` calcula la rejilla con el detector nuevo (Beat This! `small0` + rejilla global + sesgo + árbitro) y el worker la manda en un bloque `v2` **aparte**. El worker no decide nada: sigue mandando el mismo `bpm`, la misma ancla y los mismos cues. Qué se hace con el bloque lo decide la plataforma, con dos interruptores **apagados de fábrica** en su tabla `analisis_config` (se cambian con una fila, sin desplegar):
+- `sombra_v2`: `worker-next` le pide el bloque al worker y `worker-result` lo guarda en `music_tracks.analisis_v2`. Nada más.
+- `rejilla_v2_real`: además, `worker-result` escribe esa rejilla (`grid_source = 'analizador_v2'`) en los temas sin candado.
+
+Del lado del worker:
+- Anuncia la capacidad `sombra-v2-1` solo si tiene el modelo y sus pesos. La imagen los trae (`requirements-v2.txt`, pesos comprobados por sha256 al construir). Si no se le pide, ni importa torch.
+- `SOMBRA_V2=true` lo fuerza siempre (para probar). `SOMBRA_V2=false` es el freno de mano: ni se anuncia ni se calcula. Opcionales: `SOMBRA_V2_HILOS` (2) y `SOMBRA_V2_TOPE_S` (150).
+- Corre al final del trabajo, en un proceso nuevo y con tope: si falla, se cae o tarda de más, el análisis se entrega igual, el bloque dice `error` y la rejilla queda en manos del detector de hoy.
 - Humo de tiempo y memoria con 10 temas sintéticos: `bancos/humo_sombra.py` (las cifras medidas están en el CHANGELOG).
 
 ## Reglas aprendidas (no romper)
