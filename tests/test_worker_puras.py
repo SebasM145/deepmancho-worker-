@@ -99,10 +99,11 @@ def test_sanity_check_sin_problemas():
 
 def test_sanity_check_cuenta_cada_problema():
     r = {"bpm": 124, "bpm_precise": 164.2, "tempo_stability": "variable",
-         "cue_points": cues(mix_in=100000, mix_out=90000)}
+         "cue_points": cues(mix_in=199000, mix_out=195000)}
     problemas, conf = worker.sanity_check(r, 200000)
     nombres = {p.split(":")[0] for p in problemas}
-    assert nombres == {"bpm_fuera_de_rango", "mixin_tarde", "mixout_temprano", "orden_invertido", "tempo_variable"}
+    # 7.6.25: `mixout_temprano` ya no existe (alarma falsa, C5); la salida pegada al final sí avisa.
+    assert nombres == {"bpm_fuera_de_rango", "mixin_tarde", "runway_corto", "orden_invertido", "tempo_variable"}
     assert conf == 0.0                       # nunca negativa
     # el BPM que se mira es el refinado, no el de detect_grid
     assert "bpm_fuera_de_rango:164.2" in problemas

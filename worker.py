@@ -63,6 +63,37 @@ HEADERS = {"x-worker-secret": WORKER_SECRET, "Content-Type": "application/json"}
 # contenedor se despliegan en cualquier orden).
 CAPACIDADES = "parecido-1"
 
+# Analizador v2 del «1» (7.6.25; dj-connect #1211 y `docs/plan/analizador-sombra.md`): calcula la
+# rejilla con el detector nuevo (rejilla_v2.py) y manda el bloque `v2` APARTE. El worker no decide
+# nada: no cambia bpm, ancla ni cues. Qué se hace con el bloque lo decide la plataforma.
+#   - Se calcula cuando la PLATAFORMA lo pide (worker-next manda `sombra_v2: true`, según su
+#     interruptor `analisis_config.sombra_v2`, apagado de fábrica). Se enciende y se apaga allá,
+#     sin tocar Railway. El worker solo anuncia que sabe hacerlo (capacidad «sombra-v2-1») si
+#     tiene instalados el modelo y sus pesos.
+#   - SOMBRA_V2=true lo fuerza siempre (para probar); SOMBRA_V2=false lo apaga del todo (freno
+#     de mano: ni se anuncia ni se calcula, diga lo que diga la plataforma).
+_SOMBRA_ENV = os.environ.get("SOMBRA_V2", "").lower()
+SOMBRA_V2 = _SOMBRA_ENV == "true"                 # forzada
+SOMBRA_V2_FRENO = _SOMBRA_ENV == "false"          # apagada del todo
+SOMBRA_V2_HILOS = int(float(os.environ.get("SOMBRA_V2_HILOS", "2")))
+# Tope del modelo por tema. Medido en un contenedor como el de Railway (CHANGELOG 7.6.25): un tema
+# de 10 min tarda ~1/4 de esto. Y nunca le quita tiempo al trabajo: solo corre con lo que sobra
+# de TOPE_TRABAJO_S menos esta reserva para entregar el resultado.
+SOMBRA_V2_TOPE_S = int(float(os.environ.get("SOMBRA_V2_TOPE_S", "150")))
+SOMBRA_V2_RESERVA_S = 45
+
+
+def sombra_instalada() -> bool:
+    try:
+        import rejilla_v2
+        return rejilla_v2.disponible()
+    except Exception:
+        return False
+
+
+if not SOMBRA_V2_FRENO and sombra_instalada():
+    CAPACIDADES += ",sombra-v2-1"
+
 
 # ── Registros sin firmas (W6, 2-oct-2026) ────────────────────────────────────
 # Los errores de requests/urllib traen la URL firmada completa ("…for url: https://…?token=eyJ…")
@@ -419,16 +450,95 @@ def _energia_1_10(db_val, p10, p90):
     return int(max(1, min(10, round(3.5 + 4.0 * x))))
 
 
-# Hot cues v7.7 (#860): calibrados contra Mixed In Key con el banco de 50 temas de Germán
-# (docs/hot-cues/referencia-mik-piso3-2026-10-09.json en dj-connect; medida reproducible con
-# bancos/banco_mik.py + scripts/medir/cues-mik.mjs). Cues de MIK con uno nuestro a <= 2
-# compases: 60 % (v7.4) -> 76 %, igual en las dos mitades del banco (pares 148, impares 152).
-CUE_VENTANA = 4          # compases a cada lado para medir el cambio (8 tapaba los cambios cortos)
+# Hot cues v7.8 (7.6.25, 17-nov-2026). Reglas C1, C3 y C5 de la metodología propia
+# (dj-connect `docs/auditorias/2026-11-15/analisis-sin-rekordbox.md` §6.2; Germán, 17-nov: D-AN-3).
+# La v7.7 (#860) buscaba parecerse a Mixed In Key; desde el 15-nov MIK es solo referencia (C9).
+CUE_VENTANA = 4          # compases a cada lado para medir el cambio (8 tapaba los cambios cortos, #860)
 CUE_PESO_TOTAL = 0.5     # peso del salto de volumen total frente al cambio de timbre por bandas
-CUE_FACTOR_MEDIA_FRASE = 0.8   # MIK prefiere el borde de 8 compases; uno de 4 vale un 20 % menos
-CUE_COLA = 24            # compases que deja la salida (H) hasta el final del audio util
-CUE_SALIDA_DESDE = 0.75  # H se busca a partir del 75 % del audio util (MIK: mediana 79 %)
-CUE_SEPARACION = 8       # dos cues nunca a menos de una frase
+CUE_FRASE = 8            # C3: todo cue va en frontera de 8 compases contados desde el primer «1»
+CUE_SEPARACION = CUE_FRASE   # dos cues nunca a menos de una frase (C4)
+CUE_MEDIOS = 6           # C1: hasta 8 cues = Inicio + hasta 6 del medio + Salida
+# C1 · «cambio claro» de un cue del medio, las dos cosas a la vez:
+#   1) se oye: el nivel de las 4 bandas cambia en promedio 1 dB o más entre los 4 compases de antes
+#      y los 4 de después (1 dB ≈ el menor cambio de nivel que se alcanza a oír). Sin esto, en un
+#      tema plano la mitad de las fronteras «le ganaba al azar» por puro ruido.
+#   2) le gana al azar del propio tema (ver detect_cues).
+# Medido en la muestra del 15-nov (CHANGELOG 7.6.25): lo pasan 9 de cada 10 fronteras donde MIK
+# puso un cue y 4 de cada 10 donde no.
+CAMBIO_AUDIBLE_DB = 1.0
+# C5 · la Salida (H). Tema largo = 5 min o más: H entre 32 y 48 compases antes del final del audio
+# útil (MIK: mediana 41). Tema corto: la última bajada que deje al menos 16 compases de cola.
+SALIDA_LARGO_S = 300.0
+SALIDA_COLA_MIN = 32
+SALIDA_COLA_MAX = 48
+SALIDA_COLA_CORTA = 16
+# «Bajada real»: desde H hasta el final, el nivel medio de las 4 bandas queda al menos 1 dB por
+# debajo de los 8 compases anteriores (1 dB ≈ el menor cambio de nivel que se alcanza a oír). Se
+# mide contra TODA la cola, no contra los 8 compases siguientes: un break de 8 compases también
+# baja, pero después la música vuelve, y ahí no se sale.
+BAJADA_REAL_DB = 1.0
+# Confianza de H, por tramos de la app (`cueConfidence.ts`: ≥ 0,60 mezcla completa; 0,45–0,60
+# mezcla corta de 8 compases; < 0,45 el Auto no lo usa y se dibuja punteado).
+CONF_SALIDA = {
+    "bajada": 1.0,             # bajada real y cola: mezcla completa
+    "sin_bajada_largo": 0.6,   # tema largo sin bajada en la ventana: la cola de 32 alcanza igual
+    "sin_bajada": 0.5,         # tema corto sin bajada, con 16 compases de cola: mezcla corta
+    "sin_cola": 0.3,           # no caben 16 compases después de H: el Auto no la usa
+}
+CONF_CUE_MIN = 0.45      # un cue del medio que pasó la vara del azar nunca se dibuja como dudoso
+
+
+def nivel_por_bandas(F: dict) -> np.ndarray:
+    """dB medio de las 4 bandas, por compás. Pesa igual el bombo, el bajo, el medio y los hats:
+    en el nivel total manda el bombo y no se nota cuando salen los demás."""
+    return np.mean(np.vstack([F[k] for k in ("low", "lowmid", "mid", "high")]), axis=0)
+
+
+def caida_sostenida(nivel: np.ndarray, b: int, fin1: int) -> float:
+    """dB que baja la música desde el compás `b` hasta el final del audio útil (`fin1`), contra los
+    8 compases anteriores. > 0 = baja."""
+    pre, cola = nivel[max(0, b - CUE_FRASE):b], nivel[b:fin1]
+    if not pre.size or not cola.size:
+        return 0.0
+    return float(np.median(pre) - np.median(cola))
+
+
+def elegir_salida(nivel: np.ndarray, fin1: int, largo: bool):
+    """C5 · Dónde va la Salida (H): (compás, estado). Siempre en frontera de 8 compases.
+
+    - Tema largo: entre las fronteras que dejan de 32 a 48 compases de cola, la de mayor bajada
+      sostenida. Si ninguna baja 1 dB, igual va ahí (la cola es lo que necesita la mezcla) y el
+      estado lo dice: `sin_bajada_largo`.
+    - Tema corto: la ÚLTIMA bajada real que deja al menos 16 compases de cola, sin pasar de medio
+      tema (una cola de medio tema no es una salida). Sin bajada: la última frontera con esa cola
+      (`sin_bajada`). Si ni eso cabe: la última frontera que deje una frase (`sin_cola`).
+    """
+    fronteras = list(range(CUE_FRASE, fin1, CUE_FRASE))
+    if not fronteras:
+        return None, "sin_cola"
+    if largo:
+        cand = [b for b in fronteras if SALIDA_COLA_MIN <= fin1 - b <= SALIDA_COLA_MAX]
+        if cand:
+            h = max(cand, key=lambda b: (caida_sostenida(nivel, b, fin1), b))
+            return h, ("bajada" if caida_sostenida(nivel, h, fin1) >= BAJADA_REAL_DB else "sin_bajada_largo")
+    cand = [b for b in fronteras if fin1 - b >= SALIDA_COLA_CORTA and b >= fin1 / 2.0]
+    reales = [b for b in cand if caida_sostenida(nivel, b, fin1) >= BAJADA_REAL_DB]
+    if reales:
+        return max(reales), "bajada"
+    if cand:
+        return max(cand), "sin_bajada"
+    con_frase = [b for b in fronteras if fin1 - b >= CUE_FRASE]
+    return (max(con_frase) if con_frase else max(fronteras)), "sin_cola"
+
+
+def origen_de_compases(first_beat_ms, bpm) -> float:
+    """El primer «1» de la rejilla (ms, sin redondear): ancla − k compases, el más temprano ≥ 0.
+    Desde ahí se cuentan los compases y las frases de 8 (C3)."""
+    bar_ms = (60000.0 / float(bpm)) * 4
+    ancla = float(first_beat_ms or 0.0)
+    if ancla <= 0:
+        return 0.0
+    return max(0.0, ancla - math.floor(ancla / bar_ms + 1e-6) * bar_ms)
 
 
 def primer_downbeat_ms(first_beat_ms, bpm) -> int:
@@ -447,22 +557,22 @@ def primer_downbeat_ms(first_beat_ms, bpm) -> int:
     return int(round(max(0.0, ancla - math.floor(ancla / bar_ms + 1e-6) * bar_ms)))
 
 
-def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
-    """v7.7 — 8 hot cues como los pone Mixed In Key: A al inicio y el resto DONDE CAMBIA la
-    musica, en borde de frase.
+def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms, info: dict = None):
+    """v7.8 — hasta 8 hot cues: Inicio (A) y Salida (H) siempre; del medio, solo los claros.
 
-    Medido contra MIK (banco de #860, 397 cues):
-      1. A va al PRIMER DOWNBEAT de la rejilla (`primer_downbeat_ms`, #930). Hasta 7.6.23 iba
-         al segundo 0 (punto de carga de MIK) y saltar a A caia fuera del compas.
-      2. Las frases se cuentan desde el INICIO del archivo, en la fase del primer beat: el
-         compas 0 es el primer downbeat que cabe antes del ancla. Contarlas desde el ancla
-         corria todos los cues cuando el tema arranca sin bombo (ancla en el compas 4 -> cues
-         a 4 compases de los de MIK).
-      3. Candidatos cada 4 compases; el cambio se mide con 4 compases antes vs 4 despues
-         (timbre por bandas + salto de volumen). El de 8 compases separaba peor (AUC 0,82
-         frente a 0,89 contra los cues de MIK).
-      4. H (salida) se elige PRIMERO, en el ultimo cuarto util dejando cola: es la que usa el
-         mezclador. Despues, los 6 cambios mas fuertes antes de H, separados al menos una frase.
+      1. A va al PRIMER DOWNBEAT de la rejilla (`primer_downbeat_ms`, #930).
+      2. Las frases se cuentan desde ese primer «1» (#860): el compás 0 es el primer downbeat que
+         cabe antes del ancla.
+      3. C3 · todos los cues van en el «1» y en frontera de 8 compases. Hasta la 7.6.24 los
+         candidatos iban cada 4 compases y el 12 % quedaba a media frase.
+      4. C5 · H se elige PRIMERO, con `elegir_salida`: cola para mezclar y, si la hay, bajada real.
+      5. C1 · del medio, hasta 6: los cambios más fuertes antes de H que son CLAROS: se oyen
+         (`CAMBIO_AUDIBLE_DB`) y superan lo que daría el AZAR. El azar se mide en el propio tema:
+         el cambio (4 compases antes contra 4 después) en las MEDIAS frases, que es donde caería
+         un cue puesto sin oír la canción. Un cue del medio tiene que cambiar más que la mediana
+         de esos puntos. Un tema plano queda solo con Inicio y Salida.
+
+    `info` (opcional) recibe `salida`: bajada | sin_bajada_largo | sin_bajada | sin_cola.
     """
     if not bpm or bpm < 40:
         return None
@@ -472,9 +582,7 @@ def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
         anchor_ms = float(first_beat_ms or 0.0)
         if anchor_ms < 0 or anchor_ms > dur_ms:
             anchor_ms = 0.0
-        # regla 2 (+1e-6: un ancla justo en un compás no puede caer al anterior por redondeo)
-        origen_ms = anchor_ms - math.floor(anchor_ms / bar_ms + 1e-6) * bar_ms
-        origen_ms = max(0.0, origen_ms)
+        origen_ms = origen_de_compases(anchor_ms, bpm)
         n_bars = int((dur_ms - origen_ms) // bar_ms)
         if n_bars < 24:
             return None
@@ -488,53 +596,62 @@ def detect_cues(y: np.ndarray, sr: int, bpm, first_beat_ms):
         M = (M - M.mean(0)) / (M.std(0) + 1e-6)
 
         activos = np.where(tot >= p90 - 25)[0]
-        fin_util = int(activos[-1]) if activos.size else n_bars - 1
+        fin1 = (int(activos[-1]) if activos.size else n_bars - 1) + 1   # fin del audio útil (compás)
 
         w = CUE_VENTANA
-        cambio = {}
-        for b in range(8, fin_util - CUE_COLA + 1, 4):
+
+        def cambio_en(b):
             pre, post = M[b - w:b], M[b:b + w]
-            if not pre.size or not post.size:
-                continue
+            if b < w or not pre.size or not post.size:
+                return None
             c = float(np.linalg.norm(post.mean(0) - pre.mean(0)))
-            c += CUE_PESO_TOTAL * abs(float(np.median(tot[b:b + w]) - np.median(tot[b - w:b]))) / 6.0
-            cambio[b] = c * (1.0 if b % 8 == 0 else CUE_FACTOR_MEDIA_FRASE)
-        if len(cambio) < 4:
+            return c + CUE_PESO_TOTAL * abs(float(np.median(tot[b:b + w]) - np.median(tot[b - w:b]))) / 6.0
+
+        Fm = np.vstack([F[k] for k in ("low", "lowmid", "mid", "high")])
+
+        def se_oye(b):
+            return float(np.mean(np.abs(Fm[:, b:b + w].mean(1) - Fm[:, b - w:b].mean(1)))) >= CAMBIO_AUDIBLE_DB
+
+        # C5: la salida primero.
+        h_bar, estado = elegir_salida(nivel_por_bandas(F), fin1, dur_ms >= SALIDA_LARGO_S * 1000.0)
+        if h_bar is None:
             return None
 
-        elegidos = []
-        ventana_h = [b for b in cambio if b >= CUE_SALIDA_DESDE * fin_util]
-        h_bar = max(ventana_h, key=cambio.get) if ventana_h else max(cambio)
-        elegidos.append(h_bar)
-        for b in sorted(cambio, key=cambio.get, reverse=True):
-            if len(elegidos) == 7:
-                break
-            if b < h_bar and all(abs(b - e) >= CUE_SEPARACION for e in elegidos):
-                elegidos.append(b)
-        elegidos = [0] + sorted(elegidos)
-        if len(elegidos) < 6:
-            return None
+        # C1: lo que daría el azar = la mediana del cambio en las medias frases del tema.
+        nulo = [c for c in (cambio_en(b) for b in range(CUE_FRASE // 2, fin1 - w + 1, CUE_FRASE)) if c is not None]
+        azar = float(np.median(nulo)) if nulo else float("inf")
+        cambio = {}
+        for b in range(CUE_FRASE, h_bar - CUE_SEPARACION + 1, CUE_FRASE):
+            c = cambio_en(b)
+            if c is not None:
+                cambio[b] = c
+        claros = sorted((b for b in cambio if cambio[b] > azar and se_oye(b)), key=cambio.get, reverse=True)[:CUE_MEDIOS]
+        nmax = max(cambio.values(), default=0.0) or 1.0
 
-        nmax = max(cambio.values()) or 1.0
-        cues = []
-        for num, b in enumerate(elegidos):
-            pos = int(round(origen_ms + b * bar_ms))  # b = 0 -> A en el primer downbeat (#930)
-            if pos >= dur_ms - 500:
-                continue
+        def cue(num, b, conf):
             label, color = CUE_DEF[num]
             seg = tot[b:b + 8]
-            energia = _energia_1_10(
-                float(np.median(seg)) if seg.size else p10, p10, p90)
-            conf = 0.4 + 0.6 * min(1.0, cambio.get(b, 0.0) / nmax) if num else 1.0
-            cues.append({
+            return {
                 "number": num, "label": label, "color": color,
-                "positionMs": pos,
-                "energy": energia,
+                "positionMs": int(round(origen_ms + b * bar_ms)),  # b = 0 -> A en el primer downbeat (#930)
+                "energy": _energia_1_10(float(np.median(seg)) if seg.size else p10, p10, p90),
                 "confidence": round(float(min(1.0, conf)), 2),
-            })
-        return cues if len(cues) >= 6 else None
+            }
+
+        cues = [cue(0, 0, 1.0)]
+        for num, b in enumerate(sorted(claros), start=1):
+            cues.append(cue(num, b, CONF_CUE_MIN + (1.0 - CONF_CUE_MIN) * min(1.0, cambio[b] / nmax)))
+        # H es siempre el cue 7 (MIX-OUT), haya los del medio que haya: la app y el mezclador lo
+        # buscan por ese número y esa etiqueta.
+        cues.append(cue(7, h_bar, CONF_SALIDA[estado]))
+        cues = [c for c in cues if c["positionMs"] < dur_ms - 500]
+        if not any(c["number"] == 7 for c in cues):
+            return None
+        if info is not None:
+            info["salida"] = estado
+        return cues
     except Exception as e:
-        print(f"    detect_cues v7.7 fallo: {e}", flush=True)
+        print(f"    detect_cues v7.8 fallo: {e}", flush=True)
         return None
 
 
@@ -569,8 +686,10 @@ def cues_respaldo(y: np.ndarray, sr: int, bpm, first_beat_ms):
         anchor = float(first_beat_ms or 0.0)
         if anchor < 0 or anchor > dur_ms:
             anchor = 0.0
-        n_bars = int((dur_ms - anchor) // bar_ms)
         inicio = primer_downbeat_ms(anchor, bpm)
+        # C3 (7.6.25): los compases y las frases se cuentan desde el primer «1», no desde el ancla.
+        anchor = origen_de_compases(anchor, bpm)
+        n_bars = int((dur_ms - anchor) // bar_ms)
         if n_bars < 2:
             return [_cue_respaldo(0, inicio, 5, "grilla")]
         # Frase de 8 compases; en audio corto, de 4 (o 2) para que entren cues.
@@ -925,10 +1044,15 @@ def detect_mix_out(y22, sr22, bpm, first_beat_ms):
 def cuantizar_cues(cues, bpm_grid, fb, dur_ms, mix=None):
     """Pasos 4-5 del pipeline v7: cues a la rejilla definitiva y sin duplicados.
 
+    C3 (7.6.25): todos al «1» del compás, contando desde el primer «1» de la rejilla. Los del
+    detector estructural, además, a la frase de 8 compases. Los del plan B (`origen`) solo al
+    compás: en un audio corto sus frases son de 4 o de 2. Hasta la 7.6.24 los del medio iban al
+    BEAT, y un cue podía quedar en el 2, el 3 o el 4.
+
     Aparte de analyze() para que el banco de Mixed In Key (bancos/banco_mik.py) mida
     exactamente lo que se guarda. `mix` = (mi, mo) solo con ENABLE_MIX_V7."""
     bar_ms = (60000.0 / bpm_grid) * 4
-    beat_ms = 60000.0 / bpm_grid
+    origen = origen_de_compases(fb, bpm_grid)
     nuevos = []
     for c in cues:
         c2 = dict(c)
@@ -945,14 +1069,11 @@ def cuantizar_cues(cues, bpm_grid, fb, dur_ms, mix=None):
         if int(c2.get("number", -1)) == 0:
             c2["positionMs"] = primer_downbeat_ms(fb, bpm_grid)
             continue
-        p = c2["positionMs"]
-        # MIX-IN/OUT al compás; el resto de los cues al BEAT (los
-        # hot cues intermedios pueden legítimamente caer a mitad
-        # de compás — cuantizarlos a compás los movería de lugar).
-        paso = bar_ms if c2.get("label") in ("MIX-IN", "MIX-OUT") else beat_ms
-        q = fb + round((p - fb) / paso) * paso
-        q = max(0, min(q, dur_ms - 1000))
-        c2["positionMs"] = int(round(q))
+        paso = bar_ms if c2.get("origen") else bar_ms * CUE_FRASE
+        q = origen + round((c2["positionMs"] - origen) / paso) * paso
+        while q > dur_ms - 1000 and q - paso >= origen:   # sin salirse del audio ni de la rejilla
+            q -= paso
+        c2["positionMs"] = int(round(max(origen, q)))
     # Descartar cues duplicados tras cuantizar
     vistos, limpios = set(), []
     for c2 in sorted(nuevos, key=lambda x: x["positionMs"]):
@@ -1013,12 +1134,19 @@ def sanity_check(result, dur_ms):
         if pct > 0.15:
             problemas.append(f"mixin_tarde:{pct:.2f}")
     if mo is not None and dur_ms:
-        pct = mo / dur_ms
-        if pct < 0.80:
-            problemas.append(f"mixout_temprano:{pct:.2f}")
+        # C5 (7.6.25): se quitó `mixout_temprano` (H antes del 80 % del tema). Era falsa: el
+        # detector ponía H desde el 75 % y la revisión exigía el 80 %, así que saltaba en 48 de 72
+        # subidas reales y en 31 de 58 temas de la muestra del 15-nov. Lo que le importa a la
+        # mezcla es la cola después de H, y eso lo dicen `runway_corto` y las dos marcas de abajo.
         runway_s = (dur_ms - mo) / 1000.0
         if runway_s < 20:
             problemas.append(f"runway_corto:{runway_s:.0f}s")
+    # C5: en un tema corto, la Salida sin bajada real o sin 16 compases de cola se dice.
+    salida = result.get("_salida")
+    if salida == "sin_bajada":
+        problemas.append("salida_sin_bajada")
+    elif salida == "sin_cola":
+        problemas.append("salida_sin_cola")
     if mi is not None and mo is not None and mo <= mi:
         problemas.append("orden_invertido")
     if result.get("tempo_stability") == "variable":
@@ -1144,7 +1272,10 @@ def analyze(path: str, bpm_seed=None) -> dict:
                 print("    v7 ancla: fallback a la rejilla interna", flush=True)
 
             # AHORA si: los cues se calculan sobre el ancla DEFINITIVA.
-            cues = detect_cues(y, sr, bpm_grid, fb)
+            info_cues = {}
+            cues = detect_cues(y, sr, bpm_grid, fb, info_cues)
+            if info_cues.get("salida"):
+                out["_salida"] = info_cues["salida"]
             if not cues:
                 # Plan B: sin estructura medible, rejilla de frases.
                 cues = cues_respaldo(y, sr, bpm_grid, fb)
@@ -1181,6 +1312,7 @@ def analyze(path: str, bpm_seed=None) -> dict:
 
             # 7) Validación automática + score de confianza
             problemas, confianza = sanity_check(out, dur_ms)
+            out.pop("_salida", None)   # solo para la revisión: no viaja en el resultado
             out["analysis_confidence"] = confianza
             # #206: siempre la lista, aunque venga vacía. worker-result reemplaza las alarmas
             # solo si llega `analysis_flags`; sin el campo, un tema reanalizado y ya limpio
@@ -1192,6 +1324,7 @@ def analyze(path: str, bpm_seed=None) -> dict:
         traceback.print_exc()
         print("    v7 falló (no bloquea el job)", flush=True)
 
+    out.pop("_salida", None)
     dur_total_ms = (len(y) / sr) * 1000.0
     if not out.get("cue_points"):
         # Plan B sin el pipeline v7 (BPM de detect_grid) o Plan C (sin BPM).
@@ -1664,7 +1797,7 @@ def next_job():
     # (este ultimo solo cuando la plataforma marca needs_master_conversion).
     return job, data.get("track") or {}, data.get("audio_url"), {
         "rendition": data.get("rendition_upload"), "master": data.get("master_upload"),
-        "parecido": data.get("parecido")}
+        "parecido": data.get("parecido"), "sombra_v2": data.get("sombra_v2") is True}
 
 
 # ---------------------------------------------------------------------------
@@ -2078,8 +2211,73 @@ def _al_apagar(_sig, _frame):
     sys.exit(0)
 
 
+_AVISO_SOMBRA = False
+
+
+def sombra_v2(path: str, t0: float):
+    """El bloque `v2` del analizador nuevo, o None si no hay modelo. NUNCA tumba el trabajo: un
+    fallo, una caída o el tope del modelo devuelven un bloque con `error`, que también es un dato
+    (cuántos temas fallan y por qué), y la rejilla queda en manos del detector de hoy.
+
+    Corre en un intérprete NUEVO (`python rejilla_v2.py tema`), no en un hijo por fork como el
+    análisis. Medido el 17-nov: cargar torch en un proceso que ya corrió librosa y numba se quedó
+    trabado en un futex (2 de 2 intentos, en la medida local). Un proceso nuevo no hereda nada de
+    eso, su memoria se devuelve entera al terminar y el tope lo corta el sistema."""
+    global _AVISO_SOMBRA
+    try:
+        import rejilla_v2
+        if not rejilla_v2.disponible():
+            if not _AVISO_SOMBRA:
+                print("[sombra v2] pedida, pero el modelo no está instalado: no se calcula", flush=True)
+                _AVISO_SOMBRA = True
+            return None
+        base = {"v": rejilla_v2.V_BLOQUE, "version": rejilla_v2.version_de(), "modelo": rejilla_v2.ARBITRO_SMALL0["modelo"]}
+        tope = min(float(SOMBRA_V2_TOPE_S), TOPE_TRABAJO_S - (time.time() - t0) - SOMBRA_V2_RESERVA_S)
+        if tope < 20:
+            print("[sombra v2] sin tiempo dentro del tope del trabajo: no se calcula", flush=True)
+            return {**base, "error": "sin_tiempo"}
+        try:
+            bloque = correr_rejilla_v2(path, SOMBRA_V2_HILOS, tope)
+        except subprocess.TimeoutExpired:
+            print(f"[sombra v2] más de {tope:.0f} s: se corta y queda la rejilla de hoy", flush=True)
+            return {**base, "error": "tope", "seg": round(tope, 1)}
+        if not isinstance(bloque, dict) or bloque.get("v") != rejilla_v2.V_BLOQUE:
+            return {**base, "error": "caido" if bloque == "caido" else "fallo"}
+        print(f"[sombra v2] {bloque.get('regla') or bloque.get('error')} bpm={bloque.get('bpm')} ancla={bloque.get('ancla_ms')} "
+              f"conf={bloque.get('confianza')} en {bloque.get('seg')} s, pico {bloque.get('mem_mb')} MB", flush=True)
+        return bloque
+    except Apagado:
+        raise
+    except Exception as e:  # noqa: BLE001 — el analizador v2 no bloquea el trabajo
+        print(f"[sombra v2] fallo (no bloquea): {type(e).__name__}: {sin_firma(str(e))[:200]}", flush=True)
+        try:
+            import rejilla_v2
+            return {"v": rejilla_v2.V_BLOQUE, "version": rejilla_v2.version_de(),
+                    "modelo": rejilla_v2.ARBITRO_SMALL0["modelo"], "error": "fallo"}
+        except Exception:
+            return None
+
+
+def correr_rejilla_v2(path: str, hilos: int, tope_s: float):
+    """`python rejilla_v2.py <tema>` en un proceso nuevo. Devuelve el bloque (dict), "caido" si el
+    proceso murió por una señal (memoria), o None si falló. Lanza subprocess.TimeoutExpired al
+    pasar el tope (subprocess.run mata al proceso antes de lanzarla)."""
+    import rejilla_v2
+    entorno = {**os.environ, "SOMBRA_V2_HILOS": str(int(hilos)), "OMP_NUM_THREADS": str(int(hilos)),
+               "MKL_NUM_THREADS": str(int(hilos))}
+    r = subprocess.run([sys.executable, "-u", os.path.abspath(rejilla_v2.__file__), path], env=entorno,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=tope_s, check=False)
+    if r.returncode != 0:
+        causa = f"señal {-r.returncode}" if r.returncode < 0 else f"código {r.returncode}"
+        print(f"[sombra v2] el proceso del modelo terminó con {causa}: "
+              f"{sin_firma(r.stderr[-300:].decode(errors='replace'))}", flush=True)
+        return "caido" if r.returncode < 0 else None
+    lineas = [x for x in r.stdout.decode(errors="replace").splitlines() if x.startswith("{")]
+    return json.loads(lineas[-1]) if lineas else None
+
+
 def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict = None, master_upload: dict = None,
-                pedido_parecido: dict = None):
+                pedido_parecido: dict = None, pedir_sombra: bool = False):
     job_id = job["id"]
     track_id = job["track_id"]
     print(f"[job {job_id}] track {track_id} — analizando...", flush=True)
@@ -2199,6 +2397,11 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
                 print(f"[job {job_id}] parecido: fallo (no bloquea): {e}", flush=True)
         # respetar bpm/key de tags: el backend solo los usa si el track no los tenía
         result["bpm"] = result.get("bpm")  # enviar siempre el BPM preciso (con decimales)
+        # T1 (7.6.25): el tono que midió el worker viaja SIEMPRE, aparte, en `key_detected`.
+        # `key` sigue igual: solo va si el tema no traía tono, y worker-result nunca pisa una
+        # etiqueta ni un dato manual. Antes, con etiqueta, nuestro tono se descartaba y no había
+        # con qué compararlo (auditoría del 15-nov, arreglo 6).
+        result["key_detected"] = result.get("key")
         result["key"] = result.get("key") if not track.get("key") else None
         # Fase 2 — identificar por huella SOLO si el track no trae artista/título.
         # El backend (worker-result) escribe estos campos únicamente si están vacíos.
@@ -2208,6 +2411,12 @@ def process_job(job: dict, track: dict, audio_url: str, rendition_upload: dict =
                 result["identified_artist"] = ident["artist"]
                 result["identified_title"] = ident["title"]
                 print(f"[job {job_id}] identificado: {ident['artist']} — {ident['title']}", flush=True)
+        # Analizador v2: lo último, con el tiempo que sobre. Va en un bloque aparte. Solo si la
+        # plataforma lo pidió (o está forzado), y nunca con el freno puesto.
+        if (pedir_sombra or SOMBRA_V2) and not SOMBRA_V2_FRENO:
+            v2 = sombra_v2(tmp, t0)
+            if v2:
+                result["v2"] = v2
         send_result(job_id, track_id, "done", result=result)
         n_cues = len(result.get("cue_points") or [])
         # El tiempo total sirve para ajustar TOPE_TRABAJO_S con datos de Railway (carga masiva).
@@ -3080,9 +3289,12 @@ def liberar_memoria():
 
 def main():
     filtrar_salida()
-    print("DeepMancho worker iniciado (v7.6.24: el cue A va al primer downbeat de la rejilla, no al segundo 0 (dj-connect #930); v7.6.23: tempo sin etiqueta dentro del rango de baile, una proporcion de afuera ya no le gana a 124 (dj-connect #885); un tema reanalizado y limpio borra sus alarmas viejas, analysis_flags va siempre (#206); v7.6.20: energy_v2 en la escala del catalogo real, energy no cambia (#248); v7.6.19: tempo sin etiqueta ya no sale a 4/3 ni a 5/4 por una percusion que arma otra rejilla, decide el bombo (#206); v7.6.18: parecido v0 entre una toma y su semilla, con huella de rasgos por tema; v7.6.17: el analisis corre en un proceso hijo (si muere, la replica sigue); v7.6.16: WAV/AIFF se guardan en FLAC sin perdida y verificado; v7.6.15: archivos raros terminan con un mensaje claro y sin reintentos; v7.6.14: set por tramos a disco, memoria de un solo tema (#75 C-2); temas del Taller constantes y sin 149, desempate 3:2 por el bombo (#618); tempo sin etiqueta a 136 ya no sale a 2/3 (#206); tempo de refine_bpm por bloques, sin pico de memoria en temas largos; SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
+    print("DeepMancho worker iniciado (v7.6.25: el tono propio viaja siempre en key_detected; hasta 8 hot cues, todos en el 1 y en frontera de 8 compases, y del medio solo los que cambian mas que el azar; salida con cola (32 a 48 compases en temas de 5 min o mas) y sin la alarma falsa mixout_temprano; analizador v2 del 1 en un bloque aparte, cuando la plataforma lo pide (dj-connect, auditoria del 15-nov); v7.6.24: el cue A va al primer downbeat de la rejilla, no al segundo 0 (dj-connect #930); v7.6.23: tempo sin etiqueta dentro del rango de baile, una proporcion de afuera ya no le gana a 124 (dj-connect #885); un tema reanalizado y limpio borra sus alarmas viejas, analysis_flags va siempre (#206); v7.6.20: energy_v2 en la escala del catalogo real, energy no cambia (#248); v7.6.19: tempo sin etiqueta ya no sale a 4/3 ni a 5/4 por una percusion que arma otra rejilla, decide el bombo (#206); v7.6.18: parecido v0 entre una toma y su semilla, con huella de rasgos por tema; v7.6.17: el analisis corre en un proceso hijo (si muere, la replica sigue); v7.6.16: WAV/AIFF se guardan en FLAC sin perdida y verificado; v7.6.15: archivos raros terminan con un mensaje claro y sin reintentos; v7.6.14: set por tramos a disco, memoria de un solo tema (#75 C-2); temas del Taller constantes y sin 149, desempate 3:2 por el bombo (#618); tempo sin etiqueta a 136 ya no sale a 2/3 (#206); tempo de refine_bpm por bloques, sin pico de memoria en temas largos; SIGTERM devuelve el trabajo a la cola; loudness_lufs en estereo BS.1770 (#320); examen CM2 con golden set sintetico (#573); tempo mas rapido con el mismo resultado; tiempo por trabajo en el log y archivo muy grande como falla determinista; tempo sin BPM previo tambien con semilla de 2/3; genero detectado por etiqueta; carga masiva con tope por trabajo y MAX_TRACK_MB; el set sigue el plan del DJ; tempo correcto sin BPM previo; CM2 con x-worker-secret y solo con examen aprobado; HOT CUES metodologia MIK sobre el ancla DEFINITIVA + plan B por rejilla de frases y plan C por tiempo: ningun tema queda sin cues). Esperando jobs...", flush=True)
     if ENABLE_SET_RENDER:
         print("[set-render] habilitado — se atenderan jobs de render de sets", flush=True)
+    estado_v2 = ("apagado del todo (SOMBRA_V2=false)" if SOMBRA_V2_FRENO else "sin instalar" if "sombra-v2-1" not in CAPACIDADES
+                 else "forzado (SOMBRA_V2=true)" if SOMBRA_V2 else "listo: se calcula cuando la plataforma lo pide")
+    print(f"[sombra v2] analizador v2 del 1: {estado_v2} ({SOMBRA_V2_HILOS} hilos, tope {SOMBRA_V2_TOPE_S} s)", flush=True)
     global EXAMEN_CM2_APROBADO
     if GOLDEN_EXAM:
         try:
@@ -3109,7 +3321,7 @@ def main():
             idle = 0
             espera.trabajo()
             process_job(job, track, audio_url, (subidas or {}).get("rendition"), (subidas or {}).get("master"),
-                        (subidas or {}).get("parecido"))
+                        (subidas or {}).get("parecido"), bool((subidas or {}).get("sombra_v2")))
             liberar_memoria()
         else:
             # Sin jobs de analisis: aprovechar para renderizar sets si hay cola.
