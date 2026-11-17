@@ -1,12 +1,12 @@
-"""Humo de la sombra del analizador v2: tiempo y memoria con 10 temas SINTÉTICOS.
+"""Humo del analizador v2: tiempo y memoria con 12 temas SINTÉTICOS (3 de ellos de 8 a 10 min).
 
-Mide operación (contrato, tiempo, memoria), NO calidad: con 10 temas el margen es de ±25 puntos
+Mide operación (contrato, tiempo, memoria), NO calidad: con tan pocos temas el margen es de ±25 puntos
 (dj-connect `docs/plan/analizador-sombra.md` §2). No usa música de nadie: fabrica los temas.
 
 Se corre DENTRO de la imagen del worker, con los límites que se quieran probar:
 
     docker build -t dmworker .
-    docker run --rm --cpus 4 --memory 8g -v "$PWD/bancos:/bancos:ro" -v "$PWD/salida:/salida" \
+    docker run --rm --cpus 2 --memory 10g -v "$PWD/bancos:/bancos:ro" -v "$PWD/salida:/salida" \
         -e SOMBRA_V2=true -e SOMBRA_V2_HILOS=2 dmworker python /bancos/humo_sombra.py /salida/humo.json
 
 Por cada tema corre lo mismo que `process_job` (análisis y sonoridad en procesos hijos) y después
@@ -40,6 +40,8 @@ TEMAS = [
     ("corto_128_2min", 128.0, 2.0, 4, True, 0.03),
     ("lento_95_3min", 95.0, 3.0, 4, True, 0.20),
     ("largo_125_10min", 125.0, 10.0, 4, True, 0.08),
+    ("largo_128_9min", 128.0, 9.0, 4, True, 0.12),
+    ("largo_122_8min", 122.0, 8.0, 4, True, 0.30),
     ("tres_cuartos_120_4min", 120.0, 4.0, 3, True, 0.10),
     ("sin_beats_4min", 0.0, 4.0, 4, False, 0.0),
 ]
@@ -130,9 +132,21 @@ def main():
             fila.update({"analisis_ok": False, "error": f"{type(e).__name__}: {e}"[:200]})
         fila["analisis_s"] = round(time.time() - t0, 1)
         fila["pico_contenedor_tras_analisis_mb"] = pico_contenedor_mb()
+        # La copia de escucha (MP3 192k), como en un tema recién subido: también gasta del tope.
+        t2 = time.time()
+        try:
+            rend = worker.make_rendition(ruta)
+            if rend:
+                os.remove(rend)
+        except Exception as e:  # noqa: BLE001
+            fila["error_copia"] = str(e)[:100]
+        fila["copia_s"] = round(time.time() - t2, 1)
         if worker.SOMBRA_V2:
             t1 = time.time()
-            fila["v2"] = worker.sombra_v2(ruta, time.time())
+            # Con el reloj del TRABAJO (t0), no desde cero: el modelo solo tiene lo que sobra de
+            # TOPE_TRABAJO_S. Así se ve cuántos temas se quedarían sin bloque (`sin_tiempo`, `tope`).
+            fila["v2"] = worker.sombra_v2(ruta, t0)
+            fila["trabajo_s"] = round(time.time() - t0, 1)
             fila["sombra_s"] = round(time.time() - t1, 1)
             fila["pico_contenedor_tras_sombra_mb"] = pico_contenedor_mb()
         filas.append(fila)

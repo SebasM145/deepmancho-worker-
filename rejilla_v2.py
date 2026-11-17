@@ -20,6 +20,7 @@ import importlib.util
 import json
 import math
 import os
+import shutil
 import subprocess
 import time
 
@@ -234,7 +235,8 @@ def bloque_v2(r: dict, arbitro: dict = ARBITRO_SMALL0) -> dict:
 # ── Modelo (torch): solo dentro del proceso hijo ────────────────────────────────────────────────
 # Pesos de Beat This! `small0` (CPJKU, ISMIR 2024; código MIT). Los mismos con los que midió el
 # banco. Se bajan UNA vez al construir la imagen (Dockerfile) y se comprueban por sha256: en
-# marcha el worker nunca baja nada, y con otros pesos la sombra no corre.
+# marcha el worker nunca baja nada. Si no bajan o no son estos, la imagen NO se construye.
+# No van dentro del repo: no hemos confirmado la licencia de los pesos para redistribuirlos.
 PESOS_URL = "https://cloud.cp.jku.at/public.php/dav/files/7ik4RrBKTS273gp/small0.ckpt"
 PESOS_SHA256 = "6074be2c4d490c5f6101fcc374a1ec72ae93456e23bb6019783b849f5dc7d47b"
 
@@ -254,20 +256,29 @@ def _sha256(ruta: str) -> str:
     return h.hexdigest()
 
 
-def bajar_pesos() -> bool:
-    """Para el Dockerfile. Baja los pesos y los comprueba. Si la descarga falla (red), avisa y
-    devuelve False: la imagen sale igual y la sombra queda apagada. Si lo bajado NO es el archivo
-    esperado, lanza: eso no se deja pasar."""
+def bajar_pesos(intentos: int = 3, espera_s: int = 60) -> bool:
+    """Para el Dockerfile. Baja los pesos y los comprueba por sha256. Si no bajan (tras `intentos`,
+    cada uno con `espera_s` de tope) o lo bajado NO es el archivo esperado, LANZA y la construcción
+    de la imagen falla: un despliegue sin pesos no puede quedar en silencio (Railway se queda con
+    la imagen anterior, que sigue analizando)."""
+    import socket
     import urllib.request
     ruta = ruta_pesos()
     os.makedirs(os.path.dirname(ruta), exist_ok=True)
-    if not os.path.exists(ruta):
+    ultimo = None
+    for n in range(1, intentos + 1):
+        if os.path.exists(ruta):
+            break
         try:
-            urllib.request.urlretrieve(PESOS_URL, ruta + ".tmp")
+            with urllib.request.urlopen(PESOS_URL, timeout=espera_s) as r, open(ruta + ".tmp", "wb") as f:
+                shutil.copyfileobj(r, f)
             os.replace(ruta + ".tmp", ruta)
-        except Exception as e:  # noqa: BLE001
-            print(f"AVISO: no se pudieron bajar los pesos del detector v2 ({type(e).__name__}): la sombra queda apagada")
-            return False
+        except (OSError, socket.timeout) as e:
+            ultimo = e
+            print(f"pesos del detector v2: intento {n} de {intentos} falló ({type(e).__name__})", flush=True)
+            time.sleep(min(5 * n, 15))
+    if not os.path.exists(ruta):
+        raise RuntimeError(f"no se pudieron bajar los pesos del detector v2 tras {intentos} intentos: {type(ultimo).__name__}")
     if _sha256(ruta) != PESOS_SHA256:
         os.remove(ruta)
         raise RuntimeError("los pesos del detector v2 no son los esperados (sha256 distinto)")

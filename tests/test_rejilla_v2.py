@@ -67,3 +67,54 @@ def test_sombra_arma_el_bloque_con_tiempo_y_memoria(monkeypatch):
     b = r2.sombra("x.mp3", hilos=3)
     assert {k: b[k] for k in CAMPOS_DEL_BANCO} == caso["banco"]
     assert b["hilos"] == 3 and b["seg"] >= 0 and b["mem_mb"] > 0 and b["dur_s"] == 345.0
+
+
+# ── los pesos del modelo: sin ellos, o con otros, la imagen no se construye ───────────────────
+class _Respuesta:
+    def __init__(self, datos):
+        import io
+        self._b = io.BytesIO(datos)
+
+    def read(self, n=-1):
+        return self._b.read(n)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_bajar_pesos_falla_si_no_bajan(tmp_path, monkeypatch):
+    import urllib.request
+    monkeypatch.setenv("TORCH_HOME", str(tmp_path))
+    monkeypatch.setattr(r2.time, "sleep", lambda s: None)
+    intentos = []
+
+    def caido(url, timeout=None):
+        intentos.append(timeout)
+        raise OSError("sin red")
+
+    monkeypatch.setattr(urllib.request, "urlopen", caido)
+    with pytest.raises(RuntimeError, match="no se pudieron bajar"):
+        r2.bajar_pesos(intentos=3, espera_s=7)
+    assert intentos == [7, 7, 7] and not os.path.exists(r2.ruta_pesos()) and not r2.disponible()
+
+
+def test_bajar_pesos_falla_si_el_archivo_no_es_el_esperado(tmp_path, monkeypatch):
+    import urllib.request
+    monkeypatch.setenv("TORCH_HOME", str(tmp_path))
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=None: _Respuesta(b"otra cosa"))
+    with pytest.raises(RuntimeError, match="sha256"):
+        r2.bajar_pesos()
+    assert not os.path.exists(r2.ruta_pesos())
+
+
+def test_bajar_pesos_acepta_el_archivo_bueno(tmp_path, monkeypatch):
+    import hashlib
+    import urllib.request
+    datos = b"pesos de mentira"
+    monkeypatch.setenv("TORCH_HOME", str(tmp_path))
+    monkeypatch.setattr(r2, "PESOS_SHA256", hashlib.sha256(datos).hexdigest())
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=None: _Respuesta(datos))
+    assert r2.bajar_pesos() is True and open(r2.ruta_pesos(), "rb").read() == datos

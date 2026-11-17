@@ -55,56 +55,61 @@ Las filas «de 55» son la corrida completa del worker (`analyze`, de punta a pu
 - **D-AN-10 (Germán, 17-nov: «sí, encendamos y conectemos todo»):** en la versión final el detector nuevo se enciende de verdad para los temas sin candado, sin esperar el XML de otros DJ. Encenderlo es un paso del guion de publicación (dos filas en la base), no de este PR.
 - **Dos interruptores, los dos en la plataforma y los dos apagados de fábrica** (tabla `analisis_config` de dj-connect; se cambian con una fila, sin desplegar ni tocar Railway):
   1. `sombra_v2`: `worker-next` le pide al worker el bloque (`sombra_v2: true` en la respuesta). `worker-result` lo guarda en `music_tracks.analisis_v2` y nada más.
-  2. `rejilla_v2_real`: además, `worker-result` escribe el ancla y el tempo del bloque con `grid_source = 'analizador_v2'`, **solo en temas sin candado** (nunca rejilla `rekordbox`, `manual` o `audio`; nunca BPM de etiqueta o manual), y lleva los cues nuestros al «1» nuevo.
+  2. `rejilla_v2_real`: además, `worker-result` escribe el ancla y el tempo del bloque con `grid_source = 'analizador_v2'`, **solo en temas sin candado** (nunca rejilla `rekordbox`, `manual`, `audio` o heredada; nunca BPM de etiqueta o manual; nunca si su tempo queda a más de 0,5 BPM del que midió el detector de hoy), y lleva los cues nuestros al «1» nuevo.
 - El worker anuncia la capacidad `sombra-v2-1` solo si tiene instalados el modelo y sus pesos. `SOMBRA_V2=true` en Railway lo fuerza siempre (para probar); `SOMBRA_V2=false` es el freno de mano: ni se anuncia ni se calcula, diga lo que diga la plataforma.
 - **No puede tumbar un análisis.** Corre al final (después de la copia de escucha y del máster), en un **proceso nuevo** (`python rejilla_v2.py tema`), con tope (`SOMBRA_V2_TOPE_S`, 150 s) y solo con el tiempo que sobre del tope del trabajo. Si falla, se cae o tarda de más, el resultado se entrega igual, el bloque dice `error` (`fallo`, `caido`, `tope`, `sin_tiempo`, `sin_rejilla`) y la rejilla queda en manos del detector de hoy.
 - **Por qué un proceso nuevo y no un hijo por fork como el análisis:** en la medida local, cargar torch en un proceso que ya había corrido librosa y numba se quedó trabado en un futex (2 de 2 intentos). Un intérprete nuevo no hereda nada; cuesta unos segundos más por tema, y están en la tabla de abajo.
 - **Contrato:** `worker-result` y `worker-next` de antes ignoran lo nuevo, y un worker de antes no lo manda ni lo anuncia: función y contenedor se despliegan en cualquier orden.
-- **Imagen:** `requirements-v2.txt` (torch de CPU 2.15, torchaudio, beat-this 1.1.0) y los pesos `small0` (8 MB), que se bajan al construir y se comprueban por sha256. En marcha el worker no baja nada. **La imagen pasa de 1,52 a 2,77 GB.**
+- **Imagen:** `requirements-v2.txt` (torch de CPU 2.15, torchaudio, beat-this 1.1.0) y los pesos `small0` (8 MB), que se bajan al construir (3 intentos, 60 s de espera cada uno) y se comprueban por sha256. **Si no bajan o no son los esperados, la imagen no se construye** y Railway se queda con la anterior: un despliegue sin pesos no puede quedar en silencio. No van dentro del repo porque no hemos confirmado la licencia de los pesos para redistribuirlos; si el servidor de la universidad falla seguido, se suben a un release propio con el mismo sha256. En marcha el worker no baja nada. **La imagen pasa de 1,52 a 2,77 GB.**
 
-### Humo: tiempo y memoria en un contenedor como el de Railway
-`bancos/humo_sombra.py`, en la imagen del `Dockerfile` (`python:3.11-slim`), con `--cpus 4 --memory 8g` y 10 temas **sintéticos** (de 2 a 10 min; uno sin beats, uno de 10 min, uno en 3/4, uno a 95 y uno a 150). El padre corre antes su examen CM2, como en producción. El servidor tenía otros trabajos corriendo: los tiempos son más bien pesimistas. **Mide operación, no calidad** (con 10 temas, ±25 puntos; y son sintéticos).
+### Humo: tiempo y memoria en un contenedor como una réplica de Railway
+`bancos/humo_sombra.py`, en la imagen del `Dockerfile` (`python:3.11-slim`), con **`--cpus 2 --memory 10g`** (lo que tiene cada una de las 3 réplicas del servicio) y 12 temas **sintéticos** (de 2 a 10 min; tres de 8 a 10 min, uno sin beats, uno en 3/4, uno a 95 y uno a 150). Cada tema hace lo que hace un trabajo de verdad: el análisis, la sonoridad, la copia de escucha y, al final, el modelo, con el reloj del trabajo corriendo desde el principio. El padre corre antes su examen CM2, como en producción. El servidor tenía otros trabajos corriendo: los tiempos son más bien pesimistas. **Mide operación, no calidad** (pocos temas, y sintéticos).
 
-| Tema sintético | Dura | Análisis de hoy | + detector nuevo, 2 hilos | + detector nuevo, 4 hilos | Memoria del proceso del modelo |
-|---|---|---|---|---|---|
-| House 124 | 6 min | 47,6 s | 21,4 s | 16,8 s | 513 MB |
-| Techno 130 | 7 min | 42,6 s | 23,3 s | 17,3 s | 556 MB |
-| Deep 120 | 5 min | 25,5 s | 18,2 s | 12,8 s | 459 MB |
-| Tech 126, intro de 15 s | 6 min | 32,0 s | 17,5 s | 13,7 s | 513 MB |
-| Rápido 150 | 4 min | 20,2 s | 14,4 s | 12,2 s | 422 MB |
-| Corto 128 | 2 min | 9,5 s | 9,7 s | 7,6 s | 402 MB |
-| Lento 95 | 3 min | 14,0 s | 11,8 s | 10,0 s | 385 MB |
-| Largo 125 | 10 min | 52,6 s | 31,5 s | 25,0 s | 658 MB |
-| En 3/4, 120 | 4 min | 24,1 s | 14,9 s | 13,0 s | 420 MB |
-| Sin beats | 4 min | 28,7 s | 15,6 s | 12,9 s | 422 MB |
-| **Los 10** | 51 min | 296,8 s | **178,3 s** (+60 %) | 141,3 s (+46 %) | máx. **658 MB** |
+| Tema sintético | Dura | Análisis de hoy | Copia de escucha | + detector nuevo (2 hilos) | Trabajo entero (tope 420 s) | Memoria del proceso del modelo | ¿Quedó con bloque? |
+|---|---|---|---|---|---|---|---|
+| House 124 | 6 min | 71,7 s | 5,9 s | 24,2 s | 101,8 s | 511 MB | sí |
+| Techno 130 | 7 min | 63,6 s | 5,9 s | 23,9 s | 93,4 s | 558 MB | sí |
+| Deep 120 | 5 min | 44,0 s | 4,8 s | 19,3 s | 68,0 s | 466 MB | sí |
+| Tech 126, intro de 15 s | 6 min | 54,7 s | 5,8 s | 23,9 s | 84,4 s | 509 MB | sí |
+| Rápido 150 | 4 min | 35,6 s | 3,4 s | 17,8 s | 56,8 s | 420 MB | sí |
+| Corto 128 | 2 min | 14,3 s | 1,7 s | 9,7 s | 25,7 s | 377 MB | sí |
+| Lento 95 | 3 min | 23,2 s | 3,6 s | 14,8 s | 41,6 s | 373 MB | sí |
+| Largo 125 | 10 min | 75,8 s | 8,8 s | 40,0 s | 124,6 s | 665 MB | sí |
+| Largo 128 | 9 min | 79,6 s | 9,0 s | 37,8 s | 126,4 s | 616 MB | sí |
+| Largo 122 | 8 min | 62,8 s | 8,0 s | 34,6 s | 105,3 s | 599 MB | sí |
+| En 3/4, 120 | 4 min | 36,2 s | 3,7 s | 19,6 s | 59,5 s | 418 MB | sí |
+| Sin beats | 4 min | 28,2 s | 4,2 s | 21,2 s | 53,6 s | 422 MB | sí |
+| **Los 12** | 68 min | 589,7 s | 64,8 s | **286,8 s** (+49 %) | máx. 126,4 s | máx. **665 MB** | **12 de 12** |
 
-| Lo que Germán necesita para decidir | Cifra |
+| Lo que Germán necesita para decidir | Cifra (2 vCPU y 10 GB, como una réplica de Railway) |
 |---|---|
-| **Segundos por tema** que suma el detector nuevo (2 hilos) | mediana **16,6 s**; el de 10 min, **31,5 s**; unos 3,6 s por minuto de audio |
-| … con música real (58 temas de la muestra, fuera del contenedor, 3 a la vez y el servidor cargado) | mediana 32,8 s; el peor, 98,7 s |
-| **Memoria máxima** del proceso del modelo | **658 MB** (tema de 10 min); 680 MB con música real |
-| Pico del contenedor entero | 2,1 a 2,5 GB, con o sin el detector nuevo: lo pone el análisis de hoy |
+| **Segundos por tema** que suma el detector nuevo | mediana **22,6 s**; el de 10 min, **40,0 s**; unos 4,3 s por minuto de audio |
+| Temas largos (8 a 10 min) que se quedan sin bloque (`sin_tiempo` o `tope`) | **0 de 3**. El trabajo entero más largo usó 126,4 s de los 420 del tope |
+| … con música real (58 temas de la muestra, fuera del contenedor, 3 a la vez y el servidor cargado) | mediana 32,8 s; el peor, 98,7 s; 0 sin bloque |
+| **Memoria máxima** del proceso del modelo | **665 MB** (tema de 10 min); 680 MB con música real |
+| Pico del contenedor entero | 2,3 a 2,4 GB de los 10: lo pone el análisis de hoy, no el modelo |
 | **Tamaño de la imagen** | de **1,52 GB a 2,77 GB** (+1,25 GB: torch de CPU) |
-| Fallos del modelo | 0 de 20 corridas en el contenedor y 0 de 58 con música real |
+| Con 1 hilo en vez de 2 | 6 min → 33,4 s, 10 min → 54,6 s, 9 min → 53,1 s, 8 min → 47,8 s |
+| Fallos del modelo | 0 de 16 corridas en el contenedor y 0 de 58 con música real |
 
-- **Cabe.** El detector nuevo suma unos 3,6 s por minuto de audio con 2 hilos (entre la mitad y dos tercios más de lo que ya tarda el análisis) y su proceso no pasa de 0,7 GB. El pico del contenedor no sube, porque lo pone el análisis de hoy (2,1 GB aquí; 4,5 GB medido antes con un tema real de 10 min) y el modelo corre después, cuando ese proceso ya devolvió su memoria. Railway da 24 GB por réplica.
-- **Costo** (precios de lista de Railway: US$ 20 por vCPU al mes y US$ 10 por GB al mes): unos 17 s de 2 vCPU y 0,5 GB por tema ≈ **US$ 0,0003 por tema**, unos 30 centavos por cada 1.000 temas.
-- **El tope de 150 s** es casi 5 veces lo que tardó el tema de 10 min en el contenedor (31,5 s), y vez y media el peor tema real con el servidor cargado (98,7 s).
-- **No se midió en Railway de verdad:** eso es encender el interruptor allá, y necesita el sí del dueño. Tampoco se midió con las 3 réplicas trabajando a la vez.
+- **Cabe.** El detector nuevo suma unos 4,3 s por minuto de audio (la mitad más de lo que ya tarda el análisis) y su proceso no pasa de 0,7 GB. El pico del contenedor no sube, porque lo pone el análisis de hoy (2,3 GB aquí; 4,5 GB medido antes con un tema real de 10 min) y el modelo corre después, cuando ese proceso ya devolvió su memoria.
+- **Ningún tema largo se quedó sin bloque.** El trabajo más largo usó 126 s de los 420 del tope. El tope del modelo (`SOMBRA_V2_TOPE_S`, 150 s) es casi 4 veces lo que tardó el tema de 10 min (40 s) y vez y media el peor tema real con el servidor cargado (98,7 s). **No hace falta cambiarlo.** Si en Railway los primeros 10 temas muestran tiempos cerca de 100 s, se sube con la variable, sin desplegar código.
+- **Costo** (precios de lista de Railway: US$ 20 por vCPU al mes y US$ 10 por GB al mes): unos 23 s de 2 vCPU y 0,5 GB por tema ≈ **US$ 0,0004 por tema**, unos 40 centavos por cada 1.000 temas.
+- **Una medida anterior, con 4 CPU y 8 GB** (antes de saber lo que tiene Railway): mediana 16,6 s y 31,5 s el de 10 min. Queda solo como referencia.
+- **No se midió en Railway de verdad:** eso es encender el interruptor allá, y por eso el guion lo hace en dos pasos (primero solo la sombra, mirar 10 temas, después la rejilla). Cada réplica tiene sus propios 2 vCPU, así que 3 réplicas a la vez no deberían cambiar estas cifras, pero no se probó.
 
 ### Para desplegar (lo hace el integrador, con el sí del dueño)
-1. Aplicar en dj-connect la migración `20261117120000_tono_propio_y_sombra_v2.sql` y desplegar `worker-result` y `worker-next`. El orden no importa.
+1. Aplicar en dj-connect la migración `20261117120000_tono_propio_y_sombra_v2.sql` (`scripts/migraciones.sh aplicar`) y desplegar `worker-result` y `worker-next`. El orden no importa.
 2. Mezclar este PR a `main`: Railway redespliega solo. Con eso ya salen el tono propio, los cues y la salida nuevos. **El detector nuevo sigue apagado** (los dos interruptores nacen en `false`).
-3. Sumar `rejilla_v2.py` y `requirements-v2.txt` a las rutas vigiladas del servicio en Railway.
-4. Para encender la sombra: `UPDATE public.analisis_config SET sombra_v2 = true WHERE id;`. Mirar en los registros la línea `[sombra v2] … en N s, pico M MB` de los primeros 10 temas.
-5. Para pasar a real (D-AN-10): `UPDATE public.analisis_config SET rejilla_v2_real = true WHERE id;`. Apagar: lo mismo con `false`; no hace falta desplegar.
-6. Volver a analizar las subidas crudas que ya están (89 temas sin candado al 17-nov, contados en solo lectura): `supabase/pruebas/1117_reanalizar_crudas_ensayo.sql` (solo cuenta) y `1117_reanalizar_crudas.sql` en dj-connect. A unos 60 s por tema con una réplica, hora y media.
+3. Sumar `rejilla_v2.py`, `requirements-v2.txt` y `parecido.py` a las rutas vigiladas del servicio en Railway (es configuración de Railway: va en el guion de publicación, con el sí de Germán).
+4. **Primero solo la sombra:** `UPDATE public.analisis_config SET sombra_v2 = true WHERE id;`. Mirar en los registros de Railway la línea `[sombra v2] … en N s, pico M MB` de los primeros 10 temas: si N se acerca a 100 s o aparecen `tope` o `sin_tiempo`, parar ahí.
+5. **Después, la rejilla** (D-AN-10): `UPDATE public.analisis_config SET rejilla_v2_real = true WHERE id;`. Apagar: lo mismo con `false`; no hace falta desplegar.
+6. Volver a analizar las subidas crudas que ya están (48 temas sin candado al 17-nov, contados en solo lectura; los espejos reciben la rejilla de su original): `supabase/pruebas/1117_reanalizar_crudas_ensayo.sql` (solo cuenta) y `1117_reanalizar_crudas.sql` en dj-connect. A unos 90 s por tema, unos 25 minutos con las 3 réplicas.
 - **Los temas ya analizados no cambian solos.** Los cues nuevos, el tono propio y la rejilla nueva llegan al analizar o reanalizar; los temas con cues importados o manuales no se tocan (lo decide `worker-result`).
 
 ### Pruebas
-- `tests/test_1117_cues_y_salida.py` (18), `tests/test_1117_tono_propio.py` (3), `tests/test_1117_sombra_v2.py` (18) y `tests/test_rejilla_v2.py` (19). Ajustadas: `test_860_cues_mik.py` (la salida ya no se busca desde el 75 %) y `test_worker_puras.py` (sin `mixout_temprano`).
-- Batería completa: 848 en verde, 39 saltadas y 2 fallos esperados (las mismas saltadas y esperadas de antes). `ruff` limpio. Ninguna prueba necesita torch.
+- `tests/test_1117_cues_y_salida.py` (18), `tests/test_1117_tono_propio.py` (3), `tests/test_1117_sombra_v2.py` (18) y `tests/test_rejilla_v2.py` (22). Ajustadas: `test_860_cues_mik.py` (la salida ya no se busca desde el 75 %) y `test_worker_puras.py` (sin `mixout_temprano`).
+- Batería completa: 851 en verde, 39 saltadas y 2 fallos esperados (las mismas saltadas y esperadas de antes). `ruff` limpio. Ninguna prueba necesita torch.
 - En dj-connect: `worker-result/sombra_test.ts`, `worker-result/contrato_test.ts` (con un payload grabado de este worker) y `worker-next/index_test.ts`.
 
 ## 7.6.24 (11-oct-2026) — EL CUE A VA AL PRIMER DOWNBEAT DE LA REJILLA, NO AL SEGUNDO 0 (dj-connect #930)
