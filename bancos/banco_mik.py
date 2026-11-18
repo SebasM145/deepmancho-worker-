@@ -43,7 +43,7 @@ def cues_y_energia(y: np.ndarray, bpm: float, fb: float) -> dict:
     sr = worker.SR
     dur_ms = len(y) / sr * 1000.0
     cues = worker.detect_cues(y, sr, bpm, fb) or worker.cues_respaldo(y, sr, bpm, fb) or []
-    cues = worker.cuantizar_cues(cues, bpm, fb, dur_ms) if cues else []
+    cues = worker.cuantizar_cues(cues, bpm, fb, dur_ms, inicio_ms=worker.inicio_audible_ms(y, dur_ms)) if cues else []
     bands = worker.compute_bands(y, sr, worker.BUCKETS)
     energia = worker.compute_energy(librosa.feature.rms(y=y)[0], bands)
     return {

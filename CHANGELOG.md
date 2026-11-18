@@ -1,6 +1,26 @@
 # Historial de versiones · worker.py (análisis)
 
-## 7.6.25 (17-nov-2026) — TONO PROPIO SIEMPRE, HASTA 8 CUES CLAROS, SALIDA CON COLA Y SIN ALARMA FALSA, Y EL DETECTOR NUEVO DEL «1» LISTO PARA ENCENDER
+## 7.6.26 (18-nov-2026) — LA 7.6.25 (#71) CON EL CUE A DONDE EMPIEZA A SONAR (#68, dj-connect #930)
+Es la versión que sale en la final del 6-dic. Une dos PR que nunca se desplegaron y que los dos decían 7.6.25: el análisis de la final (#71) y el arreglo del cue A (#68, abierto desde el 16-oct). **Sale una sola versión, la 7.6.26.**
+
+### Qué trae
+- **Todo lo de la 7.6.25 de #71, sin cambios** (tono propio, hasta 8 cues claros, salida con cola, sin `mixout_temprano` y el detector nuevo del «1» aparte): ver la sección de abajo.
+- **El cue A va al beat de la rejilla donde empieza a sonar** (regla de #68): `posicion_cue_a_ms(ancla, bpm, inicio_ms)` = el último **beat** de la rejilla que no pasa el primer sonido (la regla del dueño en #278, la misma de `posicionCueASec` en el mezclador). Sin dato de sonido, el primer beat ≥ 0. Sin BPM, 0. El primer sonido (`inicio_audible_ms`) usa el criterio del mezclador (más del 2 % del pico), medido sobre las muestras. Lo usan `detect_cues`, `cues_respaldo` y `cuantizar_cues`.
+- **B a H siguen la regla de #71:** en el «1» y en frontera de 8 compases contados desde el primer «1». A ya no: puede caer en el 2, el 3 o el 4 del compás, porque ahí empieza el tema (MIK y Rekordbox hacen lo mismo).
+
+### Choques al unir #68 sobre #71
+1. **`primer_downbeat_ms` → `posicion_cue_a_ms`.** #68 la reemplazó; #71 la seguía usando en `cues_respaldo` y `cuantizar_cues`. Quedó la de #68 en los tres sitios.
+2. **`detect_cues`.** #71 la reescribió entera (hasta 8 cues, salida primero, azar del tema); #68 solo cambiaba dónde va A. Quedó el cuerpo de #71 y A en `posicion_cue_a_ms`.
+3. **`cues_respaldo`.** #71 cuenta las frases desde el primer «1»; #68 calcula A con el primer sonido. Quedan las dos: A con el ancla real (misma fase de beat) y las frases desde el primer «1».
+4. **El aviso de arranque y este CHANGELOG:** las dos 7.6.25 pasan a una sola 7.6.26. La entrada de #68 queda resumida aquí y la de #71, abajo, entera.
+
+### Medida
+(se completa con las corridas de esta rama)
+
+### Pruebas
+- `tests/test_930_cue_a.py` (de #68) y `tests/test_1117_cues_y_salida.py` (de #71) en la misma batería, más una prueba de las dos reglas juntas.
+
+## 7.6.25 (17-nov-2026, PR #71; no se desplegó sola: sale dentro de la 7.6.26) — TONO PROPIO SIEMPRE, HASTA 8 CUES CLAROS, SALIDA CON COLA Y SIN ALARMA FALSA, Y EL DETECTOR NUEVO DEL «1» LISTO PARA ENCENDER
 Sale de la auditoría del 15-nov de dj-connect (`docs/auditorias/2026-11-15/analisis-sin-rekordbox.md`, §6 y §7) y del sí de Germán del 17-nov (T1, D-AN-3, C5 y D-AN-7) y de su pedido de ese mismo día: que el «1» salga bien desde la subida. **El worker sigue mandando el mismo BPM y la misma ancla de la 7.6.24.** La rejilla nueva viaja aparte, y si se usa o no lo decide un interruptor de la plataforma, apagado de fábrica.
 
 ### 1. Tono propio siempre (T1)

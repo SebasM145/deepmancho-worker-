@@ -1,7 +1,8 @@
 """7.6.25 · Hot cues y Salida de la metodología propia (dj-connect, auditoría del 15-nov, §6.2).
 
 C1: hasta 8 cues; Inicio y Salida siempre; del medio, solo los claros: se oyen y le ganan al azar.
-C3: todos en el «1» y en frontera de 8 compases contados desde el primer «1».
+C3: B a H en el «1» y en frontera de 8 compases contados desde el primer «1». El cue A, desde la
+    7.6.26 (#930, worker #68), va al beat donde empieza a sonar: ver `test_930_cue_a.py`.
 C5: en temas de 5 min o más, la Salida deja de 32 a 48 compases de cola; en temas cortos va en la
     última bajada con 16 compases de cola, y si no la hay se dice. Sin la alarma `mixout_temprano`.
 La medida con música real está en el CHANGELOG; aquí van las reglas, con audio sintético.
@@ -51,6 +52,26 @@ def test_c3_todos_los_cues_en_frontera_de_8_desde_el_primer_uno():
     assert cues[0]["number"] == 0 and cues[0]["positionMs"] == 300
     for b in compases(cues, 300):
         assert abs(b - round(b)) < 0.02 and round(b) % 8 == 0, f"fuera de la frase de 8: {b}"
+
+
+def test_7626_a_en_el_beat_del_primer_sonido_y_b_a_h_en_frontera_de_8():
+    # 7.6.26: las dos reglas juntas. El primer «1» cae en 300 ms, pero el tema empieza a sonar un
+    # beat después (y 20 ms): A va a ese beat (#930, #68) y B a H siguen en frontera de 8 contados
+    # desde el primer «1» (C3, #71). Así queda también después de cuantizar, que es lo que se guarda.
+    beat_ms = BAR_MS / 4
+    y = tema(LARGO, silencio_ms=300)
+    y[: int((300 + beat_ms + 20) / 1000 * SR)] = 0.0
+    ancla = 300 + 3 * BAR_MS
+    a = int(round(300 + beat_ms))
+    cues = worker.detect_cues(y, SR, BPM, ancla)
+    dur_ms = len(y) / SR * 1000
+    guardados = worker.cuantizar_cues(cues, BPM, ancla, dur_ms, inicio_ms=worker.inicio_audible_ms(y, dur_ms))
+    for lista in (cues, guardados):
+        assert lista[0]["number"] == 0 and lista[0]["positionMs"] == a
+        assert lista[-1]["number"] == 7
+        for b in compases(lista[1:], 300):
+            assert abs(b - round(b)) < 0.02 and round(b) % 8 == 0, f"fuera de la frase de 8: {b}"
+    assert [c["positionMs"] for c in guardados[1:]] == [c["positionMs"] for c in cues[1:]]
 
 
 def test_c1_inicio_y_salida_siempre_y_la_salida_es_el_cue_7():
