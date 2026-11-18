@@ -15,10 +15,23 @@ Es la versión que sale en la final del 6-dic. Une dos PR que nunca se desplegar
 4. **El aviso de arranque y este CHANGELOG:** las dos 7.6.25 pasan a una sola 7.6.26. La entrada de #68 queda resumida aquí y la de #71, abajo, entera.
 
 ### Medida
-(se completa con las corridas de esta rama)
+Banco del cue A contra Mixed In Key (`bancos/banco_cue_a.py` y el banco de las tres versiones del carril, solo local): 212 temas del XML de Rekordbox de Germán con el A de MIK, el mismo audio, BPM y ancla para las tres versiones. Ni audio ni XML entran al repo.
+
+| | 7.6.24 (main) | 7.6.25 (#71) | **7.6.26** |
+|---|---|---|---|
+| A a ≤ 50 ms del A de MIK | 49/212 = 23 % (IC 18-29) | 49/212 = 23 % | **174/212 = 82 % (IC 76-87)** |
+| Distancia mediana al A de MIK | 440 ms | 440 ms | **41 ms** |
+| El mezclador respeta el A al cargar | 59/212 = 28 % | 59/212 = 28 % | **212/212 = 100 %** |
+| B a H iguales a los de 7.6.25 | — | — | 212/212 |
+
+- Pareado 7.6.25 → 7.6.26: 130 temas ganan y 5 pierden (McNemar exacto p < 0,001). #71 no tocó el A: el de 7.6.24 y el de 7.6.25 son el mismo en 212/212.
+- En 153/212 (72 %) la música empieza más de un beat antes del A de 7.6.24; ahí el A de MIK cae en un beat de nuestra rejilla en el 92 % y en nuestro downbeat en el 1 %.
+- **Con la rejilla de Rekordbox** (`worker-result` lleva los cues al «1» de esa rejilla), el A de 7.6.26 solo sirve si `worker-result` no lo corre con los demás (dj-connect #1814): corrido, 44/212 a ≤ 50 ms de MIK y el mezclador lo respeta en 57/212; sin correrlo, 174/212 y 212/212 (hoy, con 7.6.25: 176/212 y 199/212; pareado 8 pierden y 6 ganan, p = 0,79). **Esta versión no se despliega sin ese `worker-result`.**
+- **Muestra ciega del 15-nov** (la de #71: subida cruda, sin BPM ni tono de semilla; 56 temas con corrida de 7.6.25 y 7.6.26): BPM, ancla, «1», tono, energía global y de salida y pico, confianza, alarmas, estabilidad y LUFS **idénticos en 56/56**; cues B a H (número, etiqueta, posición y confianza) **idénticos en 56/56**. Solo cambia el A (47/56) y, porque se mide 30 s desde el A, `energy_entry` en 2/56 (±1). A a ≤ 50 ms del de MIK: 10/54 = 19 % (IC 10-31) → **49/54 = 91 % (IC 80-96)**; pareado 40 ganan y 1 pierde, p < 0,001. 7.6.24 tiene el mismo A que 7.6.25 (#71 no lo tocó).
 
 ### Pruebas
-- `tests/test_930_cue_a.py` (de #68) y `tests/test_1117_cues_y_salida.py` (de #71) en la misma batería, más una prueba de las dos reglas juntas.
+- `tests/test_930_cue_a.py` (de #68) y `tests/test_1117_cues_y_salida.py` (de #71) en la misma batería, más una prueba de las dos reglas juntas. Sale `test_930_cue_a_downbeat.py` (probaba la regla de 7.6.24).
+- Resultado: 858 pasan, 39 saltadas, 2 fallos esperados, 0 fallan (#71: 851 · 39 · 2). `ruff --select E9,F63,F7,F82` limpio.
 
 ## 7.6.25 (17-nov-2026, PR #71; no se desplegó sola: sale dentro de la 7.6.26) — TONO PROPIO SIEMPRE, HASTA 8 CUES CLAROS, SALIDA CON COLA Y SIN ALARMA FALSA, Y EL DETECTOR NUEVO DEL «1» LISTO PARA ENCENDER
 Sale de la auditoría del 15-nov de dj-connect (`docs/auditorias/2026-11-15/analisis-sin-rekordbox.md`, §6 y §7) y del sí de Germán del 17-nov (T1, D-AN-3, C5 y D-AN-7) y de su pedido de ese mismo día: que el «1» salga bien desde la subida. **El worker sigue mandando el mismo BPM y la misma ancla de la 7.6.24.** La rejilla nueva viaja aparte, y si se usa o no lo decide un interruptor de la plataforma, apagado de fábrica.
