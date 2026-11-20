@@ -6,7 +6,7 @@ Servicios de procesamiento de audio de **DJConnect / DeepMancho**. Corren en Rai
 | Servicio Railway | Archivo | Dockerfile | Se redespliega solo si cambia |
 |---|---|---|---|
 | `stems-worker` | `stems_worker.py` | `Dockerfile.stems` | `stems_worker.py`, `Dockerfile.stems`, `requirements-stems.txt` |
-| `deepmancho-worker-` | `worker.py` (+ `grid_detect.py`) | `Dockerfile` | `worker.py`, `grid_detect.py`, `Dockerfile`, `requirements.txt` |
+| `deepmancho-worker-` | `worker.py` (+ `grid_detect.py`, `rejilla_v2.py`) | `Dockerfile` | `worker.py`, `grid_detect.py`, `Dockerfile`, `requirements.txt` (desde la 7.6.25 hay que sumar `rejilla_v2.py`, `requirements-v2.txt` y `parecido.py` a las rutas vigiladas en Railway) |
 | `grid-verifier` | `grid_verifier.py` | `Dockerfile.verifier` | `grid_verifier.py`, `Dockerfile.verifier` |
 
 Cambiar este README, el CHANGELOG, las pruebas o `banco_separacion.py` **no redespliega nada**.
@@ -18,8 +18,19 @@ Cambiar este README, el CHANGELOG, las pruebas o `banco_separacion.py` **no rede
 4. La plataforma guarda y muestra. El worker **nunca** escribe directo en la base.
 
 ## Variables (solo nombres; los valores están en Railway)
-`WORKER_API_URL`, `WORKER_SECRET`, `STEMS_MODEL`, `STEMS_ENGINE` (sin definir = demucs; `hibrido` activa el motor híbrido de la v1.23), `HIBRIDO_DIR`, `HIBRIDO_OTHER`, `HIBRIDO_LOTE`, `HIBRIDO_SOLAPES`, `DEMUCS_SEGMENT`, `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `TORCH_THREADS`, `MAX_TRACK_MB`, `POLL_INTERVAL_SECONDS`, `RAILWAY_DOCKERFILE_PATH`.
+`WORKER_API_URL`, `WORKER_SECRET`, `SOMBRA_V2`, `SOMBRA_V2_HILOS`, `SOMBRA_V2_TOPE_S`, `STEMS_MODEL`, `STEMS_ENGINE` (sin definir = demucs; `hibrido` activa el motor híbrido de la v1.23), `HIBRIDO_DIR`, `HIBRIDO_OTHER`, `HIBRIDO_LOTE`, `HIBRIDO_SOLAPES`, `DEMUCS_SEGMENT`, `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `TORCH_THREADS`, `MAX_TRACK_MB`, `POLL_INTERVAL_SECONDS`, `RAILWAY_DOCKERFILE_PATH`.
 Valores de referencia: `OMP_NUM_THREADS=5`, `DEMUCS_JOBS=4`, `DEMUCS_OVERLAP=0.15`, `DEMUCS_SEGMENT=7`. **No usar `NO_CACHE`**: hace lentísimos los despliegues.
+
+## Analizador v2 del «1» (desde la 7.6.25)
+`rejilla_v2.py` calcula la rejilla con el detector nuevo (Beat This! `small0` + rejilla global + sesgo + árbitro) y el worker la manda en un bloque `v2` **aparte**. El worker no decide nada: sigue mandando el mismo `bpm`, la misma ancla y los mismos cues. Qué se hace con el bloque lo decide la plataforma, con dos interruptores **apagados de fábrica** en su tabla `analisis_config` (se cambian con una fila, sin desplegar):
+- `sombra_v2`: `worker-next` le pide el bloque al worker y `worker-result` lo guarda en `music_tracks.analisis_v2`. Nada más.
+- `rejilla_v2_real`: además, `worker-result` escribe esa rejilla (`grid_source = 'analizador_v2'`) en los temas sin candado.
+
+Del lado del worker:
+- Anuncia la capacidad `sombra-v2-1` solo si tiene el modelo y sus pesos. La imagen los trae (`requirements-v2.txt`, pesos comprobados por sha256 al construir; si no bajan, la imagen no se construye). Si no se le pide, ni importa torch.
+- `SOMBRA_V2=true` lo fuerza siempre (para probar). `SOMBRA_V2=false` es el freno de mano: ni se anuncia ni se calcula. Opcionales: `SOMBRA_V2_HILOS` (2) y `SOMBRA_V2_TOPE_S` (150).
+- Corre al final del trabajo, en un proceso nuevo y con tope: si falla, se cae o tarda de más, el análisis se entrega igual, el bloque dice `error` y la rejilla queda en manos del detector de hoy.
+- Humo de tiempo y memoria con 12 temas sintéticos, con 2 vCPU y 10 GB como una réplica: `bancos/humo_sombra.py` (las cifras medidas están en el CHANGELOG).
 
 ## Reglas aprendidas (no romper)
 - **El archivo se llama exacto `stems_worker.py`** (y `worker.py`). Subirlo como `stems_worker (1).py` hace que Railway siga corriendo la versión vieja.

@@ -14,6 +14,17 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Analizador v2 del «1» (7.6.25): torch de CPU + Beat This! y sus pesos `small0` (8 MB),
+# comprobados por sha256. Si los pesos no bajan o no son los esperados, la construcción FALLA
+# (Railway se queda con la imagen anterior). El worker solo lo calcula cuando la plataforma lo
+# pide (`analisis_config.sombra_v2`); si no, ni importa torch. Va en su propia capa, antes del
+# código, para que un cambio de worker.py no la vuelva a bajar.
+ENV TORCH_HOME=/opt/torch
+COPY requirements-v2.txt .
+RUN pip install --no-cache-dir -r requirements-v2.txt
+COPY rejilla_v2.py .
+RUN python -c "import rejilla_v2; rejilla_v2.bajar_pesos()"
+
 COPY worker.py .
 COPY grid_detect.py .
 COPY analizador_v8.py .

@@ -1,0 +1,11 @@
+# Analizador v2 del «1» en sombra (rejilla_v2.py, worker 7.6.25). Solo para la imagen del worker de
+# análisis (Dockerfile). Las pruebas NO lo necesitan: lo puro de rejilla_v2.py corre sin torch.
+# torch de CPU: la rueda normal de PyPI trae CUDA y pesa varios GB.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.15.0+cpu
+torchaudio==2.11.1+cpu
+beat-this==1.1.0
+einops==0.8.2
+rotary-embedding-torch==0.9.2
+soxr==1.1.0
+tqdm==4.70.1

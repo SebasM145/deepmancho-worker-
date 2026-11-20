@@ -36,8 +36,8 @@ def test_boceto_corto_tiene_inicio_y_salida():
     assert worker.detect_cues(y, SR, BPM, ancla) is None
     cues = worker.cues_respaldo(y, SR, BPM, ancla)
     nums = [c["number"] for c in cues]
-    # #930: A en el primer downbeat de la rejilla (aquí el ancla, que cae antes del primer compás).
-    assert nums[0] == 0 and cues[0]["positionMs"] == worker.primer_downbeat_ms(ancla, BPM) == round(ancla)
+    # #930: A en el último beat que no pasa el primer sonido (aquí el ancla: el tema suena desde ahí).
+    assert nums[0] == 0 and cues[0]["positionMs"] == worker.posicion_cue_a_ms(ancla, BPM, ancla) == round(ancla)
     assert 7 in nums, "debe haber cue de salida"
     assert all(c["confidence"] < 0.5 for c in cues if c["number"] != 0)
     assert all(c["origen"] == "grilla" for c in cues)

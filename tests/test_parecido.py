@@ -306,7 +306,7 @@ def test_next_job_avisa_la_capacidad_y_pasa_el_pedido(monkeypatch):
 
     monkeypatch.setattr(worker.requests, "post", post)
     _, _, _, extra = worker.next_job()
-    assert visto["headers"]["x-worker-capacidades"] == "parecido-1"
+    assert "parecido-1" in visto["headers"]["x-worker-capacidades"].split(",")   # 7.6.25: puede sumar «sombra-v2-1»
     assert extra["parecido"] == {"semilla_track_id": "S"}
 
 

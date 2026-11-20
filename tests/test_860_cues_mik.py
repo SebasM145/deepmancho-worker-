@@ -53,15 +53,16 @@ def test_las_frases_se_cuentan_desde_el_inicio_del_archivo_aunque_el_bombo_entre
         assert any(abs(b - cambio) < 0.1 for b in compases), f"falta el cambio del compás {cambio}: {compases}"
 
 
-def test_la_salida_queda_en_el_ultimo_cuarto_y_deja_cola():
+def test_la_salida_es_el_cue_7_y_deja_cola():
+    # 7.6.25 (C5): la salida ya no se busca «desde el 75 %»: deja de 32 a 48 compases de cola en
+    # un tema de 5 min o más (tests/test_1117_cues_y_salida.py).
     y, ancla = tema(ESTRUCTURA, intro_sin_bombo=4)
     cues = worker.detect_cues(y, SR, BPM, ancla)
     h = cues[-1]
-    assert h["number"] == len(cues) - 1 and h["label"] in ("MIX-OUT", "VOCALS", "DROP 2")
+    assert h["number"] == 7 and h["label"] == "MIX-OUT"
     total = len(y) / SR / BAR_S
     salida = h["positionMs"] / 1000 / BAR_S
-    assert salida >= 0.75 * (total - 1) - 4, f"salida muy temprano: compás {salida:.0f} de {total:.0f}"
-    assert total - salida >= worker.CUE_COLA - 1, "la salida tiene que dejar cola para mezclar"
+    assert worker.SALIDA_COLA_MIN - 1 <= total - salida <= worker.SALIDA_COLA_MAX + 1, f"cola {total - salida:.0f}"
 
 
 def test_dos_cues_nunca_a_menos_de_una_frase():
